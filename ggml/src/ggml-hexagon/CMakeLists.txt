@@ -25,8 +25,12 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 option(GGML_HEXAGON_HTP_DEBUG  "ggml-hexagon: enable HTP debug output" OFF)
 option(GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS "ggml-hexagon: release VTCM and HMX on request between ops, not only between op batches" OFF)
 option(GGML_HEXAGON_HTP_YIELD_IN_CPY "ggml-hexagon: release VTCM and HMX on request within non-contiguous copies" OFF)
+option(GGML_HEXAGON_HTP_YIELD_IN_OPS "ggml-hexagon: release VTCM and HMX on request inside long ops (flash attention), between completed output blocks" OFF)
 if (GGML_HEXAGON_HTP_YIELD_IN_CPY AND NOT GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS)
     message(FATAL_ERROR "GGML_HEXAGON_HTP_YIELD_IN_CPY requires GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS")
+endif()
+if (GGML_HEXAGON_HTP_YIELD_IN_OPS AND NOT GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS)
+    message(FATAL_ERROR "GGML_HEXAGON_HTP_YIELD_IN_OPS requires GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS")
 endif()
 set(GGML_HEXAGON_HTP_BUILD_TYPE "Release" CACHE STRING "ggml-hexagon: HTP skel build type (Release, RelWithDebInfo, Debug)")
 set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: enable HTP library signing using certificate")
@@ -54,7 +58,7 @@ endif()
 get_filename_component(_htp_sdk_ver "${GGML_HEXAGON_HTP_SDK_ROOT}" NAME)
 get_filename_component(_htp_tools_ver "${GGML_HEXAGON_HTP_TOOLS_ROOT}" NAME)
 set(_htp_yield "y")
-foreach(_opt GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY GGML_HEXAGON_HTP_DEBUG)
+foreach(_opt GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY GGML_HEXAGON_HTP_YIELD_IN_OPS GGML_HEXAGON_HTP_DEBUG)
     if (${_opt})
         string(APPEND _htp_yield "1")
     else()
@@ -123,6 +127,7 @@ function(build_htp_skel V)
             -DHEXAGON_HTP_DEBUG=${GGML_HEXAGON_HTP_DEBUG}
             -DHEXAGON_HTP_YIELD_BETWEEN_OPS=${GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS}
             -DHEXAGON_HTP_YIELD_IN_CPY=${GGML_HEXAGON_HTP_YIELD_IN_CPY}
+            -DHEXAGON_HTP_YIELD_IN_OPS=${GGML_HEXAGON_HTP_YIELD_IN_OPS}
             -DDSP_VERSION=${V}
             -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
             -DHEXAGON_SWIV_UTILITY=${GGML_HEXAGON_SWIV_UTILITY}

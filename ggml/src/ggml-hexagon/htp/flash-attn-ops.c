@@ -1990,6 +1990,47 @@ static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor 
 // Core HMX flash attention algorithm (GQA-merged)
 // ============================================================================
 
+// Per-op VTCM contents that outlive one (Q block, KV head) step: the mask line cache, the
+// zeroed head-dim padding of the staging buffers, the HMX output scales and the sinks.
+// Run at op start, and again after VTCM was given away in the middle of the op.
+static void fa_vtcm_setup(struct hmx_fa_context *            factx,
+                          const struct hmx_fa_vtcm_layout * L,
+                          dma_queue *                       dma_q,
+                          size_t                            size_k_row_padded,
+                          size_t                            size_v_row_padded) {
+    dma_cache_fa_init(factx->m_cache, (uint8_t *) factx->vtcm_mask_buf, L->m_buf_slot_bytes, HMX_FA_DMA_CACHE_SIZE);
+
+    // Head-dim padding: the K/V DMA staging buffers and the flat-Q buffer are laid out
+    // with padded row strides (size_{k,v,q}_row_padded, covering D_pad columns) but the
+    // DMA only writes the real D columns per row. Zero the whole staging buffers once up
+    // front so tail lanes [D, D_pad) stay zero for all KV blocks. No-op when already aligned.
+    if (factx->DK_pad != factx->DK || factx->DV_pad != factx->DV) {
+        const size_t k_buf_bytes = (size_t) factx->Bc * size_k_row_padded;
+        const size_t v_buf_bytes = (size_t) factx->Bc * size_v_row_padded;
+        hvx_splat_u8_a((char *) factx->vtcm_k_fp16[0], 0, k_buf_bytes);
+        hvx_splat_u8_a((char *) factx->vtcm_k_fp16[1], 0, k_buf_bytes);
+        hvx_splat_u8_a((char *) factx->vtcm_v_fp16[0], 0, v_buf_bytes);
+        hvx_splat_u8_a((char *) factx->vtcm_v_fp16[1], 0, v_buf_bytes);
+        // Flat-Q DMA scratch
+        if (factx->vtcm_q_dma) {
+            const size_t q_dma_bytes = hex_align_up(factx->g_br * factx->DK * (factx->is_q_fp32 ? sizeof(float) : sizeof(__fp16)), 128);
+            hvx_splat_u8_a((char *) factx->vtcm_q_dma, 0, q_dma_bytes);
+        }
+    }
+
+    // HMX output scales
+    hmx_init_column_scales(factx->vtcm_hmx_scales_id, Q6_V_vsplat_R(0x3c00)); // 1.0
+    {
+        union { __fp16 f; uint16_t u; } sc = { .f = factx->scale };
+        hmx_init_column_scales(factx->vtcm_hmx_scales_qk, Q6_V_vsplat_R(sc.u));
+    }
+
+    if (factx->sinks) {
+        dma_queue_push(dma_q, dma_make_data(factx->vtcm_sinks, factx->sinks->data), L->sinks_bytes, 0, factx->sinks->size, 1);
+        dma_queue_pop(dma_q);
+    }
+}
+
 int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     struct htp_thread_trace * tr_hvx = &octx->ctx->trace[0];
     struct htp_thread_trace * tr_hmx = &octx->ctx->trace[HTP_MAX_NTHREADS];
@@ -2201,40 +2242,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
     factx.ddr_slopes = ddr->slopes;
     factx.m_cache    = &octx->dma_cache_fa[0];
-    dma_cache_fa_init(factx.m_cache, (uint8_t *) factx.vtcm_mask_buf, L.m_buf_slot_bytes, HMX_FA_DMA_CACHE_SIZE);
 
-    // Head-dim padding: the K/V DMA staging buffers and the flat-Q buffer are laid out
-    // with padded row strides (size_{k,v,q}_row_padded, covering D_pad columns) but the
-    // DMA only writes the real D columns per row. Zero the whole staging buffers once up
-    // front so tail lanes [D, D_pad) stay zero for all KV blocks. No-op when already aligned.
-    if (DK_pad != DK || DV_pad != DV) {
-        const size_t k_buf_bytes = (size_t) factx.Bc * size_k_row_padded;
-        const size_t v_buf_bytes = (size_t) factx.Bc * size_v_row_padded;
-        hvx_splat_u8_a((char *) factx.vtcm_k_fp16[0], 0, k_buf_bytes);
-        hvx_splat_u8_a((char *) factx.vtcm_k_fp16[1], 0, k_buf_bytes);
-        hvx_splat_u8_a((char *) factx.vtcm_v_fp16[0], 0, v_buf_bytes);
-        hvx_splat_u8_a((char *) factx.vtcm_v_fp16[1], 0, v_buf_bytes);
-        // Flat-Q DMA scratch
-        if (factx.vtcm_q_dma) {
-            const size_t q_dma_bytes = hex_align_up(factx.g_br * DK * (factx.is_q_fp32 ? sizeof(float) : sizeof(__fp16)), 128);
-            hvx_splat_u8_a((char *) factx.vtcm_q_dma, 0, q_dma_bytes);
-        }
-    }
-
-    // ======== Initialize HMX output scales ========
-    hmx_init_column_scales(factx.vtcm_hmx_scales_id, Q6_V_vsplat_R(0x3c00)); // 1.0
-    {
-        union { __fp16 f; uint16_t u; } sc = { .f = factx.scale };
-        hmx_init_column_scales(factx.vtcm_hmx_scales_qk, Q6_V_vsplat_R(sc.u));
-    }
-
-    // ======== DMA setup ========
     dma_queue * const dma_q = ctx->dma[0];
-
-    if (factx.sinks) {
-        dma_queue_push(dma_q, dma_make_data(factx.vtcm_sinks, factx.sinks->data), L.sinks_bytes, 0, factx.sinks->size, 1);
-        dma_queue_pop(dma_q);
-    }
+    fa_vtcm_setup(&factx, &L, dma_q, size_k_row_padded, size_v_row_padded);
 
     const size_t n_row_tiles_g_br = g_br / HMX_FP16_TILE_N_ROWS;
     const size_t n_tiles_per_bc   = Bc / HMX_FP16_TILE_N_COLS;
@@ -2250,6 +2260,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     hmx_fa_qk_job_t       qk_job;
     hmx_fa_o_update_job_t ou_job;
     hmx_fa_o_norm_job_t   on_job;
+
+    // Q/K/V/mask DMAs for a step are pushed at the end of the previous step, except for
+    // the first step and the step after VTCM was given away.
+    bool push_step_dma = true;
 
     // ======== Main loop ========
     for (uint32_t ib3 = 0; ib3 < neq3; ++ib3) {
@@ -2283,9 +2297,11 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 const uint32_t iv2 = kv_head;
                 const uint32_t iv3 = fastdiv(ib3, &kparams->broadcast_rv3);
 
-                // 1. Push Q and KV DMAs for the first kv_head of this q_start block.
-                // Subsequent kv_head iterations are enqueued early at the end of the previous iteration.
-                if (kv_head == kv_head_min) {
+                // 1. Push Q and KV DMAs for the first kv_head of this q_start block, and for
+                // the step after VTCM was given away. Other kv_head iterations are enqueued
+                // early at the end of the previous iteration.
+                if (kv_head == kv_head_min || push_step_dma) {
+                    push_step_dma = false;
                     const dma_addr_t q_ptr = q->data + q_start * q->nb[1] +
                                             (kv_head * factx.G) * q->nb[2] + ib3 * q->nb[3];
                     const size_t q_row_bytes = q_transposed ? n_rows_q * q_row_bytes_trans_factor : q_row_bytes_untransposed;
@@ -2608,7 +2624,17 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 const uint32_t next_kv_head = kv_head + 1;
                 const bool has_next = (next_kv_head < kv_head_max);
 
-                if (has_next) {
+#ifdef HTP_YIELD_IN_OPS
+                // A VTCM/HMX release was requested (e.g. by a functional-safety self-test): finish
+                // this step with no DMA into VTCM in flight, give VTCM away after storing O, and
+                // push the next step's DMAs afresh.
+                const bool has_more    = has_next || q_start + Br < q_start_max || ib3 + 1 < neq3;
+                const bool yield_after = has_more && atomic_load(&ctx->vtcm_needs_release);
+#else
+                const bool yield_after = false;
+#endif
+
+                if (has_next && !yield_after) {
                     const dma_addr_t next_q_ptr = q->data + q_start * q->nb[1] + (next_kv_head * factx.G) * q->nb[2] + ib3 * q->nb[3];
                     const size_t next_q_row_bytes = q_transposed ? n_rows_q * q_row_bytes_trans_factor : q_row_bytes_untransposed;
                     const size_t next_n_rows      = q_transposed ? factx.G : n_rows_q;
@@ -2650,11 +2676,31 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                 // ---- Store O block ----
                 fa_phase_o_store(&factx, dst, o_tile_curr, q_start, kv_head, ib3, n_rows_g);
+
+#ifdef HTP_YIELD_IN_OPS
+                if (yield_after) {
+                    // O is in DDR and the step state is rebuilt per step: only the per-op setup
+                    // has to be redone after VTCM comes back.
+                    dma_queue_flush(dma_q);
+                    htp_vtcm_yield(ctx);
+                    fa_vtcm_setup(&factx, &L, dma_q, size_k_row_padded, size_v_row_padded);
+                    push_step_dma = true;
+                }
+#else
+                (void) yield_after;
+#endif
             }
         }
     }
 
     return HTP_STATUS_OK;
+}
+
+static void fa_hvx_dma_sinks(struct htp_ops_context * octx, struct htp_fa_context * factx, size_t size_sinks) {
+    const struct htp_tensor * sinks = octx->src[4];
+    dma_queue * dma_q = octx->ctx->dma[0];
+    dma_queue_push(dma_q, dma_make_data(factx->spad_sinks, sinks->data), size_sinks, 0, sinks->size, 1);
+    dma_queue_pop(dma_q);
 }
 
 int op_flash_attn_ext(struct htp_ops_context * octx) {
@@ -2816,13 +2862,33 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     }
 
     if (has_sinks) {
-        const struct htp_tensor * sinks = octx->src[4];
-        dma_queue * dma_q = octx->ctx->dma[0];
-        dma_queue_push(dma_q, dma_make_data(factx.spad_sinks, sinks->data), L.size_sinks, 0, sinks->size, 1);
-        dma_queue_pop(dma_q);
+        fa_hvx_dma_sinks(octx, &factx, L.size_sinks);
     }
 
-    work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_thread, &factx, n_threads);
+#ifdef HTP_YIELD_IN_OPS
+    // Run the rows in rounds, so VTCM/HMX can be given away between rounds when a release
+    // is requested (e.g. by a functional-safety self-test). A round sets up its own scratch;
+    // only the sinks outlive it.
+    const uint32_t round_rows = n_threads * 8;
+#else
+    const uint32_t round_rows = qrows;
+#endif
+    for (uint32_t done = 0; done < qrows;) {
+        const uint32_t n = MIN(round_rows, qrows - done);
+        factx.qrow_start       = qrow_start + done;
+        factx.qrows            = n;
+        factx.qrows_per_thread = fastdiv(n + n_threads - 1, &octx->n_threads_div);
+        work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_thread, &factx, n_threads);
+        done += n;
+#ifdef HTP_YIELD_IN_OPS
+        if (done < qrows && atomic_load(&octx->ctx->vtcm_needs_release)) {
+            htp_vtcm_yield(octx->ctx);
+            if (has_sinks) {
+                fa_hvx_dma_sinks(octx, &factx, L.size_sinks);
+            }
+        }
+#endif
+    }
 
     return HTP_STATUS_OK;
 }
