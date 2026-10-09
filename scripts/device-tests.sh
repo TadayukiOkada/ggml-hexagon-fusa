@@ -6,8 +6,9 @@
 # usage: scripts/device-tests.sh <package dir> <out dir> [--ops] [--long] [--bench MODEL.gguf]...
 #
 #   --ops     test-backend-ops-hex against the CPU, one process per op, on HTP0
-#   --long    perf mode for single ops that run for tens of ms, with GGML_HEXAGON_PROFILE=1;
-#             feed long_*.log to scripts/op-budget.py
+#   --long    single ops that run for tens of ms, checked against the CPU once each with
+#             GGML_HEXAGON_PROFILE=1; feed long_*.log to scripts/op-budget.py (perf mode would
+#             repeat a 100 ms op thousands of times)
 #   --bench   llama-bench pp512, pp2048 and tg128 on HTP0 for each model
 #
 # Environment: ADSP_LIBRARY_PATH as the board needs it (run.sh puts the package first),
@@ -54,7 +55,7 @@ if [ $ops -eq 1 ]; then
 fi
 
 if [ $long -eq 1 ]; then
-    # The single ops added by tests/patches/0002 and friends; perf mode repeats each for about a second.
+    # The single ops added by tests/patches/0002 and friends.
     for spec in \
         "cont CONT ne=\[(1024,(768|1152),1,1|32,32,(768|1152),1|128,8,(512,4|4096,1))\]" \
         "lmhead MUL_MAT m=(151936|262144)," \
@@ -64,7 +65,7 @@ if [ $long -eq 1 ]; then
         "fa FLASH_ATTN_EXT hsk=128,hsv=128,nh=8,nr23=\[2,1\],kv=(512|4096|8192|16384),nb=512,"
     do
         set -- $spec
-        GGML_HEXAGON_PROFILE=1 run 1800 "$out/long_$1.log" test-backend-ops-hex perf -b HTP0 -o "$2" -p "$3"
+        GGML_HEXAGON_PROFILE=1 run 1800 "$out/long_$1.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$2" -p "$3"
         rc=$?
         echo "long $1 rc=$rc" | tee -a "$summary"
         [ $rc -ne 0 ] && sleep "$pause"
