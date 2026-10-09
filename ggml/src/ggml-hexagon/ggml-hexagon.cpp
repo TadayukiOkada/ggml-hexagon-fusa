@@ -5446,8 +5446,9 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
         return false;
     }
 
-    // HMX paths require K aligned to 32.
-    if (ne00 % 32 != 0) {
+    // HMX paths require K aligned to 32. The flat 2D path pads F16/F32 weights with zeros.
+    const bool can_pad_k = (wtype == GGML_TYPE_F16 || wtype == GGML_TYPE_F32) && !is_batched && !is_matmul_id;
+    if (ne00 % 32 != 0 && !can_pad_k) {
         return false;
     }
 
@@ -5753,7 +5754,8 @@ static void ggml_hexagon_precompute_matmul_params_impl(
 
     const int wtype = src0->type;
     const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
-    const int ne00_padded = is_repack ? hex_round_up(ne00, 32) : ne00;
+    const bool is_float  = (wtype == GGML_TYPE_F16 || wtype == GGML_TYPE_F32);
+    const int ne00_padded = (is_repack || is_float) ? hex_round_up(ne00, 32) : ne00;
     const int ne01_padded = is_repack ? hex_round_up(ne01, 32) : ne01;
     const int ne11_padded = hex_round_up(ne11, 32);
     // VTCM has to hold whole 32-row weight tiles, so size for the rounded-up N
@@ -6814,7 +6816,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
     const size_t vtcm_budget = sess->vtcm_size;
     const bool is_batched = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
 
-    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 2);
+    // The fused NX kernel needs K aligned to 32 (no padding).
+    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 2) && (ne00 % 32 == 0);
     if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, act, nullptr, ne01_padded, false, is_batched)) {
         if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, act, nullptr, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, false, is_batched, 0, vtcm_budget, kparams)) {
             kparams->n_weights = n_weights;
