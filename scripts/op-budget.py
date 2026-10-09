@@ -28,8 +28,8 @@ LINE = re.compile(
 
 
 # Ops that release VTCM/HMX on request inside the op in builds with GGML_HEXAGON_HTP_YIELD_IN_CPY
-# (CONT, CPY) and GGML_HEXAGON_HTP_YIELD_IN_OPS (flash attention, IM2COL, unary ops).
-YIELDING = ["CONT", "CPY", "FLASH_ATTN_EXT", "IM2COL",
+# (CONT, CPY) and GGML_HEXAGON_HTP_YIELD_IN_OPS (flash attention, IM2COL, GET_ROWS, PAD, unary ops).
+YIELDING = ["CONT", "CPY", "FLASH_ATTN_EXT", "IM2COL", "GET_ROWS", "PAD",
             "SCALE", "CLAMP", "LEAKY_RELU", "SQR", "SQRT", "NEG", "EXP", "SIGMOID", "SILU", "GELU",
             "GELU_QUICK", "GELU_ERF", "SOFTPLUS", "TANH", "ABS", "LOG", "RELU", "STEP",
             "NORM", "RMS_NORM", "RMS_NORM_MUL", "L2_NORM", "TRI"]
