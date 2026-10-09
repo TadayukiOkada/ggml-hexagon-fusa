@@ -2139,6 +2139,19 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
 
     this->valid_handle = true;
 
+    // Host library and skel must come from the same build: they share the
+    // op and message definitions, and a mismatch is not detected otherwise.
+    {
+        char skel_id[256] = {};
+        int  id_err = htp_iface_build_id(this->handle, skel_id, sizeof(skel_id));
+        if (id_err != AEE_SUCCESS || strcmp(skel_id, GGML_HEXAGON_BUILD_ID) != 0) {
+            GGML_ABORT("ggml-hex: %s skel libggml-htp-v%u.so does not match libggml-hexagon.so: build %s, expected %s (error 0x%x)\n",
+                       this->c_name(), opt_arch, id_err == AEE_SUCCESS ? skel_id : "(none)", GGML_HEXAGON_BUILD_ID,
+                       (unsigned) id_err);
+        }
+        GGML_LOG_INFO("ggml-hex: %s build %s\n", this->c_name(), GGML_HEXAGON_BUILD_ID);
+    }
+
     // Query HW info and resolve session options
     {
         unsigned int hw_n_threads = 0;

@@ -60,6 +60,10 @@ target_compile_definitions(${HTP_LIB} PRIVATE
     $<$<BOOL:${HEXAGON_HTP_YIELD_BETWEEN_OPS}>:HTP_YIELD_BETWEEN_OPS=1>
     $<$<BOOL:${HEXAGON_HTP_YIELD_IN_CPY}>:HTP_YIELD_IN_CPY=1>)
 
+if (HEXAGON_BUILD_ID)
+    target_compile_definitions(${HTP_LIB} PRIVATE HTP_BUILD_ID="${HEXAGON_BUILD_ID}")
+endif()
+
 # Keep build-machine paths out of the skel (__FILE__ in asserts).
 target_compile_options(${HTP_LIB} PRIVATE
     -ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/=htp/
