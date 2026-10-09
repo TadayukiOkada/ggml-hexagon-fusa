@@ -48,6 +48,36 @@ static inline void transpose_tile_to_nibbles(uint8_t tile_quants[32][32], const 
     }
 }
 
+// Q4_0 tiles are laid out for vrmpy: byte 4 * row + j of nibble vector v (128 bytes) holds
+// k = 8v + sigma(j) in the low nibble and k = 8v + 4 + sigma(j) in the high nibble, sigma = (0, 2, 1, 3).
+// A nibble mask or shift gives the four k per row that vrmpy consumes (the activations are quantized
+// in the same order), and the even and odd bytes are the k pairs that an HMX weight vector holds.
+static const int q4_0_tile_sigma[4] = { 0, 2, 1, 3 };
+
+static inline void transpose_nibbles_to_tile_q4_0(uint8_t * tile_dst, const uint8_t tile_quants[32][32]) {
+    for (int v = 0; v < 4; v++) {
+        for (int row = 0; row < 32; row++) {
+            for (int j = 0; j < 4; j++) {
+                const int k = 8 * v + q4_0_tile_sigma[j];
+                tile_dst[v * 128 + row * 4 + j] = (tile_quants[row][k + 4] << 4) | tile_quants[row][k];
+            }
+        }
+    }
+}
+
+static inline void transpose_tile_to_nibbles_q4_0(uint8_t tile_quants[32][32], const uint8_t * tile_src) {
+    for (int v = 0; v < 4; v++) {
+        for (int row = 0; row < 32; row++) {
+            for (int j = 0; j < 4; j++) {
+                const int     k   = 8 * v + q4_0_tile_sigma[j];
+                const uint8_t val = tile_src[v * 128 + row * 4 + j];
+                tile_quants[row][k]     = val & 0x0F;
+                tile_quants[row][k + 4] = val >> 4;
+            }
+        }
+    }
+}
+
 #if defined(__ARM_NEON) || defined(__aarch64__)
 static void repack_neon_transpose8x8(const uint8x8_t rows[8], uint8x8_t columns[8]) {
     const uint8x8x2_t t0 = vtrn_u8(rows[0], rows[1]);
@@ -439,22 +469,6 @@ static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset,
     repack_to_tiled_grid_32<block_q4_0, 1>(t, data, offset, size, HTP_TENSOR_TILE_SIZE_Q4_0,
         [](uint8_t * tile_dst, const block_q4_0 * src_slice, int64_t ne0, int64_t ne1, int64_t row_stride, int ct, int kt) {
             ggml_half * scale_dst = (ggml_half *) (tile_dst + 512);
-#if defined(__ARM_NEON) || defined(__aarch64__)
-            if (ct * 32 + 32 <= ne1 && kt < ne0 / 32) {
-                for (int row0 = 0; row0 < 32; row0 += 8) {
-                    const uint8_t * qs[8];
-                    for (int rr = 0; rr < 8; ++rr) {
-                        qs[rr] = src_slice[(ct * 32 + row0 + rr) * row_stride + kt].qs;
-                    }
-                    repack_neon_4bit_rows(qs, tile_dst, row0);
-                }
-
-                for (int row = 0; row < 32; ++row) {
-                    scale_dst[row] = src_slice[(ct * 32 + row) * row_stride + kt].d;
-                }
-                return;
-            }
-#endif
             uint8_t tile_quants[32][32];
             for (int row = 0; row < 32; row++) {
                 const int64_t r = ct * 32 + row;
@@ -467,7 +481,7 @@ static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset,
                     scale_dst[row] = 0;
                 }
             }
-            transpose_nibbles_to_tile(tile_dst, tile_quants);
+            transpose_nibbles_to_tile_q4_0(tile_dst, tile_quants);
         });
 }
 
@@ -475,7 +489,7 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset,
     unpack_from_tiled_grid_32<block_q4_0, 1>(data, t, offset, size, HTP_TENSOR_TILE_SIZE_Q4_0,
         [](block_q4_0 * dst_slice, const uint8_t * tile_src, int64_t ne0, int64_t start_row, int64_t end_row, int64_t row_stride, int ct, int kt) {
             uint8_t tile_quants[32][32];
-            transpose_tile_to_nibbles(tile_quants, tile_src);
+            transpose_tile_to_nibbles_q4_0(tile_quants, tile_src);
             const ggml_half * scale_src = (const ggml_half *) (tile_src + 512);
             for (int row = 0; row < 32; row++) {
                 const int64_t r = ct * 32 + row;

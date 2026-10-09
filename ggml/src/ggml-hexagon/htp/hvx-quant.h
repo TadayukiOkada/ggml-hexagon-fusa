@@ -517,15 +517,18 @@ static inline void hvx_dequantize_row_tiled_q4_0_f32(float * dst_spad, const uin
         const uint8_t * tile = src_spad + k_tile * tile_stride;
         float * dst = dst_spad + k_tile * HTP_TENSOR_TILE_N_COLS;
 
+        // Row r has 4 bytes at 4r of each nibble vector v: k 8v + (0, 2, 1, 3) low, 8v + 4 + (0, 2, 1, 3)
+        // high (see repack_q4_0_tiled); swap the middle bytes back and interleave the nibbles by 4.
         HVX_Vector vq = Q6_V_vzero();
-        for (int group = 3; group >= 0; --group) {
-            vq = Q6_V_vmux_QVV(first4, hvx_dequantize_gather4(hvx_vmem(tile + group * VLEN), row), Q6_V_vror_VR(vq, VLEN - 4));
+        for (int v = 3; v >= 0; --v) {
+            const HVX_Vector rot = Q6_V_vror_VR(hvx_vmem(tile + v * VLEN), 4 * row);
+            vq = Q6_V_vmux_QVV(first4, rot, Q6_V_vror_VR(vq, VLEN - 4));
         }
+        vq = hvx_vec_swap_mid_bytes(vq);
 
         const HVX_Vector lo = Q6_V_vand_VV(vq, Q6_Vb_vsplat_R(0x0F));
         const HVX_Vector hi = Q6_Vub_vlsr_VubR(vq, 4);
-        vq = Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -1));
-        vq = Q6_Vb_vsub_VbVb(vq, Q6_Vb_vsplat_R(8));
+        vq = Q6_Vb_vsub_VbVb(Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -4)), Q6_Vb_vsplat_R(8));
 
         const HVX_Vector scales = hvx_vmem(tile + 512);
         const HVX_Vector scale_hf = hvx_vec_repl_f16(Q6_V_vror_VR(scales, 2 * row));
