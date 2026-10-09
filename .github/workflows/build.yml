@@ -34,7 +34,7 @@ jobs:
             image: arm64-linux
             preset: arm64-linux-release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: true
 
@@ -49,7 +49,7 @@ jobs:
       - name: Package
         run: scripts/package.sh --split build pkg
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ggml-hexagon-fusa-${{ matrix.target }}
           path: pkg
