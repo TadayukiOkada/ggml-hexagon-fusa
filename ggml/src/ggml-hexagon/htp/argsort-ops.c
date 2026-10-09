@@ -1017,13 +1017,43 @@ static int op_sort_common(struct htp_ops_context * octx, bool is_top_k) {
     if (rows_per_chunk == 0) {
         rows_per_chunk = 1;
     }
-    uint32_t dr = fastdiv(nrows + octx->n_threads - 1, &octx->n_threads_div);
-    if (rows_per_chunk > 1) {
-        dr = hex_round_up(dr, rows_per_chunk);
+    const uint32_t n_threads = octx->n_threads;
+#ifdef HTP_YIELD_IN_OPS
+    // Each thread sorts whole rows. Run the rows in rounds of about 5 ms per thread, so VTCM/HMX
+    // can be given away between rounds when a release is requested; a row is staged within its
+    // round. Per-row cost fitted on v73 (us per element), as in the host's op budget estimate.
+    float elem_us;
+    if (!is_top_k) {
+        elem_us = ne00 <= 512 ? 0.05f : 1.1f;
+    } else {
+        elem_us = (ne00 % 128 == 0 && k <= 128) ? 0.1f : 0.8f;
     }
-    mctx.nrows_per_thread = dr;
-
-    work_queue_run(octx->ctx->work_queue, htp_sort_multi_row_job, &mctx, octx->n_threads);
+    const uint32_t row_us     = (uint32_t) (elem_us * (float) ne00) + 1;
+    uint32_t       per_thread = MAX(1u, 5000u / row_us);
+    if (rows_per_chunk > 1) {
+        per_thread = hex_round_up(per_thread, rows_per_chunk);
+    }
+    const uint32_t round = MIN(nrows, per_thread * n_threads);
+#else
+    const uint32_t round = nrows;
+#endif
+    for (uint32_t done = 0; done < nrows;) {
+        const uint32_t n = MIN(round, nrows - done);
+        mctx.row_start = row_start + done;
+        mctx.row_end   = row_start + done + n;
+        uint32_t dr = fastdiv(n + n_threads - 1, &octx->n_threads_div);
+        if (rows_per_chunk > 1) {
+            dr = hex_round_up(dr, rows_per_chunk);
+        }
+        mctx.nrows_per_thread = dr;
+        work_queue_run(octx->ctx->work_queue, htp_sort_multi_row_job, &mctx, n_threads);
+        done += n;
+#ifdef HTP_YIELD_IN_OPS
+        if (done < nrows && atomic_load(&octx->ctx->vtcm_needs_release)) {
+            htp_vtcm_yield(octx->ctx);
+        }
+#endif
+    }
 
     return HTP_STATUS_OK;
 }

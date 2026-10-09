@@ -15,14 +15,20 @@ static bool htp_budget_check(const struct ggml_hexagon_session * sess, const str
     return true;
 }
 
-// Conservative op time estimates (ms) for sorts, which have no point where VTCM could be released.
+// Conservative op time estimates (ms) for sorts. A single row cannot release VTCM; several rows
+// release it between rounds when the skel is built with yield inside ops.
 // Fitted to v73 (QCS9075, 4 HVX threads): a single row is sorted by all threads, several rows
 // one per thread; ARGSORT rows above 512 and TOP_K rows that are not a multiple of 128 or take
 // a large k go through much slower paths.
 static double htp_estimate_sort_ms(const struct ggml_tensor * src0, int64_t k, uint32_t n_threads) {
     const double n      = (double) src0->ne[0];
     const int64_t nrows = ggml_nrows(src0);
+#ifdef GGML_HEXAGON_HTP_YIELD_IN_OPS
+    // Several rows run in rounds with a yield point between them: only one row per thread counts.
+    const double rounds = 1.0;
+#else
     const double rounds = (double) ((nrows + n_threads - 1) / n_threads);
+#endif
 
     if (k < 0) { // ARGSORT
         if (nrows == 1) {
