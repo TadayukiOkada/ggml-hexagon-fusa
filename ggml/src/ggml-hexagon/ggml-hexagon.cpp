@@ -6997,14 +6997,20 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         return false;
     }
 
-    // A matmul has no point where VTCM could be released. The long ones are output projections
-    // over many tokens (perplexity, embeddings). Estimate from v73 (QCS9075): about 5 TFLOP/s on
-    // HMX and 45 GB/s of weights, whichever bounds it (lm_head 262144x1536 x 512 tokens: 71 ms).
+    // The long matmuls are output projections over many tokens (perplexity, embeddings). The HMX
+    // 2D kernel releases VTCM between weight chunks when the skel is built with yield inside ops;
+    // the other kernels have no such point. Estimate from v73 (QCS9075): about 5 TFLOP/s on HMX
+    // and 45 GB/s of weights, whichever bounds it (lm_head 262144x1536 x 512 tokens: 71 ms).
     // Only for weights with data: llama.cpp places weights by asking about a 512-token matmul
     // with a zero-size placeholder buffer, and a refusal there would keep the weight, and every
     // decode step, off the HTP. In a real graph a refused matmul runs on the CPU with the weight
     // copied over. test-backend-ops asks before allocating, so it does not see this check.
-    if (opt_op_budget_ms > 0 && src0->data != nullptr) {
+#ifdef GGML_HEXAGON_HTP_YIELD_IN_OPS
+    const bool mm_yields = kparams.kernel_type == HTP_MM_KERNEL_HMX_2D;
+#else
+    const bool mm_yields = false;
+#endif
+    if (opt_op_budget_ms > 0 && src0->data != nullptr && !mm_yields) {
         const double flops = 2.0 * src0->ne[0] * src0->ne[1] * ggml_nrows(src1);
         const double est   = (std::max)(flops / 5.0e9, (double) ggml_nbytes(src0) / 45.0e6);
         if (est > opt_op_budget_ms) {

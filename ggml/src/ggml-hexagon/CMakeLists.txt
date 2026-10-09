@@ -97,7 +97,8 @@ ggml_add_backend_library(${TARGET_NAME}
     ../../include/ggml-hexagon.h)
 
 target_link_libraries(${TARGET_NAME} PRIVATE htp_iface)
-target_compile_definitions(${TARGET_NAME} PRIVATE GGML_HEXAGON_BUILD_ID="${GGML_HEXAGON_BUILD_ID}")
+target_compile_definitions(${TARGET_NAME} PRIVATE GGML_HEXAGON_BUILD_ID="${GGML_HEXAGON_BUILD_ID}"
+    $<$<BOOL:${GGML_HEXAGON_HTP_YIELD_IN_OPS}>:GGML_HEXAGON_HTP_YIELD_IN_OPS>)
 
 target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${CMAKE_CURRENT_BINARY_DIR})
 
