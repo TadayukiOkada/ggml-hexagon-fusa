@@ -21,7 +21,13 @@ static inline void hvx_vec_sincos_reduce_f32(HVX_Vector x, HVX_Vector * y, HVX_V
     HVX_Vector n_int   = hvx_vec_truncate_f32(n_float);
 
     HVX_Vector n_pi = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(n_float, const_pi));
-    *y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(x, n_pi));
+    HVX_Vector r = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(x, n_pi));
+    // x - n*pi cancels most leading bits, and the qf32 difference is not normalized.
+    // Hexagon tools 8.x drop the conversion above and square the raw qf32 value,
+    // which loses most of the precision for |x| in the hundreds (ROPE at long
+    // positions). The empty asm keeps the converted value. Tools 19 already keep it.
+    __asm__("" : "+v"(r));
+    *y = r;
 
     HVX_VectorPred is_odd = Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(n_int, const_one_i), const_one_i);
     *sign = Q6_V_vmux_QVV(is_odd, const_neg_one, const_one);
