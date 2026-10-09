@@ -66,6 +66,10 @@ include(cmake/build-id.cmake)
 include(GNUInstallDirs)
 add_subdirectory(ggml/src/ggml-hexagon)
 
+if (LLAMA_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()
+
 if (GGML_HEXAGON_FUSA)
     # Check every skel after it is built: SWIV section, and imports against the firmware shell if given.
     foreach(V IN LISTS GGML_HEXAGON_HTP_ARCHS)

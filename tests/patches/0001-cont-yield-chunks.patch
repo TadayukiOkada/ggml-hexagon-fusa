@@ -1,0 +1,19 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8d739dc38..cdbfd1a31 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10037,6 +10037,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I32 }) {
++        for (std::array<int64_t, 4> ne : std::initializer_list<std::array<int64_t, 4>>{
++                {1024, 768, 1, 1}, {1023, 33, 1, 1}, {1023, 65, 1, 1} }) {
++            test_cases.emplace_back(new test_cont(type, ne));
++        }
++        test_cases.emplace_back(new test_cont(type, {32, 32, 768, 1}, false, {1, 2, 0, 3}));
++    }
++
+     auto add_test_bin_bcast = [&](ggml_type type, std::array<int64_t, 4> ne, std::array<int, 4> nr, bool perm1 = false, bool src_overlap = false) {
+         for (auto op : {ggml_add, ggml_sub, ggml_mul, ggml_div}) {
+             test_cases.emplace_back(new test_bin_bcast(op, type, ne, nr, 1, perm1, src_overlap));

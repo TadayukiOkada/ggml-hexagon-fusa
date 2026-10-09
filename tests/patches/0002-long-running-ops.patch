@@ -1,0 +1,114 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index cdbfd1a31..5bb7a35c9 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1495,15 +1495,15 @@ struct test_case {
+             const char * bn1 = ggml_backend_name(ud->backend1);
+             const char * bn2 = ggml_backend_name(ud->backend2);
+ 
+-            if (t1->op == GGML_OP_NONE) {
+-                // sentinels must be unchanged
++            if (t1->op == GGML_OP_NONE || t1->op == GGML_OP_CONT) {
++                // Sentinels and contiguous copies must match byte for byte.
+                 std::vector<uint8_t> t1_data(ggml_nbytes(t1));
+                 std::vector<uint8_t> t2_data(ggml_nbytes(t2));
+                 ggml_backend_tensor_get(t1, t1_data.data(), 0, ggml_nbytes(t1));
+                 ggml_backend_tensor_get(t2, t2_data.data(), 0, ggml_nbytes(t2));
+ 
+                 if (memcmp(t1_data.data(), t2_data.data(), ggml_nbytes(t1)) != 0) {
+-                    printf("sentinel mismatch: %s ", t1->name);
++                    printf("tensor byte mismatch: %s ", t1->name);
+                     ud->ok = false;
+                     return true;
+                 }
+@@ -9339,6 +9339,69 @@ static const ggml_type other_types[] = {
+ #pragma optimize("", off)
+ #endif
+ 
++// Single ops that may run for tens of ms at model shapes.
++// A backend that holds shared accelerator resources for a whole op can starve other clients.
++static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
++    std::vector<std::unique_ptr<test_case>> test_cases;
++
++    // transposed copies: SigLIP2 patch transpose and position-embedding resize (n_embd 768, 1152),
++    // and the transposed V view without flash attention (head 128, 8 KV heads)
++    for (int64_t n_embd : { 768, 1152 }) {
++        test_cases.emplace_back(new test_cont(GGML_TYPE_F32, { 1024, n_embd, 1, 1 }));
++        test_cases.emplace_back(new test_cont(GGML_TYPE_F32, { 32, 32, n_embd, 1 }, false, { 1, 2, 0, 3 }));
++    }
++    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, { 128, 8, 512, 4 }, false, { 1, 2, 0, 3 }));
++    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, { 128, 8, 4096, 1 }, false, { 1, 2, 0, 3 }));
++
++    // output projection over a whole ubatch (perplexity, embeddings)
++    for (int64_t n_tokens : { 256, 512 }) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, n_tokens, 1024, { 1, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, n_tokens, 2048, { 1, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 262144, n_tokens, 1536, { 1, 1 }, { 1, 1 }));
++    }
++
++    // prefill attention against a long KV cache: head 128 with 16/8 heads, head 64 with 32/8 heads
++    for (int64_t kv : { 512, 4096, 8192, 16384 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 2, 1 }, kv, 512, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, { 4, 1 }, 4096, 512, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    // single-token decode against a long KV cache
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 2, 1 }, 32768, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++
++    // attention without flash attention: soft_max, KQ and KQV
++    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, { 512, 128, 16, 4 }, true, false, GGML_TYPE_F32, { 1, 1 }, 0.1f));
++    for (int64_t kv : { 4096, 8192 }) {
++        test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, { kv, 512, 16, 1 }, true, false, GGML_TYPE_F32, { 1, 1 }, 0.1f));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, kv, 512, 128, { 8, 1 }, { 2, 1 }));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 512, kv, { 8, 1 }, { 2, 1 }));
++    }
++
++    // concat outside the DMA paths, element-wise copy
++    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
++        test_cases.emplace_back(new test_concat(type, { 1024, 768, 1, 1 }, 1024, 0, 0));
++        test_cases.emplace_back(new test_concat(type, { 128, 16, 512, 1 }, 512, 2, 0));
++        test_cases.emplace_back(new test_concat(type, { 1024, 768, 1, 1 }, 768, 1, 1));
++    }
++
++    // pad of a permuted source, element-wise copy
++    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, { 64, 512, 64, 1 }, 1, 1, 1, 1, 1, 1, 0, 0, 2, false));
++
++    // repeat with short rows (one copy call per element) and with long rows
++    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, { 1, 4096, 1, 1 }, { 1024, 1, 1, 1 }));
++    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, { 128, 16, 512, 1 }, { 1, 2, 1, 1 }));
++
++    // sort over a whole vocabulary (backend sampling)
++    for (int64_t n_vocab : { 151936, 262144 }) {
++        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, { n_vocab, 1, 1, 1 }, GGML_SORT_ORDER_DESC));
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { n_vocab, 1, 1, 1 }, 40));
++    }
++
++    // gated delta net prefill: 16 K heads, 32 V heads, head 128
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2));
++
++    return test_cases;
++}
++
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+@@ -11629,6 +11692,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    for (auto & tc : make_test_cases_long_ops()) {
++        test_cases.emplace_back(std::move(tc));
++    }
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER
+@@ -12109,6 +12176,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
+     }
+ 
++    for (auto & tc : make_test_cases_long_ops()) {
++        test_cases.emplace_back(std::move(tc));
++    }
+ 
+     return test_cases;
+ }
