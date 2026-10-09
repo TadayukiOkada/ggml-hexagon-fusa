@@ -972,9 +972,17 @@ static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset,
                     }
                 }
 
-                for (int cp = 0; cp < 16; cp++) {
+                // vector v (128 bytes): byte 4 * row + j holds k = 8v + sigma(j) in the low nibble and
+                // k = 8v + 4 + sigma(j) in the high nibble, sigma = (0, 2, 1, 3). A nibble mask or shift
+                // gives the four k per row that vrmpy consumes (the activations are quantized in the same
+                // order), and the even and odd bytes are the k pairs that an HMX weight vector holds.
+                static const int sigma[4] = { 0, 2, 1, 3 };
+                for (int v = 0; v < 4; v++) {
                     for (int row = 0; row < 32; row++) {
-                        tile_dst[cp * 32 + row] = (tile_quants[row][2 * cp + 1] << 4) | tile_quants[row][2 * cp];
+                        for (int j = 0; j < 4; j++) {
+                            const int k = 8 * v + sigma[j];
+                            tile_dst[v * 128 + row * 4 + j] = (tile_quants[row][k + 4] << 4) | tile_quants[row][k];
+                        }
                     }
                 }
 
@@ -1033,11 +1041,15 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset,
                 const uint8_t * tile_src = matrix_src + (ct * n_k_tiles + kt) * tile_size;
 
                 uint8_t tile_quants[32][32];
-                for (int cp = 0; cp < 16; cp++) {
+                static const int sigma[4] = { 0, 2, 1, 3 };  // see repack_q4_0_tiled
+                for (int v = 0; v < 4; v++) {
                     for (int row = 0; row < 32; row++) {
-                        uint8_t val = tile_src[cp * 32 + row];
-                        tile_quants[row][2 * cp + 0] = val & 0x0F;
-                        tile_quants[row][2 * cp + 1] = val >> 4;
+                        for (int j = 0; j < 4; j++) {
+                            const int k = 8 * v + sigma[j];
+                            uint8_t val = tile_src[v * 128 + row * 4 + j];
+                            tile_quants[row][k]     = val & 0x0F;
+                            tile_quants[row][k + 4] = val >> 4;
+                        }
                     }
                 }
 

@@ -221,7 +221,18 @@ static __attribute__((noinline)) void compute_get_rows_tiled(float * dst, const 
     const HVX_VectorPred first2 = Q6_Q_vsetq_R(2);
     const HVX_VectorPred first4 = Q6_Q_vsetq_R(4);
     HVX_Vector vq = Q6_V_vzero();
-    if (q4) {
+    if (q4 && !q4_k) {
+        // Q4_0: row r has 4 bytes at 4r of each nibble vector v: k 8v + (0, 2, 1, 3) low,
+        // 8v + 4 + (0, 2, 1, 3) high (see repack_q4_0_tiled); swap the middle bytes back
+        for (int v = 3; v >= 0; --v) {
+            const HVX_Vector rot = Q6_V_vror_VR(hvx_vmem(tile + v * VLEN), 4 * row);
+            vq = Q6_V_vmux_QVV(first4, rot, Q6_V_vror_VR(vq, VLEN - 4));
+        }
+        vq = hvx_vec_swap_mid_bytes(vq);
+        const HVX_Vector lo = Q6_V_vand_VV(vq, Q6_Vb_vsplat_R(0x0F));
+        const HVX_Vector hi = Q6_Vub_vlsr_VubR(vq, 4);
+        vq = Q6_Vb_vsub_VbVb(Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -4)), Q6_Vb_vsplat_R(8));
+    } else if (q4) {
         const HVX_VectorPred first1 = Q6_Q_vsetq_R(1);
         const HVX_VectorPred first3 = Q6_Q_vsetq_R(3);
         for (int group = 3; group >= 0; --group) {
@@ -235,9 +246,6 @@ static __attribute__((noinline)) void compute_get_rows_tiled(float * dst, const 
         const HVX_Vector lo = Q6_V_vand_VV(vq, Q6_Vb_vsplat_R(0x0F));
         const HVX_Vector hi = Q6_Vub_vlsr_VubR(vq, 4);
         vq = Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -1));
-        if (!q4_k) {
-            vq = Q6_Vb_vsub_VbVb(vq, Q6_Vb_vsplat_R(8));
-        }
     } else {
         for (int group = 7; group >= 0; --group) {
             const HVX_Vector v = Q6_V_vror_VR(hvx_vmem(tile + group * VLEN), 2 * row);

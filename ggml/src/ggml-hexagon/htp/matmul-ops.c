@@ -238,6 +238,24 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
 #include "hvx-mm-kernels-float.h"
 #include "hmx-mm-kernels-tiled.h"
 
+// VTCM stride of the weight tiles in the HVX repacked kernels (see HTP_MM_VTCM_TILE_STRIDE_Q4_0)
+static inline uint32_t htp_mm_hvx_vtcm_tile_stride_type(uint32_t type) {
+    return type == HTP_TYPE_Q4_0 ? HTP_MM_VTCM_TILE_STRIDE_Q4_0 : htp_mm_get_weight_aligned_tile_size(type);
+}
+
+// per suffix of the repacked kernel macros
+enum {
+    hvx_vtcm_tile_stride_q4_0  = HTP_MM_VTCM_TILE_STRIDE_Q4_0,
+    hvx_vtcm_tile_stride_q4_1  = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_1,
+    hvx_vtcm_tile_stride_q8_0  = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0,
+    hvx_vtcm_tile_stride_q6_k  = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K,
+    hvx_vtcm_tile_stride_q5_k  = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q5_K,
+    hvx_vtcm_tile_stride_q3_k  = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q3_K,
+    hvx_vtcm_tile_stride_q2_k  = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q2_K,
+    hvx_vtcm_tile_stride_iq4nl = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_IQ4_NL,
+    hvx_vtcm_tile_stride_mxfp4 = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4,
+};
+
 // Specialized repacked matmul macros
 #define MATMUL_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X2, DOT_2X1)                                                                       \
 static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                                 \
@@ -268,12 +286,12 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     const dma_addr_t src0_row = src0->data;                                                                                                \
                                                                                                                                            \
     const uint32_t tile_size = TILE_SIZE;                                                                                                  \
-    const uint32_t aligned_tile_size = hex_align_up(tile_size, 128);                                                                       \
+    const uint32_t aligned_tile_size = hvx_vtcm_tile_stride_##SUFFIX;                                                                                       \
                                                                                                                                            \
     uint32_t n_k_tiles_w = ne00 / 32;                                                                                                      \
     uint32_t n_k_tiles_a = ne10 / 32;                                                                                                      \
     uint32_t tile_row_stride = n_k_tiles_w * tile_size;                                                                                    \
-    uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;                                                             \
+    uint32_t tile_row_transfer_size_aligned = hex_align_up(n_k_tiles_a * aligned_tile_size, 128);                                                             \
                                                                                                                                            \
     uint32_t ct_start = src0_start_row / 32;                                                                                               \
     uint32_t ct_end   = (src0_end_row + 31) / 32;                                                                                          \
@@ -371,12 +389,12 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     float * restrict dst_col          = (float *) dst->data;                                                             \
                                                                                                                          \
     const uint32_t tile_size = TILE_SIZE;                                                                                \
-    const uint32_t aligned_tile_size = hex_align_up(tile_size, 128);                                                     \
+    const uint32_t aligned_tile_size = hvx_vtcm_tile_stride_##SUFFIX;                                                                     \
                                                                                                                          \
     uint32_t n_k_tiles_w = ne00 / 32;                                                                                    \
     uint32_t n_k_tiles_a = ne10 / 32;                                                                                    \
     uint32_t tile_row_stride = n_k_tiles_w * tile_size;                                                                  \
-    uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;                                           \
+    uint32_t tile_row_transfer_size_aligned = hex_align_up(n_k_tiles_a * aligned_tile_size, 128);                                           \
                                                                                                                          \
     uint32_t ct_start = src0_start_row / 32;                                                                             \
     uint32_t ct_end   = (src0_end_row + 31) / 32;                                                                        \
@@ -456,9 +474,9 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);                         \
                                                                                                                                   \
     const uint32_t tile_size = TILE_SIZE;                                                                                         \
-    const uint32_t aligned_tile_size = hex_align_up(tile_size, 128);                                                              \
+    const uint32_t aligned_tile_size = hvx_vtcm_tile_stride_##SUFFIX;                                                                              \
     uint32_t n_k_tiles_a = ne10 / 32;                                                                                             \
-    uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;                                                    \
+    uint32_t tile_row_transfer_size_aligned = hex_align_up(n_k_tiles_a * aligned_tile_size, 128);                                                    \
                                                                                                                                   \
     for (uint32_t widx = 0; widx < n_weights; widx++) {                                                                           \
         const struct htp_tensor * restrict src_w = octx->src[widx];                                                               \
@@ -650,6 +668,7 @@ static void name(unsigned int nth, unsigned int ith, void * data) {             
 }
 
 QUANTIZE_IMPL(quantize_f32_q8_0_tiled, "quantize-f32-q8_0_tiled", quantize_f32_q8_0_tiled_kernel, htp_mm_q8_0_tiled_row_size(ne0))
+QUANTIZE_IMPL(quantize_f32_q8_0q40_tiled, "quantize-f32-q8_0q40_tiled", quantize_f32_q8_0q40_tiled_kernel, htp_mm_q8_0_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_q8_1_tiled, "quantize-f32-q8_1_tiled", quantize_f32_q8_1_tiled_kernel, htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_q8_1_s16_tiled, "quantize-f32-q8_1_s16_tiled", quantize_f32_q8_1_s16_tiled_kernel, htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_f32,        "quantize-f32-f32",        quantize_f32_f32_kernel,        mmctx->vtcm_act_stride)
@@ -669,6 +688,34 @@ static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, vo
     const struct htp_tensor * src = mmctx->act;
 
     quantize_f32_q8_0_tiled_block_kernel(
+        (const float *) mmctx->vtcm_act_raw,
+        mmctx->vtcm_act,
+        NULL,
+        src->ne[0],
+        mmctx->quant_ib_first[ith],
+        mmctx->quant_ib_last[ith],
+        mmctx->vtcm_act_raw_stride,
+        htp_mm_q8_0_tiled_row_size(src->ne[0]),
+        mmctx->quant_r[ith],
+        mmctx->quant_c[ith]
+    );
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
+}
+
+static void quantize_f32_q8_0q40_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+    (void) nth;
+    struct htp_mm_context * mmctx = data;
+    if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
+        return;
+    }
+    struct htp_ops_context * octx = mmctx->octx;
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
+
+    const struct htp_tensor * src = mmctx->act;
+
+    quantize_f32_q8_0q40_tiled_block_kernel(
         (const float *) mmctx->vtcm_act_raw,
         mmctx->vtcm_act,
         NULL,
@@ -745,12 +792,18 @@ static inline worker_callback_t htp_mm_act_quant_row_func(int weight_type) {
     if (weight_type == HTP_TYPE_Q2_K) {
         return quantize_f32_q8_1_s16_tiled;
     }
+    if (weight_type == HTP_TYPE_Q4_0) {
+        return quantize_f32_q8_0q40_tiled;  // k order of the Q4_0 tiles
+    }
     return htp_mm_weight_has_offset(weight_type) ? quantize_f32_q8_1_tiled : quantize_f32_q8_0_tiled;
 }
 
 static inline worker_callback_t htp_mm_act_quant_block_func(int weight_type) {
     if (weight_type == HTP_TYPE_Q2_K) {
         return quantize_f32_q8_1_s16_tiled_block;
+    }
+    if (weight_type == HTP_TYPE_Q4_0) {
+        return quantize_f32_q8_0q40_tiled_block;  // k order of the Q4_0 tiles
     }
     return htp_mm_weight_has_offset(weight_type) ? quantize_f32_q8_1_tiled_block : quantize_f32_q8_0_tiled_block;
 }
@@ -798,12 +851,12 @@ static void hvx_mm_4d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     uint8_t * restrict act_data = mmctx->vtcm_act;                                                                                                          \
                                                                                                                                                             \
     const uint32_t tile_size = TILE_SIZE;                                                                                                                   \
-    const uint32_t aligned_tile_size = hex_align_up(tile_size, 128);                                                                                        \
+    const uint32_t aligned_tile_size = hvx_vtcm_tile_stride_##SUFFIX;                                                                                                        \
                                                                                                                                                             \
     const uint32_t n_k_tiles_w = ne00 / 32;                                                                                                                 \
     const uint32_t n_k_tiles_a = ne10 / 32;                                                                                                                 \
     const uint32_t tile_row_stride = n_k_tiles_w * tile_size;                                                                                               \
-    const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;                                                                        \
+    const uint32_t tile_row_transfer_size_aligned = hex_align_up(n_k_tiles_a * aligned_tile_size, 128);                                                                        \
     const uint32_t src0_slice_stride = ((ne01 + 31) / 32) * tile_row_stride;                                                                                \
                                                                                                                                                             \
     const uint32_t ct_start = src0_start_row / 32;                                                                                                          \
@@ -1313,11 +1366,11 @@ static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
         const dma_addr_t src0_row = src0->data + cur_a * nb02;
 
         const uint32_t tile_size = htp_mm_get_weight_tile_size(src0->type);
-        const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(src0->type);
+        const uint32_t aligned_tile_size = htp_mm_hvx_vtcm_tile_stride_type(src0->type);
         const uint32_t n_k_tiles_w = ne00 / 32;
         const uint32_t n_k_tiles_a = ne10 / 32;
         const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
-        const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;
+        const uint32_t tile_row_transfer_size_aligned = hex_align_up(n_k_tiles_a * aligned_tile_size, 128);
 
         const uint32_t ct_start = src0_start_row / 32;
         const uint32_t ct_end   = (src0_end_row + 31) / 32;
@@ -1401,11 +1454,11 @@ static void hvx_mv_id(unsigned int nth, unsigned int ith, void * data) {
         float * restrict dst_row          = (float *) (dst->data + ie1 * nb1);
 
         const uint32_t tile_size = htp_mm_get_weight_tile_size(src0->type);
-        const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(src0->type);
+        const uint32_t aligned_tile_size = htp_mm_hvx_vtcm_tile_stride_type(src0->type);
         const uint32_t n_k_tiles_w = ne00 / 32;
         const uint32_t n_k_tiles_a = ne10 / 32;
         const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
-        const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;
+        const uint32_t tile_row_transfer_size_aligned = hex_align_up(n_k_tiles_a * aligned_tile_size, 128);
 
         const uint32_t ct_start = src0_start_row / 32;
         const uint32_t ct_end   = (src0_end_row + 31) / 32;
@@ -1490,11 +1543,11 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
             float * restrict dst_row = (float *) (dst->data + ie1 * dst->nb[1]);
 
             const uint32_t tile_size = htp_mm_get_weight_tile_size(src_w->type);
-            const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(src_w->type);
+            const uint32_t aligned_tile_size = htp_mm_hvx_vtcm_tile_stride_type(src_w->type);
             const uint32_t n_k_tiles_w = src_w->ne[0] / 32;
             const uint32_t n_k_tiles_a = act->ne[0] / 32;
             const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
-            const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;
+            const uint32_t tile_row_transfer_size_aligned = hex_align_up(n_k_tiles_a * aligned_tile_size, 128);
 
             const uint32_t ct_start = src0_start_row / 32;
             const uint32_t ct_end   = (src0_end_row + 31) / 32;
@@ -1581,11 +1634,11 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
             const dma_addr_t src0_row = src_w->data + cur_a * src_w->nb[2];
 
             const uint32_t tile_size = htp_mm_get_weight_tile_size(src_w->type);
-            const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(src_w->type);
+            const uint32_t aligned_tile_size = htp_mm_hvx_vtcm_tile_stride_type(src_w->type);
             const uint32_t n_k_tiles_w = src_w->ne[0] / 32;
             const uint32_t n_k_tiles_a = act->ne[0] / 32;
             const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
-            const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;
+            const uint32_t tile_row_transfer_size_aligned = hex_align_up(n_k_tiles_a * aligned_tile_size, 128);
 
             const uint32_t ct_start = src0_start_row / 32;
             const uint32_t ct_end   = (src0_end_row + 31) / 32;

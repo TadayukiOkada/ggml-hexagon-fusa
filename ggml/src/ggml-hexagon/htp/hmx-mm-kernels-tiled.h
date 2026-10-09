@@ -40,6 +40,7 @@ static void dequantize_tiled_weight_to_fp16_task_q4_0(
 
     const HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
     const HVX_Vector i8 = Q6_Vb_vsplat_R(8);
+    const HVX_Vector ones = Q6_Vb_vsplat_R(1);
 
     for (uint32_t t = start_tile; t < end_tile; t++) {
         const uint8_t * tile_src = state->src + t * state->aligned_tile_size;
@@ -48,88 +49,24 @@ static void dequantize_tiled_weight_to_fp16_task_q4_0(
         HVX_Vector v_sc = hvx_vmem(tile_src + 512);
         HVX_Vector v_scale_duplicated = Q6_V_lo_W(Q6_W_vshuff_VVR(v_sc, v_sc, -2));
 
-        // Load all 4 groups in parallel
-        HVX_Vector vq0 = hvx_vmem(tile_src + 0 * 128);
-        HVX_Vector vq1 = hvx_vmem(tile_src + 1 * 128);
-        HVX_Vector vq2 = hvx_vmem(tile_src + 2 * 128);
-        HVX_Vector vq3 = hvx_vmem(tile_src + 3 * 128);
+        // Vector v holds, per row, k = 8v + (0, 2, 1, 3) in the low nibbles of its 4 bytes and
+        // 8v + 4 + (0, 2, 1, 3) in the high nibbles. Widening with vmpy(b, 1) splits even and odd
+        // bytes: the k pairs (8v, 8v+1) and (8v+2, 8v+3) of all 32 rows, as HMX weight vectors hold
+        // them, without a permute.
+        #pragma unroll
+        for (int v = 0; v < 4; v++) {
+            const HVX_Vector vq = hvx_vmem(tile_src + v * 128);
+            const HVX_Vector lo = Q6_Vb_vsub_VbVb(Q6_V_vand_VV(vq, mask_h4), i8);
+            const HVX_Vector hi = Q6_Vb_vsub_VbVb(Q6_Vub_vlsr_VubR(vq, 4), i8);
 
-        // Nibble extraction
-        HVX_Vector v_lo0 = Q6_V_vand_VV(vq0, mask_h4);
-        HVX_Vector v_hi0 = Q6_Vub_vlsr_VubR(vq0, 4);
-        HVX_Vector v_lo1 = Q6_V_vand_VV(vq1, mask_h4);
-        HVX_Vector v_hi1 = Q6_Vub_vlsr_VubR(vq1, 4);
-        HVX_Vector v_lo2 = Q6_V_vand_VV(vq2, mask_h4);
-        HVX_Vector v_hi2 = Q6_Vub_vlsr_VubR(vq2, 4);
-        HVX_Vector v_lo3 = Q6_V_vand_VV(vq3, mask_h4);
-        HVX_Vector v_hi3 = Q6_Vub_vlsr_VubR(vq3, 4);
+            const HVX_VectorPair plo = Q6_Wh_vmpy_VbVb(lo, ones);
+            const HVX_VectorPair phi = Q6_Wh_vmpy_VbVb(hi, ones);
 
-        // Offsetting (-8)
-        v_lo0 = Q6_Vb_vsub_VbVb(v_lo0, i8);
-        v_hi0 = Q6_Vb_vsub_VbVb(v_hi0, i8);
-        v_lo1 = Q6_Vb_vsub_VbVb(v_lo1, i8);
-        v_hi1 = Q6_Vb_vsub_VbVb(v_hi1, i8);
-        v_lo2 = Q6_Vb_vsub_VbVb(v_lo2, i8);
-        v_hi2 = Q6_Vb_vsub_VbVb(v_hi2, i8);
-        v_lo3 = Q6_Vb_vsub_VbVb(v_lo3, i8);
-        v_hi3 = Q6_Vb_vsub_VbVb(v_hi3, i8);
-
-        // Shuffling
-        HVX_VectorPair vp_shuf0 = Q6_W_vshuff_VVR(v_hi0, v_lo0, -1);
-        HVX_VectorPair vp_shuf1 = Q6_W_vshuff_VVR(v_hi1, v_lo1, -1);
-        HVX_VectorPair vp_shuf2 = Q6_W_vshuff_VVR(v_hi2, v_lo2, -1);
-        HVX_VectorPair vp_shuf3 = Q6_W_vshuff_VVR(v_hi3, v_lo3, -1);
-
-        // Unpack to 16-bit
-        HVX_VectorPair vp_int16_lo0 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf0));
-        HVX_VectorPair vp_int16_hi0 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf0));
-        HVX_VectorPair vp_int16_lo1 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf1));
-        HVX_VectorPair vp_int16_hi1 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf1));
-        HVX_VectorPair vp_int16_lo2 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf2));
-        HVX_VectorPair vp_int16_hi2 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf2));
-        HVX_VectorPair vp_int16_lo3 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf3));
-        HVX_VectorPair vp_int16_hi3 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf3));
-
-        // Convert and scale multiplication
-        HVX_Vector v_grp0_0 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_lo0)), v_scale_duplicated));
-        HVX_Vector v_grp0_1 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_int16_lo0)), v_scale_duplicated));
-        HVX_Vector v_grp0_2 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_hi0)), v_scale_duplicated));
-        HVX_Vector v_grp0_3 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_int16_hi0)), v_scale_duplicated));
-
-        HVX_Vector v_grp1_0 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_lo1)), v_scale_duplicated));
-        HVX_Vector v_grp1_1 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_int16_lo1)), v_scale_duplicated));
-        HVX_Vector v_grp1_2 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_hi1)), v_scale_duplicated));
-        HVX_Vector v_grp1_3 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_int16_hi1)), v_scale_duplicated));
-
-        HVX_Vector v_grp2_0 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_lo2)), v_scale_duplicated));
-        HVX_Vector v_grp2_1 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_int16_lo2)), v_scale_duplicated));
-        HVX_Vector v_grp2_2 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_hi2)), v_scale_duplicated));
-        HVX_Vector v_grp2_3 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_int16_hi2)), v_scale_duplicated));
-
-        HVX_Vector v_grp3_0 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_lo3)), v_scale_duplicated));
-        HVX_Vector v_grp3_1 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_int16_lo3)), v_scale_duplicated));
-        HVX_Vector v_grp3_2 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_hi3)), v_scale_duplicated));
-        HVX_Vector v_grp3_3 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_int16_hi3)), v_scale_duplicated));
-
-        hvx_vmem(dst_ptr +  0 * 64) = v_grp0_0;
-        hvx_vmem(dst_ptr +  1 * 64) = v_grp0_1;
-        hvx_vmem(dst_ptr +  2 * 64) = v_grp0_2;
-        hvx_vmem(dst_ptr +  3 * 64) = v_grp0_3;
-
-        hvx_vmem(dst_ptr +  4 * 64) = v_grp1_0;
-        hvx_vmem(dst_ptr +  5 * 64) = v_grp1_1;
-        hvx_vmem(dst_ptr +  6 * 64) = v_grp1_2;
-        hvx_vmem(dst_ptr +  7 * 64) = v_grp1_3;
-
-        hvx_vmem(dst_ptr +  8 * 64) = v_grp2_0;
-        hvx_vmem(dst_ptr +  9 * 64) = v_grp2_1;
-        hvx_vmem(dst_ptr + 10 * 64) = v_grp2_2;
-        hvx_vmem(dst_ptr + 11 * 64) = v_grp2_3;
-
-        hvx_vmem(dst_ptr + 12 * 64) = v_grp3_0;
-        hvx_vmem(dst_ptr + 13 * 64) = v_grp3_1;
-        hvx_vmem(dst_ptr + 14 * 64) = v_grp3_2;
-        hvx_vmem(dst_ptr + 15 * 64) = v_grp3_3;
+            hvx_vmem(dst_ptr + (4 * v + 0) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(plo)), v_scale_duplicated));
+            hvx_vmem(dst_ptr + (4 * v + 1) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(plo)), v_scale_duplicated));
+            hvx_vmem(dst_ptr + (4 * v + 2) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(phi)), v_scale_duplicated));
+            hvx_vmem(dst_ptr + (4 * v + 3) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(phi)), v_scale_duplicated));
+        }
     }
 }
 
