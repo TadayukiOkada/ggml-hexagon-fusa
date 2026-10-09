@@ -17,9 +17,8 @@ if (NOT IS_DIRECTORY "${HEXAGON_TOOLS_ROOT}")
     endif()
 endif()
 
-message(STATUS "hexagon: using ${HEXAGON_SDK_ROOT} and ${HEXAGON_TOOLS_ROOT} for building libggml-htp skels")
-
 include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/htp/cmake-qaic.cmake)
 include(ExternalProject)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
@@ -31,6 +30,21 @@ if (GGML_HEXAGON_HTP_YIELD_IN_CPY AND NOT GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS)
 endif()
 set(GGML_HEXAGON_HTP_BUILD_TYPE "Release" CACHE STRING "ggml-hexagon: HTP skel build type (Release, RelWithDebInfo, Debug)")
 set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: enable HTP library signing using certificate")
+
+# Older DSP firmware needs skels built against the SDK it was built with.
+# For example SDK 5.5.x has toolv87 prebuilts and no QuRT for v79/v81/v85.
+set(GGML_HEXAGON_TOOLV     "toolv21"             CACHE STRING "ggml-hexagon: Hexagon SDK prebuilt lib dir prefix (toolv21, toolv87, ...)")
+set(GGML_HEXAGON_HTP_ARCHS "v73;v75;v79;v81;v85" CACHE STRING "ggml-hexagon: Hexagon archs to build libggml-htp skels for")
+# The CPU side needs SDK 6.x headers (remote_system_request, FASTRPC_MAP_FD_DELAYED_EXTENDED, fastrpc_domain). The skels can use an older SDK.
+set(GGML_HEXAGON_HTP_SDK_ROOT   "${HEXAGON_SDK_ROOT}"   CACHE PATH "ggml-hexagon: Hexagon SDK used to build the libggml-htp skels")
+set(GGML_HEXAGON_HTP_TOOLS_ROOT "${HEXAGON_TOOLS_ROOT}" CACHE PATH "ggml-hexagon: Hexagon tools used to build the libggml-htp skels")
+if (NOT GGML_HEXAGON_HTP_SDK_ROOT STREQUAL HEXAGON_SDK_ROOT)
+    message(STATUS "hexagon: using ${HEXAGON_SDK_ROOT} for building libggml-hexagon")
+endif()
+message(STATUS "hexagon: using ${GGML_HEXAGON_HTP_SDK_ROOT} and ${GGML_HEXAGON_HTP_TOOLS_ROOT} for building libggml-htp skels")
+# Functional safety firmware only loads libraries with an SWIV CRC section. htp-swiv.py embeds one;
+# set this to the firmware's swiv_build_utility.py to embed it with that instead.
+set(GGML_HEXAGON_SWIV_UTILITY "$ENV{SWIV_BUILD_UTILITY}" CACHE FILEPATH "ggml-hexagon: embed the SWIV CRC into HTP libraries with this script instead of htp-swiv.py")
 
 add_library(htp_iface OBJECT
     ${CMAKE_CURRENT_BINARY_DIR}/htp_iface_stub.c)
@@ -71,6 +85,7 @@ ggml_add_backend_library(${TARGET_NAME}
     ../../include/ggml-hexagon.h)
 
 target_link_libraries(${TARGET_NAME} PRIVATE htp_iface)
+
 target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${CMAKE_CURRENT_BINARY_DIR})
 
 # Build HTP skels
@@ -83,25 +98,24 @@ function(build_htp_skel V)
             -DCMAKE_BUILD_TYPE=${GGML_HEXAGON_HTP_BUILD_TYPE}
             -DCMAKE_TOOLCHAIN_FILE=${CMAKE_CURRENT_SOURCE_DIR}/htp/cmake-toolchain.cmake
             -DCMAKE_INSTALL_LIBDIR=${CMAKE_CURRENT_BINARY_DIR}
-            -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_ROOT}
-            -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_ROOT}
+            -DHEXAGON_SDK_ROOT=${GGML_HEXAGON_HTP_SDK_ROOT}
+            -DHEXAGON_TOOLS_ROOT=${GGML_HEXAGON_HTP_TOOLS_ROOT}
             -DHEXAGON_HTP_DEBUG=${GGML_HEXAGON_HTP_DEBUG}
             -DHEXAGON_HTP_YIELD_BETWEEN_OPS=${GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS}
             -DHEXAGON_HTP_YIELD_IN_CPY=${GGML_HEXAGON_HTP_YIELD_IN_CPY}
             -DDSP_VERSION=${V}
             -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
-            -DPREBUILT_LIB_DIR="toolv21_${V}")
+            -DHEXAGON_SWIV_UTILITY=${GGML_HEXAGON_SWIV_UTILITY}
+            -DPREBUILT_LIB_DIR="${GGML_HEXAGON_TOOLV}_${V}")
     list(APPEND HTP_SKELS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so)
     list(APPEND HTP_PROJECTS htp-${V})
     set(HTP_SKELS ${HTP_SKELS} PARENT_SCOPE)
     set(HTP_PROJECTS ${HTP_PROJECTS} PARENT_SCOPE)
 endfunction()
 
-build_htp_skel(v73)
-build_htp_skel(v75)
-build_htp_skel(v79)
-build_htp_skel(v81)
-build_htp_skel(v85)
+foreach(V IN LISTS GGML_HEXAGON_HTP_ARCHS)
+    build_htp_skel(${V})
+endforeach()
 
 # Install Hexagon skels required at runtime
 install(FILES ${HTP_SKELS} TYPE LIB)

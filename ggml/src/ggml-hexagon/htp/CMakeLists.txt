@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.22.2)
 project(ggml-htp C CXX ASM)
 
 include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake-qaic.cmake)
 
 include_directories(
     ${HEXAGON_SDK_ROOT}/incs
@@ -59,6 +60,15 @@ target_compile_definitions(${HTP_LIB} PRIVATE
     $<$<BOOL:${HEXAGON_HTP_YIELD_BETWEEN_OPS}>:HTP_YIELD_BETWEEN_OPS=1>
     $<$<BOOL:${HEXAGON_HTP_YIELD_IN_CPY}>:HTP_YIELD_IN_CPY=1>)
 
+# SDK 5.5.x has no HMX voltage corners MIN_SVS and SVS_L2. Use the nearest lower corner.
+file(STRINGS ${HEXAGON_SDK_ROOT}/incs/HAP_power.h _hap_exp_vcorners REGEX "HAP_DCVS_EXP_VCORNER_(MIN_SVS|SVS_L2) *=")
+if (NOT _hap_exp_vcorners MATCHES "HAP_DCVS_EXP_VCORNER_MIN_SVS")
+    target_compile_definitions(${HTP_LIB} PRIVATE HAP_DCVS_EXP_VCORNER_MIN_SVS=HAP_DCVS_EXP_VCORNER_MIN)
+endif()
+if (NOT _hap_exp_vcorners MATCHES "HAP_DCVS_EXP_VCORNER_SVS_L2")
+    target_compile_definitions(${HTP_LIB} PRIVATE HAP_DCVS_EXP_VCORNER_SVS_L2=HAP_DCVS_EXP_VCORNER_SVS_L1)
+endif()
+
 build_idl(htp_iface.idl ${HTP_LIB})
 
 set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)
@@ -67,9 +77,19 @@ if (NOT Python3_EXECUTABLE)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
 endif()
 
-add_custom_command(TARGET ${HTP_LIB} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E echo "Adding SWIV section $<TARGET_FILE_NAME:${HTP_LIB}>"
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/htp-swiv.py -i $<TARGET_FILE:${HTP_LIB}> -o $<TARGET_FILE:${HTP_LIB}>
-    VERBATIM)
+# HEXAGON_SWIV_UTILITY replaces htp-swiv.py with the firmware's own swiv_build_utility.py.
+# It does not write in place, so go through a temporary file.
+if (HEXAGON_SWIV_UTILITY)
+    add_custom_command(TARGET ${HTP_LIB} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E echo "Adding SWIV section $<TARGET_FILE_NAME:${HTP_LIB}> with ${HEXAGON_SWIV_UTILITY}"
+        COMMAND ${Python3_EXECUTABLE} ${HEXAGON_SWIV_UTILITY} -i $<TARGET_FILE:${HTP_LIB}> -o $<TARGET_FILE:${HTP_LIB}>.swiv
+        COMMAND ${CMAKE_COMMAND} -E rename $<TARGET_FILE:${HTP_LIB}>.swiv $<TARGET_FILE:${HTP_LIB}>
+        VERBATIM)
+else()
+    add_custom_command(TARGET ${HTP_LIB} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E echo "Adding SWIV section $<TARGET_FILE_NAME:${HTP_LIB}>"
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/htp-swiv.py -i $<TARGET_FILE:${HTP_LIB}> -o $<TARGET_FILE:${HTP_LIB}>
+        VERBATIM)
+endif()
 
 install(TARGETS ${HTP_LIB})
