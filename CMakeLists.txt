@@ -39,6 +39,7 @@ function(ggml_add_backend_library backend)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
         ${LLAMA_DIR}/ggml/src)
     target_link_libraries(${backend} PRIVATE ggml-base)
+    target_compile_features(${backend} PRIVATE c_std_11 cxx_std_17)  # as ggml/src does for its targets
     add_dependencies(ggml ${backend})
     install(TARGETS ${backend} LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR})
 

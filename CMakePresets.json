@@ -41,6 +41,48 @@
         "GGML_HEXAGON_HTP_YIELD_IN_CPY": "ON",
         "GGML_HEXAGON_SWIV_UTILITY": "$env{SWIV_BUILD_UTILITY}"
       }
+    },
+    {
+      "name": "arm64-android-release",
+      "displayName": "ARM64 Android, upstream defaults (SDK 6.x, all HTP archs), for checking the other generations",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "toolchainFile": "$env{ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-28",
+        "GGML_NATIVE": "OFF",
+        "GGML_OPENMP": "OFF",
+        "GGML_OPENCL": "OFF",
+        "GGML_CCACHE": "OFF",
+        "LLAMA_OPENSSL": "OFF",
+        "LLAMA_BUILD_TESTS": "ON",
+        "HEXAGON_SDK_ROOT": "$env{HEXAGON_SDK_ROOT}",
+        "HEXAGON_TOOLS_ROOT": "$env{HEXAGON_TOOLS_ROOT}",
+        "PREBUILT_LIB_DIR": "android_aarch64"
+      }
+    },
+    {
+      "name": "arm64-linux-release",
+      "displayName": "ARM64 Linux with clang (upstream toolchain file, all HTP archs), for the public CI container",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "toolchainFile": "${sourceDir}/llama.cpp/cmake/arm64-linux-clang.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "-march=armv8.2a+fp16+dotprod",
+        "CMAKE_CXX_FLAGS": "-march=armv8.2a+fp16+dotprod",
+        "GGML_NATIVE": "OFF",
+        "GGML_OPENMP": "OFF",
+        "GGML_OPENCL": "OFF",
+        "GGML_CCACHE": "OFF",
+        "LLAMA_OPENSSL": "OFF",
+        "LLAMA_BUILD_TESTS": "ON",
+        "HEXAGON_SDK_ROOT": "$env{HEXAGON_SDK_ROOT}",
+        "HEXAGON_TOOLS_ROOT": "$env{HEXAGON_TOOLS_ROOT}",
+        "PREBUILT_LIB_DIR": "linux_aarch64"
+      }
     }
   ]
 }
