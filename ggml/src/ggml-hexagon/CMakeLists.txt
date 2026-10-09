@@ -23,6 +23,7 @@ include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
 include(ExternalProject)
 
 option(GGML_HEXAGON_HTP_DEBUG  "ggml-hexagon: enable HTP debug output" OFF)
+option(GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS "ggml-hexagon: release VTCM and HMX on request between ops, not only between op batches" OFF)
 set(GGML_HEXAGON_HTP_BUILD_TYPE "Release" CACHE STRING "ggml-hexagon: HTP skel build type (Release, RelWithDebInfo, Debug)")
 set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: enable HTP library signing using certificate")
 
@@ -71,6 +72,7 @@ function(build_htp_skel V)
             -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_ROOT}
             -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_ROOT}
             -DHEXAGON_HTP_DEBUG=${GGML_HEXAGON_HTP_DEBUG}
+            -DHEXAGON_HTP_YIELD_BETWEEN_OPS=${GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS}
             -DDSP_VERSION=${V}
             -DPREBUILT_LIB_DIR="toolv19_${V}")
     list(APPEND HTP_SKELS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so)

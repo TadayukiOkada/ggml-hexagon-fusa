@@ -1162,6 +1162,32 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
     return octx->status;
 }
 
+#ifdef HTP_YIELD_BETWEEN_OPS
+// Give VTCM and HMX to other clients between ops, not only between batches.
+// A batch can be a whole graph. Some clients (e.g. the NSP self-test on FuSa firmware) fail if they wait that long.
+// VTCM only holds per-op scratch, so this is safe.
+static void vtcm_yield(struct htp_context * ctx) {
+    if (!ctx->vtcm_needs_release) {
+        return;
+    }
+
+    // The hmx-queue thread holds the HMX lock and the workers spin while active
+    if (ctx->hmx_queue) {
+        hmx_queue_suspend(ctx->hmx_queue);
+        hmx_queue_flush(ctx->hmx_queue);
+    }
+    work_queue_suspend(ctx->work_queue);
+
+    vtcm_release(ctx);
+    vtcm_acquire(ctx);
+
+    work_queue_wakeup(ctx->work_queue);
+    if (ctx->hmx_queue) {
+        hmx_queue_wakeup(ctx->hmx_queue);
+    }
+}
+#endif // HTP_YIELD_BETWEEN_OPS
+
 static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf) {
     dspqueue_t queue = ctx->dsp_queue;
     int err;
@@ -1251,6 +1277,12 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
                 pds[i].pmu[j] = prof.pmu_counters[j];
             }
         }
+
+#ifdef HTP_YIELD_BETWEEN_OPS
+        if (i + 1 < n_ops) {
+            vtcm_yield(ctx);
+        }
+#endif
     }
 
     if (ctx->hmx_queue) {
