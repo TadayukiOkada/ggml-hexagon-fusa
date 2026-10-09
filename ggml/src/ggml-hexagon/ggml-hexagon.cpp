@@ -108,6 +108,13 @@ static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static bool   opt_hostbuf = false;
 static bool   opt_dma64   = false;
 
+#ifndef GGML_HEXAGON_OP_BUDGET_MS_DEFAULT
+#define GGML_HEXAGON_OP_BUDGET_MS_DEFAULT 0
+#endif
+// Ops estimated to hold the DSP longer than this (ms) without a yield point are left to the CPU.
+// Functional-safety firmware stops the DSP when its self-test cannot get VTCM/HMX in time. 0 = off.
+static double opt_op_budget_ms = GGML_HEXAGON_OP_BUDGET_MS_DEFAULT;
+
 static size_t opt_mbuf_dyn    = 512ul * 1024 * 1024;      // max dynamic (compute) buffer size
 static size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/KV) buffer size
 static size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
@@ -7520,6 +7527,45 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
     GGML_UNUSED(sess);
 }
 
+// Conservative op time estimates (ms) for sorts, which have no point where VTCM could be released.
+// Fitted to v73 (QCS9075, 4 HVX threads): a single row is sorted by all threads, several rows
+// one per thread; ARGSORT rows above 512 and TOP_K rows that are not a multiple of 128 or take
+// a large k go through much slower paths.
+static double ggml_hexagon_estimate_sort_ms(const struct ggml_tensor * src0, int64_t k, uint32_t n_threads) {
+    const double n      = (double) src0->ne[0];
+    const int64_t nrows = ggml_nrows(src0);
+    const double rounds = (double) ((nrows + n_threads - 1) / n_threads);
+
+    if (k < 0) { // ARGSORT
+        if (nrows == 1) {
+            double npow2 = 1;
+            while (npow2 < n) {
+                npow2 *= 2;
+            }
+            return 0.4e-3 * npow2;
+        }
+        return (src0->ne[0] <= 512 ? 0.05e-3 : 1.1e-3) * n * rounds;
+    }
+
+    if (src0->ne[0] % 128 == 0 && k <= 128) {
+        return nrows == 1 ? 0.1e-3 * n / n_threads : 0.1e-3 * n * rounds;
+    }
+    return 0.8e-3 * n * rounds;
+}
+
+static bool ggml_hexagon_sort_within_budget(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, int64_t k) {
+    if (opt_op_budget_ms <= 0) {
+        return true;
+    }
+    const double est = ggml_hexagon_estimate_sort_ms(op->src[0], k, sess->n_threads > 0 ? sess->n_threads : 4);
+    if (est > opt_op_budget_ms) {
+        HEX_VERBOSE("ggml-hex: %s %s %s estimated %.1f ms > budget %.1f ms, left to the CPU\n", sess->c_name(),
+                    ggml_op_desc(op), op->name, est, opt_op_budget_ms);
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0]; // values
     const struct ggml_tensor * dst  = op;         // indices
@@ -7537,7 +7583,7 @@ static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * s
         return false;
     }
 
-    return true;
+    return ggml_hexagon_sort_within_budget(sess, op, -1);
 }
 
 static bool ggml_hexagon_supported_top_k(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
@@ -7557,7 +7603,7 @@ static bool ggml_hexagon_supported_top_k(const struct ggml_hexagon_session * ses
         return false;
     }
 
-    return true;
+    return ggml_hexagon_sort_within_budget(sess, op, dst->ne[0]);
 }
 
 static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
@@ -9499,6 +9545,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
+    const char * str_budget   = getenv("GGML_HEXAGON_OP_BUDGET_MS");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -9527,6 +9574,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     // Update vmem default
     opt_vmem  = opt_arch >= 75 ? HTP_OP_MAX_VMEM_DEFAULT : 3000 * MiB;
     opt_dma64 = opt_arch > 79 && (!str_dma64 || atoi(str_dma64) != 0);
+    if (str_budget) {
+        opt_op_budget_ms = atof(str_budget);
+    }
 
     auto RE_ICASE = std::regex_constants::icase;
 

@@ -67,6 +67,12 @@ include(cmake/build-id.cmake)
 include(GNUInstallDirs)
 add_subdirectory(ggml/src/ggml-hexagon)
 
+if (GGML_HEXAGON_FUSA)
+    # Leave ops that would hold the DSP past half of a 50 ms self-test period without a
+    # yield point to the CPU (GGML_HEXAGON_OP_BUDGET_MS overrides at run time, 0 = off).
+    target_compile_definitions(ggml-hexagon PRIVATE GGML_HEXAGON_OP_BUDGET_MS_DEFAULT=25)
+endif()
+
 if (LLAMA_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
