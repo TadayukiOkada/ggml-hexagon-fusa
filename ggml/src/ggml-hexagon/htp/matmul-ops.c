@@ -2627,6 +2627,17 @@ static inline void hmx_matmul_job_init(hmx_matmul_job_t * job,
     job->n_dot_tiles = n_dot_tiles;
 }
 
+// Per-op VTCM contents of hmx_mm_2d_f32 that outlive a pass over the weight chunks: the HMX
+// output scales and the bias. Run at op start and after VTCM was given away.
+static void hmx_mm_2d_vtcm_setup(dma_queue * weight_dma, __fp16 * vtcm_scales, float * vtcm_bias,
+                                 dma_addr_t src2_addr, size_t src2_bytes, bool has_bias) {
+    hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));  // scale: 1.0, bias: 0.0 in FP16
+    if (has_bias) {
+        dma_queue_push(weight_dma, dma_make_data(vtcm_bias, src2_addr), hex_align_up(src2_bytes, 128), 0, src2_bytes, 1);
+        dma_queue_pop(weight_dma);
+    }
+}
+
 static int hmx_mm_2d_f32(struct htp_context *ctx,
                                   dma_queue *weight_dma,
                                   float *restrict dst,
@@ -2708,14 +2719,9 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
     void    *vtcm_scratch2   = VTCM_LAYOUT_PTR_OPTIONAL(void, base, L.off_dst[1], pipeline);
     __fp16  *vtcm_scales     = VTCM_LAYOUT_PTR(__fp16, base, L.off_scales);
 
-    hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));  // scale: 1.0, bias: 0.0 in FP16
-
     const bool has_bias      = (src2_bytes > 0 && src2_addr != 0);
     float   *vtcm_bias       = VTCM_LAYOUT_PTR_OPTIONAL(float, base, L.off_bias, has_bias);
-    if (has_bias) {
-        dma_queue_push(weight_dma, dma_make_data(vtcm_bias, src2_addr), hex_align_up(src2_bytes, 128), 0, src2_bytes, 1);
-        dma_queue_pop(weight_dma);
-    }
+    hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
 
     FARF(HIGH, "hmx-mm-2d: m %d k %d n %d wtype %d mc %zu nc %zu vtcm %zu/%zu",
          m, k, n, weight_type, m_chunk_n_rows, n_chunk_n_cols, vtcm_used, vtcm_budget);
@@ -2744,6 +2750,9 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
         for (size_t mr = 0; mr < m; mr += m_chunk_n_rows) {
             const size_t n_rows = hex_smin(m - mr, m_chunk_n_rows);
 
+            // First weight chunk of this pass; a pass restarts after VTCM was given away.
+            int i_start = 0;
+pipelined_pass: __attribute__((unused));
             struct activation_transfer_params act_params = {
                 .ctx = ctx,
                 .dst = vtcm_f16_act,
@@ -2761,21 +2770,21 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
             };
             transfer_activation_chunk_threaded(&act_params);
 
-            // Prologue: push A0 and optionally A1 (if n_chunk_cnt > 1)
-            const size_t   n_cols_A0 = hex_smin(n - 0 * n_chunk_n_cols, n_chunk_n_cols);
+            // Prologue: push A_{i_start} and optionally A_{i_start+1}
+            const size_t   n_cols_A0 = hex_smin(n - (size_t) i_start * n_chunk_n_cols, n_chunk_n_cols);
             const uint32_t height_A0 = is_tiled ? hmx_ceil_div(n_cols_A0, 32) * n_weight_tiles : n_cols_A0;
-            dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[0], weight),
+            dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[i_start % 4], weight + (size_t) i_start * n_chunk_n_cols * weight_stride),
                            dma_dst_stride, dma_src_stride, dma_width_bytes, height_A0);
 
-            if (1 < n_chunk_cnt) {
-                const size_t   n_cols_A1 = hex_smin(n - 1 * n_chunk_n_cols, n_chunk_n_cols);
+            if (i_start + 1 < n_chunk_cnt) {
+                const size_t   n_cols_A1 = hex_smin(n - (size_t) (i_start + 1) * n_chunk_n_cols, n_chunk_n_cols);
                 const uint32_t height_A1 = is_tiled ? hmx_ceil_div(n_cols_A1, 32) * n_weight_tiles : n_cols_A1;
-                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[1], weight + n_chunk_n_cols * weight_stride),
+                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[(i_start + 1) % 4], weight + (size_t) (i_start + 1) * n_chunk_n_cols * weight_stride),
                                dma_dst_stride, dma_src_stride, dma_width_bytes, height_A1);
             }
 
             // Main loop: pop A_i -> dequantize A_i -> push A_{i+2} -> submit C_i -> wait C_{i-1} and store D_{i-1}
-            for (int i = 0; i < n_chunk_cnt; ++i) {
+            for (int i = i_start; i < n_chunk_cnt; ++i) {
                 const size_t nc    = i * n_chunk_n_cols;
                 const size_t nc_p2 = nc + 2 * n_chunk_n_cols;
 
@@ -2806,7 +2815,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                 hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job_slots[i % 2]));
 
                 // 5. wait C_{i-1} and store D_{i-1} (multi-thread HVX, parallel with C_i)
-                if (i > 0) {
+                if (i > i_start) {
                     hmx_queue_pop(ctx->hmx_queue);
                     const size_t nc_prev = (i - 1) * n_chunk_n_cols;
                     const size_t n_cols_prev = hex_smin(n - nc_prev, n_chunk_n_cols);
@@ -2817,6 +2826,28 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                         transfer_output_chunk_threaded(ctx, output_chunk, bias_chunk, vtcm_output_bufs[(i - 1) % 2], n_rows, n_cols_prev, dst_stride, src2_stride, chunk_dst_cols, n_threads);
                     }
                 }
+
+#ifdef HTP_YIELD_IN_OPS
+                // A VTCM/HMX release was requested: finish C_i and store D_i, take the prefetched
+                // A_{i+1} (and A_{i+2}) off the DMA queue, give VTCM away, and start a new pass at
+                // i + 1 with the per-op setup and the activations staged again.
+                if (i + 1 < n_chunk_cnt && atomic_load(&ctx->vtcm_needs_release)) {
+                    hmx_queue_pop(ctx->hmx_queue);
+                    float *out_i = dst + (mr * dst_stride + nc);
+                    const float *bias_i = has_bias ? (vtcm_bias + mr * src2_stride + nc) : NULL;
+                    if (dst_cols - (int) nc > 0) {
+                        transfer_output_chunk_threaded(ctx, out_i, bias_i, vtcm_output_bufs[i % 2], n_rows, n_cols, dst_stride, src2_stride, dst_cols - (int) nc, n_threads);
+                    }
+                    dma_queue_pop(weight_dma);
+                    if (i + 2 < n_chunk_cnt) {
+                        dma_queue_pop(weight_dma);
+                    }
+                    htp_vtcm_yield(ctx);
+                    hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+                    i_start = i + 1;
+                    goto pipelined_pass;
+                }
+#endif
             }
 
             // Epilogue: wait C_{last} and store D_{last}
@@ -2839,6 +2870,9 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
         for (size_t mr = 0; mr < m; mr += m_chunk_n_rows) {
             const size_t n_rows = hex_smin(m - mr, m_chunk_n_rows);
 
+            // First weight chunk of this pass; a pass restarts after VTCM was given away.
+            int i_start = 0;
+sync_pass: __attribute__((unused));
             struct activation_transfer_params act_params = {
                 .ctx = ctx,
                 .dst = vtcm_f16_act,
@@ -2856,14 +2890,15 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
             };
             transfer_activation_chunk_threaded(&act_params);
 
-            // A0: Pre-fetch the first weight chunk (nc = 0)
-            if (n > 0) {
-                const size_t n_cols = hex_smin(n, n_chunk_n_cols);
+            // A0: Pre-fetch the first weight chunk of the pass
+            if (i_start < n_chunk_cnt) {
+                const size_t nc_start = (size_t) i_start * n_chunk_n_cols;
+                const size_t n_cols = hex_smin(n - nc_start, n_chunk_n_cols);
                 const uint32_t height = is_tiled ? hmx_ceil_div(n_cols, 32) * n_weight_tiles : n_cols;
-                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[0], weight), dma_dst_stride, dma_src_stride, dma_width_bytes, height);
+                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[i_start % 2], weight + nc_start * weight_stride), dma_dst_stride, dma_src_stride, dma_width_bytes, height);
             }
 
-            for (int i = 0; i < n_chunk_cnt; ++i) {
+            for (int i = i_start; i < n_chunk_cnt; ++i) {
                 const size_t nc = (size_t) i * n_chunk_n_cols;
                 const size_t n_cols = hex_smin(n - nc, n_chunk_n_cols);
                 const size_t n_row_tiles = hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS);
@@ -2898,6 +2933,18 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                 if (chunk_dst_cols > 0) {
                     transfer_output_chunk_threaded(ctx, output_chunk, bias_chunk, vtcm_output, n_rows, n_cols, dst_stride, src2_stride, chunk_dst_cols, n_threads);
                 }
+
+#ifdef HTP_YIELD_IN_OPS
+                // A VTCM/HMX release was requested: drop the prefetched next chunk, give VTCM away,
+                // and start a new pass at the next chunk.
+                if (nc_next < (size_t) n && atomic_load(&ctx->vtcm_needs_release)) {
+                    dma_queue_pop(weight_dma);
+                    htp_vtcm_yield(ctx);
+                    hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+                    i_start = i + 1;
+                    goto sync_pass;
+                }
+#endif
             }
         }
     }

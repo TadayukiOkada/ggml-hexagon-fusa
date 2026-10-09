@@ -1,4 +1,5 @@
 #include "htp-budget.h"
+#include "htp-kparams.h"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -40,9 +41,10 @@ static double htp_estimate_sort_ms(const struct ggml_tensor * src0, int64_t k, u
     return 0.8e-3 * n * rounds;
 }
 
-// A matmul has no point where VTCM could be released. The long ones are output projections
-// over many tokens (perplexity, embeddings). Estimate from v73 (QCS9075): about 5 TFLOP/s on
-// HMX and 45 GB/s of weights, whichever bounds it (lm_head 262144x1536 x 512 tokens: 71 ms).
+// The long matmuls are output projections over many tokens (perplexity, embeddings). The HMX
+// 2D kernel releases VTCM between weight chunks when the skel is built with yield inside ops;
+// the other kernels have no such point. Estimate from v73 (QCS9075): about 5 TFLOP/s on HMX
+// and 45 GB/s of weights, whichever bounds it (lm_head 262144x1536 x 512 tokens: 71 ms).
 // Only for weights with data: llama.cpp places weights by asking about a 512-token matmul
 // with a zero-size placeholder buffer, and a refusal there would keep the weight, and every
 // decode step, off the HTP. In a real graph a refused matmul runs on the CPU with the weight
@@ -54,6 +56,17 @@ static bool htp_mul_mat_within_budget(const struct ggml_hexagon_session * sess, 
     if (src0->data == nullptr) {
         return true;
     }
+
+#ifdef GGML_HEXAGON_HTP_YIELD_IN_OPS
+    // The kernel the op runs with: as at graph compute, after its rows are collapsed. A Hadamard
+    // MUL_MAT is another op.
+    if (htp_op_remap(op) == HTP_OP_MUL_MAT) {
+        htp_opnode node(HTP_OP_MUL_MAT, op);
+        if (htp_kparams_solve(sess, node) && node.kparams<htp_mm_kernel_params>()->kernel_type == HTP_MM_KERNEL_HMX_2D) {
+            return true;
+        }
+    }
+#endif
 
     const double flops = 2.0 * src0->ne[0] * src0->ne[1] * ggml_nrows(src1);
     const double est   = (std::max)(flops / 5.0e9, (double) ggml_nbytes(src0) / 45.0e6);
