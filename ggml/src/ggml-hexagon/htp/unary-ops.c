@@ -1976,7 +1976,26 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     }
 
     uctx.compute = compute_func;
+#ifdef HTP_YIELD_IN_OPS
+    // Large tensors (e.g. logit soft-capping over a whole ubatch, 128M elements) run in rounds of
+    // about 32 MiB, so VTCM/HMX can be given away between rounds when a release is requested.
+    // Each round stages its own rows; nothing in VTCM outlives a round.
+    const size_t   rows_32m   = (32u << 20) / MAX(src0_data_row_size, (size_t) 1);
+    const uint32_t round_rows = MAX(n_threads, (uint32_t) MIN(rows_32m, (size_t) nrows) / n_threads * n_threads);
+    for (uint32_t done = 0; done < nrows;) {
+        const uint32_t n = MIN(round_rows, nrows - done);
+        uctx.row_start             = row_start + done;
+        uctx.src0_nrows            = n;
+        uctx.src0_nrows_per_thread = fastdiv(n + n_threads - 1, &octx->n_threads_div);
+        work_queue_run(octx->ctx->work_queue, task_func, &uctx, n_threads);
+        done += n;
+        if (done < nrows && atomic_load(&octx->ctx->vtcm_needs_release)) {
+            htp_vtcm_yield(octx->ctx);
+        }
+    }
+#else
     work_queue_run(octx->ctx->work_queue, task_func, &uctx, n_threads);
+#endif
 
     return err;
 }
