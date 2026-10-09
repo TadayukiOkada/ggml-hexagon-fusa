@@ -24,6 +24,10 @@ include(ExternalProject)
 
 option(GGML_HEXAGON_HTP_DEBUG  "ggml-hexagon: enable HTP debug output" OFF)
 option(GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS "ggml-hexagon: release VTCM and HMX on request between ops, not only between op batches" OFF)
+option(GGML_HEXAGON_HTP_YIELD_IN_CPY "ggml-hexagon: release VTCM and HMX on request within non-contiguous copies" OFF)
+if (GGML_HEXAGON_HTP_YIELD_IN_CPY AND NOT GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS)
+    message(FATAL_ERROR "GGML_HEXAGON_HTP_YIELD_IN_CPY requires GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS")
+endif()
 set(GGML_HEXAGON_HTP_BUILD_TYPE "Release" CACHE STRING "ggml-hexagon: HTP skel build type (Release, RelWithDebInfo, Debug)")
 set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: enable HTP library signing using certificate")
 
@@ -73,6 +77,7 @@ function(build_htp_skel V)
             -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_ROOT}
             -DHEXAGON_HTP_DEBUG=${GGML_HEXAGON_HTP_DEBUG}
             -DHEXAGON_HTP_YIELD_BETWEEN_OPS=${GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS}
+            -DHEXAGON_HTP_YIELD_IN_CPY=${GGML_HEXAGON_HTP_YIELD_IN_CPY}
             -DDSP_VERSION=${V}
             -DPREBUILT_LIB_DIR="toolv19_${V}")
     list(APPEND HTP_SKELS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so)

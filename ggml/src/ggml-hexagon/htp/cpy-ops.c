@@ -437,7 +437,22 @@ static int cpy_reshape(struct htp_ops_context * octx, const struct htp_copy_kern
         default: return HTP_STATUS_NO_SUPPORT;
     }
 
+#ifdef HTP_YIELD_IN_CPY
+    const uint32_t chunk_elems = (128u * 1024u) / kparams->dst_type_size;
+    for (uint32_t done = 0; done < nelem;) {
+        ct.elem_start      = elem_start + done;
+        ct.nelem           = MIN(nelem - done, chunk_elems);
+        ct.elem_per_thread = fastdiv(ct.nelem + n_threads - 1, &octx->n_threads_div);
+        work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
+        done += ct.nelem;
+        if (done < nelem) {
+            // The copy state is in DDR; work_queue_run joins all workers before release.
+            htp_vtcm_yield(octx->ctx);
+        }
+    }
+#else
     work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
+#endif
     return HTP_STATUS_OK;
 }
 

@@ -144,6 +144,11 @@ static inline void htp_ops_context_set_status(struct htp_ops_context * octx, int
     }
 }
 
+#ifdef HTP_YIELD_BETWEEN_OPS
+// Call only when all workers and DMA jobs have finished and no live data remains in VTCM.
+void htp_vtcm_yield(struct htp_context * ctx);
+#endif
+
 int op_matmul(struct htp_ops_context * octx);
 int op_matmul_id(struct htp_ops_context * octx);
 int op_matmul_nx(struct htp_ops_context * octx);
