@@ -38,16 +38,18 @@ done
 cat > "$out/run.sh" <<'RUN'
 #!/bin/sh
 # usage: ./run.sh <tool> [args...]   (e.g. ./run.sh llama-cli -m model.gguf -dev HTP0 -ngl 99)
-# The skels are loaded from this directory; the rest of ADSP_LIBRARY_PATH is kept.
+# The skels are loaded from this directory, ahead of ADSP_LIBRARY_PATH. When that is
+# unset, the usual firmware library directories follow; boards that keep them
+# elsewhere should export ADSP_LIBRARY_PATH (';' separated) first.
 d=$(cd "$(dirname "$0")" && pwd)
 tool=$1; shift
-ADSP_LIBRARY_PATH="$d;${ADSP_LIBRARY_PATH:-}" LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/$tool" "$@"
+ADSP_LIBRARY_PATH="$d;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
+LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/$tool" "$@"
 RUN
 chmod +x "$out/run.sh"
 
 {
     echo "build-id:   $(cat "$build/hexagon-build-id.txt")"
-    echo "repository: $(git -C "$top" describe --always --dirty --abbrev=9)"
     echo "llama.cpp:  $(git -C "$top/llama.cpp" rev-parse HEAD)"
     for v in GGML_HEXAGON_FUSA GGML_HEXAGON_HTP_ARCHS GGML_HEXAGON_TOOLV GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY; do
         printf '%-36s %s\n' "$v" "$(sed -n "s/^$v:[A-Z]*=//p" "$cache")"
