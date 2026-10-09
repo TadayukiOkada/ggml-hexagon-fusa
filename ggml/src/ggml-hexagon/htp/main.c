@@ -1366,6 +1366,12 @@ static void process_ops(struct htp_context * ctx) {
 
         err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &dbuf, r_size, &r_size, (uint8_t *) &req);
         if (err == AEE_EWOULDBLOCK) {
+#ifdef HTP_YIELD_BETWEEN_OPS
+            // Do not hold VTCM/HMX while the queue is empty. A release request that arrives while
+            // polling is not reliably seen, so another client could otherwise wait for the whole
+            // stream of short batches (up to 51 ms measured on v73 with back-to-back small graphs).
+            vtcm_release(ctx);
+#endif
             if (--poll_count) {
                 qurt_sleep(DSPQUEUE_POLL_TIMEOUT_USEC);
                 continue;
@@ -1386,6 +1392,9 @@ static void process_ops(struct htp_context * ctx) {
         // Reset poll count for valid requests
         poll_count = DSPQUEUE_POLL_COUNT;
 
+#ifdef HTP_YIELD_BETWEEN_OPS
+        vtcm_acquire(ctx);
+#endif
         process_opbatch(ctx, &req, &dbuf);
     }
 
