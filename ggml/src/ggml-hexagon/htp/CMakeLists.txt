@@ -59,6 +59,11 @@ target_compile_definitions(${HTP_LIB} PRIVATE
     $<$<BOOL:${HEXAGON_HTP_YIELD_BETWEEN_OPS}>:HTP_YIELD_BETWEEN_OPS=1>
     $<$<BOOL:${HEXAGON_HTP_YIELD_IN_CPY}>:HTP_YIELD_IN_CPY=1>)
 
+# Keep build-machine paths out of the skel (__FILE__ in asserts).
+target_compile_options(${HTP_LIB} PRIVATE
+    -ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/=htp/
+    -ffile-prefix-map=${CMAKE_CURRENT_BINARY_DIR}/=)
+
 # SDK 5.5.x has no HMX voltage corners MIN_SVS and SVS_L2. Use the nearest lower corner.
 file(STRINGS ${HEXAGON_SDK_ROOT}/incs/HAP_power.h _hap_exp_vcorners REGEX "HAP_DCVS_EXP_VCORNER_(MIN_SVS|SVS_L2) *=")
 if (NOT _hap_exp_vcorners MATCHES "HAP_DCVS_EXP_VCORNER_MIN_SVS")
@@ -71,6 +76,11 @@ endif()
 build_idl(htp_iface.idl ${HTP_LIB})
 
 set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)
+
+# The linker records its command line, with build-machine paths, in .comment.
+add_custom_command(TARGET ${HTP_LIB} POST_BUILD
+    COMMAND ${HEXAGON_TOOLCHAIN}/Tools/bin/hexagon-llvm-objcopy --remove-section=.comment $<TARGET_FILE:${HTP_LIB}>
+    VERBATIM)
 
 # Embed the SWIV CRC in place, so install and signing see the verified image
 if (HEXAGON_SWIV_UTILITY)

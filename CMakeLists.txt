@@ -13,6 +13,11 @@ set(BUILD_SHARED_LIBS ON  CACHE BOOL "" FORCE)
 set(GGML_BACKEND_DL   ON  CACHE BOOL "" FORCE)
 set(GGML_HEXAGON      OFF CACHE BOOL "" FORCE)
 
+# Keep build-machine paths out of the binaries: __FILE__ in asserts and aborts,
+# and the build-tree RPATH (everything lands in bin/, so $ORIGIN is enough).
+add_compile_options(-ffile-prefix-map=${CMAKE_SOURCE_DIR}/= -ffile-prefix-map=${CMAKE_BINARY_DIR}/=)
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+
 # llama.cpp turns these off when it is not the top-level project.
 option(LLAMA_BUILD_COMMON   "llama: build common utils library" ON)
 option(LLAMA_BUILD_TOOLS    "llama: build tools"                ON)
