@@ -28,8 +28,11 @@ LINE = re.compile(
 
 
 # Ops that release VTCM/HMX on request inside the op in builds with GGML_HEXAGON_HTP_YIELD_IN_CPY
-# (CONT, CPY) and GGML_HEXAGON_HTP_YIELD_IN_OPS (flash attention, IM2COL, GET_ROWS, PAD, unary ops).
-YIELDING = ["CONT", "CPY", "FLASH_ATTN_EXT", "IM2COL", "GET_ROWS", "PAD",
+# (CONT, CPY) and GGML_HEXAGON_HTP_YIELD_IN_OPS (flash attention, IM2COL, GET_ROWS, PAD, unary ops,
+# multi-row sorts, the HMX 2D matmul). "OP:tag" only counts the op with that tag: the kernel
+# path for matmuls and flash attention (e.g. hmx-tiled), otherwise multi-row or single-row.
+YIELDING = ["CONT", "CPY", "FLASH_ATTN_EXT", "IM2COL", "GET_ROWS", "PAD", "MUL_MAT:hmx-tiled",
+            "ARGSORT:multi-row", "TOP_K:multi-row",
             "SCALE", "CLAMP", "LEAKY_RELU", "SQR", "SQRT", "NEG", "EXP", "SIGMOID", "SILU", "GELU",
             "GELU_QUICK", "GELU_ERF", "SOFTPLUS", "TANH", "ABS", "LOG", "RELU", "STEP",
             "NORM", "RMS_NORM", "RMS_NORM_MUL", "L2_NORM", "TRI"]
@@ -43,7 +46,20 @@ def parse(stream, groups):
         fields = m["fields"].split("|")
         dims = fields[1] if len(fields) > 1 else ""
         types = fields[2] if len(fields) > 2 else ""
-        groups[(m["dev"], m["op"], dims, types)].append(int(m["usec"]))
+        groups[(m["dev"], m["op"], dims, types, tag(m["op"], fields, dims))].append(int(m["usec"]))
+
+
+def tag(op, fields, dims):
+    """Kernel path of matmuls and flash attention, else whether the first source has several rows."""
+    last = fields[-1] if len(fields) > 4 else ""
+    if (op.startswith("MUL_MAT") or op == "FLASH_ATTN_EXT") and " vtcm " in last:
+        return last.split(" vtcm ")[0]
+    ne = [int(x) for x in re.findall(r"\d+", dims.split(" ")[0])]
+    return "multi-row" if len(ne) > 1 and math.prod(ne[1:]) > 1 else "single-row"
+
+
+def is_yielding(op, tg, yielding):
+    return op in yielding or f"{op}:{tg}" in yielding
 
 
 def p95(values):
@@ -78,14 +94,14 @@ def main():
     budget_us = args.budget_ms * 1000.0
     rows = sorted(groups.items(), key=lambda kv: max(kv[1]), reverse=True)
     yielding = {o.strip() for o in args.yielding.split(",") if o.strip()}
-    over = [r for r in rows if max(r[1]) > budget_us and r[0][1] not in yielding]
-    over_y = [r for r in rows if max(r[1]) > budget_us and r[0][1] in yielding]
+    over = [r for r in rows if max(r[1]) > budget_us and not is_yielding(r[0][1], r[0][4], yielding)]
+    over_y = [r for r in rows if max(r[1]) > budget_us and is_yielding(r[0][1], r[0][4], yielding)]
 
-    print(f"{'':2}{'max ms':>9} {'p95 ms':>9} {'mean ms':>9} {'count':>7}  op  dims  types")
-    for (dev, op, dims, types), us in rows[: args.top or None]:
-        flag = ("~~" if op in yielding else "!!") if max(us) > budget_us else ""
+    print(f"{'':2}{'max ms':>9} {'p95 ms':>9} {'mean ms':>9} {'count':>7}  op  dims  types  tag")
+    for (dev, op, dims, types, tg), us in rows[: args.top or None]:
+        flag = ("~~" if is_yielding(op, tg, yielding) else "!!") if max(us) > budget_us else ""
         print(f"{flag:2}{max(us) / 1000:9.2f} {p95(us) / 1000:9.2f} {sum(us) / len(us) / 1000:9.2f} {len(us):7d}  "
-              f"{dev} {op}  {dims}  {types}")
+              f"{dev} {op}  {dims}  {types}  {tg}")
     print(f"\n{len(over)} of {len(rows)} op groups exceed {args.budget_ms:g} ms"
           f" (plus {len(over_y)} of the yielding ops {','.join(sorted(yielding))})")
     return 1 if args.fail and over else 0
