@@ -1257,7 +1257,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
 // Give VTCM and HMX to other clients between ops, not only between batches.
 // A batch can be a whole graph. Some clients (e.g. the NSP self-test on FuSa firmware) fail if they wait that long.
 // VTCM only holds per-op scratch, so this is safe.
-static void vtcm_yield(struct htp_context * ctx) {
+void htp_vtcm_yield(struct htp_context * ctx) {
     if (!ctx->vtcm_needs_release) {
         return;
     }
@@ -1368,7 +1368,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 
 #ifdef HTP_YIELD_BETWEEN_OPS
         if (i + 1 < n_ops) {
-            vtcm_yield(ctx);
+            htp_vtcm_yield(ctx);
         }
 #endif
     }
