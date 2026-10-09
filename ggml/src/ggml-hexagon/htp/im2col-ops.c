@@ -23,9 +23,11 @@
 struct htp_im2col_context {
     struct htp_ops_context * octx;
 
-    uint32_t pe_row_base;                          // first output row index assigned to this dev (DMA path)
-    uint32_t pe_nrows;                             // number of output rows assigned to this dev (DMA path)
-    uint32_t pe_rows_per_thread;                   // output rows per worker
+    // Work blocks of one run of the threads: a block is pe_owb output columns of one output row
+    // (a whole row for the patch-embed kernels), numbered row * pe_nbpr + column block.
+    uint32_t pe_blk_base;                          // first block of this run
+    uint32_t pe_nblks;                             // number of blocks in this run
+    uint32_t pe_blks_per_thread;                   // blocks per worker
     uint32_t pe_src_row_bytes;                     // one output row's source, rounded 256
     uint32_t pe_dst_row_bytes;                     // one output row's dst: OW*patch_stride*2, rounded 256
 
@@ -48,6 +50,8 @@ struct htp_im2col_context {
     uint32_t patch_stride;
 
     // Per-thread initial coordinates (removes division from thread prologue)
+    uint32_t thread_r[HTP_MAX_NTHREADS];
+    uint32_t thread_c0[HTP_MAX_NTHREADS];
     uint32_t thread_in[HTP_MAX_NTHREADS];
     uint32_t thread_iod[HTP_MAX_NTHREADS];
     uint32_t thread_ioh[HTP_MAX_NTHREADS];
@@ -223,7 +227,6 @@ static void im2col_blocked_dma_thread(unsigned int nth, unsigned int ith, void *
     const uint32_t OW                     = ictx->OW;
     const uint32_t KH                     = ictx->KH;
     const uint32_t owb                    = ictx->pe_owb;
-    const uint32_t nbpr                   = ictx->pe_nbpr;
     const uint32_t patch_stride           = ictx->patch_stride;
     const uint32_t dst_elem               = ictx->dst_elem;
     im2col_blocked_compute_fn_t compute   = (im2col_blocked_compute_fn_t) ictx->compute;
@@ -234,23 +237,19 @@ static void im2col_blocked_dma_thread(unsigned int nth, unsigned int ith, void *
     float *        srcb2[2]               = { (float *) srcb_base, (float *) (srcb_base + ictx->pe_src_row_bytes) };
     void *         dstb2[2]               = { dstb_base, dstb_base + ictx->pe_dst_row_bytes };
     float *        scratch                = (float *) (srcb_base + 2 * ictx->pe_src_row_bytes);
-    const uint32_t row_end_max            = ictx->pe_row_base + ictx->pe_nrows;
-    const uint32_t row_start              = ictx->pe_row_base + ictx->pe_rows_per_thread * ith;
-    const uint32_t row_end                = MIN(row_start + ictx->pe_rows_per_thread, row_end_max);
-    if (row_start >= row_end) {
+    const uint32_t blk_end_max = ictx->pe_blk_base + ictx->pe_nblks;
+    const uint32_t blk_start   = ictx->pe_blk_base + ictx->pe_blks_per_thread * ith;
+    const uint32_t blk_end     = MIN(blk_start + ictx->pe_blks_per_thread, blk_end_max);
+    if (blk_start >= blk_end) {
         return;
     }
-    const uint32_t nrows_local  = row_end - row_start;
-    const uint32_t total_blocks = nrows_local * nbpr;
-    if (total_blocks == 0) {
-        return;
-    }
+    const uint32_t total_blocks = blk_end - blk_start;
     struct im2col_cursor cur = {
-        .r   = row_start,
+        .r   = ictx->thread_r[ith],
         .in  = ictx->thread_in[ith],
         .iod = 0,
         .ioh = ictx->thread_ioh[ith],
-        .c0  = 0,
+        .c0  = ictx->thread_c0[ith],
     };
     struct im2col_cursor stage = cur;
     for (uint32_t i = 0; i < total_blocks && i < 2; i++) {
@@ -364,22 +363,19 @@ static void im2col_patchembed_dma_thread(unsigned int nth, unsigned int ith, voi
     uint8_t *      dstb_base                = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;
     float *        srcb2[2]                 = { (float *) srcb_base, (float *) (srcb_base + ictx->pe_src_row_bytes) };
     void *         dstb2[2]                 = { dstb_base, dstb_base + ictx->pe_dst_row_bytes };
-    const uint32_t row_end_max              = ictx->pe_row_base + ictx->pe_nrows;
-    const uint32_t row_start                = ictx->pe_row_base + ictx->pe_rows_per_thread * ith;
-    const uint32_t row_end                  = MIN(row_start + ictx->pe_rows_per_thread, row_end_max);
-    if (row_start >= row_end) {
+    const uint32_t blk_end_max = ictx->pe_blk_base + ictx->pe_nblks;
+    const uint32_t blk_start   = ictx->pe_blk_base + ictx->pe_blks_per_thread * ith;
+    const uint32_t blk_end     = MIN(blk_start + ictx->pe_blks_per_thread, blk_end_max);
+    if (blk_start >= blk_end) {
         return;
     }
-    const uint32_t total_rows = row_end - row_start;
-    if (total_rows == 0) {
-        return;
-    }
+    const uint32_t total_rows = blk_end - blk_start; // one block per row
     struct im2col_cursor cur = {
-        .r   = row_start,
+        .r   = ictx->thread_r[ith],
         .in  = ictx->thread_in[ith],
         .iod = 0,
         .ioh = ictx->thread_ioh[ith],
-        .c0  = 0,
+        .c0  = ictx->thread_c0[ith],
     };
     struct im2col_cursor stage = cur;
     for (uint32_t i = 0; i < total_rows && i < 2; i++) {
@@ -568,7 +564,6 @@ static void im2col_3d_blocked_dma_thread(unsigned int nth, unsigned int ith, voi
     const uint32_t kd_kh        = KD * KH;
     const uint32_t patch_stride = ictx->patch_stride;
     const uint32_t owb          = ictx->pe_owb;
-    const uint32_t nbpr         = ictx->pe_nbpr;
     const uint32_t dst_elem     = ictx->dst_elem;
     const dma_addr_t dst_data   = dst->data;
     dma_queue * dma_q           = octx->ctx->dma[ith];
@@ -577,23 +572,19 @@ static void im2col_3d_blocked_dma_thread(unsigned int nth, unsigned int ith, voi
     float * srcb2[2]            = { (float *) srcb_base, (float *) (srcb_base + ictx->pe_src_row_bytes) };
     void * dstb2[2]             = { dstb_base, dstb_base + ictx->pe_dst_row_bytes };
     float * scratch             = (float *) (srcb_base + 2 * ictx->pe_src_row_bytes);
-    const uint32_t row_end_max  = ictx->pe_row_base + ictx->pe_nrows;
-    const uint32_t row_start    = ictx->pe_row_base + ictx->pe_rows_per_thread * ith;
-    const uint32_t row_end      = MIN(row_start + ictx->pe_rows_per_thread, row_end_max);
-    if (row_start >= row_end) {
+    const uint32_t blk_end_max = ictx->pe_blk_base + ictx->pe_nblks;
+    const uint32_t blk_start   = ictx->pe_blk_base + ictx->pe_blks_per_thread * ith;
+    const uint32_t blk_end     = MIN(blk_start + ictx->pe_blks_per_thread, blk_end_max);
+    if (blk_start >= blk_end) {
         return;
     }
-    const uint32_t nrows_local  = row_end - row_start;
-    const uint32_t total_blocks = nrows_local * nbpr;
-    if (total_blocks == 0) {
-        return;
-    }
+    const uint32_t total_blocks = blk_end - blk_start;
     struct im2col_cursor cur = {
-        .r   = row_start,
+        .r   = ictx->thread_r[ith],
         .in  = ictx->thread_in[ith],
         .iod = ictx->thread_iod[ith],
         .ioh = ictx->thread_ioh[ith],
-        .c0  = 0,
+        .c0  = ictx->thread_c0[ith],
     };
     struct im2col_cursor stage = cur;
     for (uint32_t i = 0; i < total_blocks && i < 2; i++) {
@@ -711,24 +702,24 @@ static void im2col_3d_patchembed_dma_thread(unsigned int nth, unsigned int ith, 
     const uint32_t dst_elem     = ictx->dst_elem;
     const dma_addr_t dst_data   = dst->data;
     dma_queue * dma_q           = octx->ctx->dma[ith];
-    const uint32_t row_end_max  = ictx->pe_row_base + ictx->pe_nrows;
-    const uint32_t row_start    = ictx->pe_row_base + ictx->pe_rows_per_thread * ith;
-    const uint32_t row_end      = MIN(row_start + ictx->pe_rows_per_thread, row_end_max);
-    if (row_start >= row_end) {
+    const uint32_t blk_end_max = ictx->pe_blk_base + ictx->pe_nblks;
+    const uint32_t blk_start   = ictx->pe_blk_base + ictx->pe_blks_per_thread * ith;
+    const uint32_t blk_end     = MIN(blk_start + ictx->pe_blks_per_thread, blk_end_max);
+    if (blk_start >= blk_end) {
         return;
     }
 
-    const uint32_t nrows_local  = row_end - row_start;
+    const uint32_t nrows_local  = blk_end - blk_start; // one block per row
     uint8_t * src_base          = ictx->pe_vtcm_src + ith * ictx->pe_src_size_per_thread;
     uint8_t * dstb_base         = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;
     float * srcb2[2]            = { (float *) src_base, (float *) (src_base + ictx->pe_src_row_bytes) };
     void * dstb2[2]             = { dstb_base, dstb_base + ictx->pe_dst_row_bytes };
     struct im2col_cursor cur = {
-        .r   = row_start,
+        .r   = ictx->thread_r[ith],
         .in  = ictx->thread_in[ith],
         .iod = ictx->thread_iod[ith],
         .ioh = ictx->thread_ioh[ith],
-        .c0  = 0,
+        .c0  = ictx->thread_c0[ith],
     };
     struct im2col_cursor stage = cur;
     for (uint32_t i = 0; i < nrows_local && i < 2; i++) {
@@ -760,6 +751,49 @@ static void im2col_3d_patchembed_dma_thread(unsigned int nth, unsigned int ith, 
         im2col_3d_step_row(&cur, ictx);
     }
     dma_queue_flush(dma_q);
+}
+
+// Run the blocks of output rows [row_base, row_base + nrows) on the threads. With yield inside ops
+// they run in rounds of about 2 MiB of output, so VTCM/HMX can be given away between rounds when
+// a release is requested (e.g. by a functional-safety self-test); a 1D convolution can have a
+// single multi-MiB row. The DMA pipelines of the threads do not outlive a round.
+static void im2col_run(struct htp_ops_context * octx, struct htp_im2col_context * ictx,
+                       const struct htp_im2col_kernel_params * kparams, uint32_t row_base, uint32_t nrows,
+                       worker_callback_t thread_fn) {
+    const uint32_t pth   = octx->n_threads;
+    const uint32_t nbpr  = ictx->pe_nbpr;
+    const uint32_t total = nrows * nbpr;
+#ifdef HTP_YIELD_IN_OPS
+    const uint32_t blks_2m = (2u << 20) / MAX(kparams->dst_row_bytes, 1u);
+    const uint32_t round   = MAX(pth, blks_2m / pth * pth);
+#else
+    const uint32_t round = total;
+#endif
+
+    for (uint32_t done = 0; done < total;) {
+        const uint32_t n = MIN(round, total - done);
+        ictx->pe_blk_base        = row_base * nbpr + done;
+        ictx->pe_nblks           = n;
+        ictx->pe_blks_per_thread = fastdiv(n + pth - 1, &octx->n_threads_div);
+        for (uint32_t ith = 0; ith < pth; ith++) {
+            const uint32_t b    = ictx->pe_blk_base + ictx->pe_blks_per_thread * ith;
+            const uint32_t r    = b / nbpr;
+            const uint32_t q_oh = fastdiv(r, &kparams->div_OH);
+            const uint32_t in   = fastdiv(q_oh, &kparams->div_OD);
+            ictx->thread_r[ith]   = r;
+            ictx->thread_c0[ith]  = (b - r * nbpr) * ictx->pe_owb;
+            ictx->thread_ioh[ith] = r - q_oh * kparams->OH;
+            ictx->thread_iod[ith] = q_oh - in * kparams->OD;
+            ictx->thread_in[ith]  = in;
+        }
+        work_queue_run(octx->ctx->work_queue, thread_fn, ictx, pth);
+        done += n;
+#ifdef HTP_YIELD_IN_OPS
+        if (done < total && atomic_load(&octx->ctx->vtcm_needs_release)) {
+            htp_vtcm_yield(octx->ctx);
+        }
+#endif
+    }
 }
 
 int op_im2col(struct htp_ops_context * octx) {
@@ -796,9 +830,6 @@ int op_im2col(struct htp_ops_context * octx) {
 
     const uint32_t pth = octx->n_threads;
     ictx.octx                   = octx;
-    ictx.pe_row_base            = row_base;
-    ictx.pe_nrows               = nrows;
-    ictx.pe_rows_per_thread     = fastdiv(nrows + pth - 1, &octx->n_threads_div);
     ictx.pe_src_row_bytes       = kparams->src_row_bytes;
     ictx.pe_dst_row_bytes       = kparams->dst_row_bytes;
     ictx.pe_vtcm_src            = VTCM_LAYOUT_PTR(uint8_t, base, layout.off_src);
@@ -821,24 +852,17 @@ int op_im2col(struct htp_ops_context * octx) {
     ictx.OW                     = kparams->OW;
     ictx.patch_stride           = kparams->patch_stride;
 
-    for (uint32_t ith = 0; ith < pth; ith++) {
-        const uint32_t r  = row_base + ictx.pe_rows_per_thread * ith;
-        const uint32_t in = fastdiv(r, &kparams->div_OH);
-        ictx.thread_ioh[ith] = r - in * kparams->OH;
-        ictx.thread_in[ith]  = in;
-    }
-
     ictx.dst_elem = dst->type == HTP_TYPE_F16 ? sizeof(__fp16) : sizeof(float);
 
     if (kparams->kernel_type == HTP_IM2COL_KERNEL_PATCHEMBED_DMA) {
         ictx.compute = dst->type == HTP_TYPE_F16 ? (void *) im2col_patchembed_compute_f16
                                                  : (void *) im2col_patchembed_compute_f32;
-        work_queue_run(octx->ctx->work_queue, im2col_patchembed_dma_thread, &ictx, pth);
+        im2col_run(octx, &ictx, kparams, row_base, nrows, im2col_patchembed_dma_thread);
         return HTP_STATUS_OK;
     } else if (kparams->kernel_type == HTP_IM2COL_KERNEL_BLOCKED_DMA) {
         ictx.compute = dst->type == HTP_TYPE_F16 ? (void *) im2col_blocked_compute_f16
                                                  : (void *) im2col_blocked_compute_f32;
-        work_queue_run(octx->ctx->work_queue, im2col_blocked_dma_thread, &ictx, pth);
+        im2col_run(octx, &ictx, kparams, row_base, nrows, im2col_blocked_dma_thread);
         return HTP_STATUS_OK;
     }
 
@@ -880,9 +904,6 @@ int op_im2col_3d(struct htp_ops_context * octx) {
 
     const uint32_t pth = octx->n_threads;
     ictx.octx                   = octx;
-    ictx.pe_row_base            = row_base;
-    ictx.pe_nrows               = nrows;
-    ictx.pe_rows_per_thread     = fastdiv(nrows + pth - 1, &octx->n_threads_div);
     ictx.pe_src_row_bytes       = kparams->src_row_bytes;
     ictx.pe_dst_row_bytes       = kparams->dst_row_bytes;
     ictx.pe_vtcm_src            = VTCM_LAYOUT_PTR(uint8_t, base, layout.off_src);
@@ -905,26 +926,17 @@ int op_im2col_3d(struct htp_ops_context * octx) {
     ictx.OW                     = kparams->OW;
     ictx.patch_stride           = kparams->patch_stride;
 
-    for (uint32_t ith = 0; ith < pth; ith++) {
-        const uint32_t rem  = row_base + ictx.pe_rows_per_thread * ith;
-        const uint32_t q_oh = fastdiv(rem, &kparams->div_OH);
-        ictx.thread_ioh[ith] = rem - q_oh * kparams->OH;
-        const uint32_t in   = fastdiv(q_oh, &kparams->div_OD);
-        ictx.thread_iod[ith] = q_oh - in * kparams->OD;
-        ictx.thread_in[ith]  = in;
-    }
-
     ictx.dst_elem = dst->type == HTP_TYPE_F16 ? sizeof(__fp16) : sizeof(float);
 
     if (kparams->kernel_type == HTP_IM2COL_KERNEL_PATCHEMBED_DMA) {
         ictx.compute = dst->type == HTP_TYPE_F16 ? (void *) im2col_3d_patchembed_compute_f16
                                                  : (void *) im2col_3d_patchembed_compute_f32;
-        work_queue_run(octx->ctx->work_queue, im2col_3d_patchembed_dma_thread, &ictx, pth);
+        im2col_run(octx, &ictx, kparams, row_base, nrows, im2col_3d_patchembed_dma_thread);
         return HTP_STATUS_OK;
     } else if (kparams->kernel_type == HTP_IM2COL_KERNEL_BLOCKED_DMA) {
         ictx.compute = dst->type == HTP_TYPE_F16 ? (void *) im2col_3d_blocked_compute_f16
                                                  : (void *) im2col_3d_blocked_compute_f32;
-        work_queue_run(octx->ctx->work_queue, im2col_3d_blocked_dma_thread, &ictx, pth);
+        im2col_run(octx, &ictx, kparams, row_base, nrows, im2col_3d_blocked_dma_thread);
         return HTP_STATUS_OK;
     }
 
