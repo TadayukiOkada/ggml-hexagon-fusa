@@ -25,6 +25,22 @@
       "cacheVariables": {
         "LLAMA_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "arm64-oe-linux-v73-fusa",
+      "displayName": "ARM64 OE Linux, HTP v73 on FuSa firmware (skel from an older SDK, yield, SWIV)",
+      "inherits": "arm64-oe-linux",
+      "cacheVariables": {
+        "LLAMA_BUILD_TESTS": "ON",
+        "GGML_HEXAGON_FUSA": "ON",
+        "GGML_HEXAGON_HTP_ARCHS": "v73",
+        "GGML_HEXAGON_HTP_SDK_ROOT": "$env{HEXAGON_HTP_SDK_ROOT}",
+        "GGML_HEXAGON_HTP_TOOLS_ROOT": "$env{HEXAGON_HTP_TOOLS_ROOT}",
+        "GGML_HEXAGON_TOOLV": "$env{HEXAGON_HTP_TOOLV}",
+        "GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS": "ON",
+        "GGML_HEXAGON_HTP_YIELD_IN_CPY": "ON",
+        "GGML_HEXAGON_SWIV_UTILITY": "$env{SWIV_BUILD_UTILITY}"
+      }
     }
   ]
 }

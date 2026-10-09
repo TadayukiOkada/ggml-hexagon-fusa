@@ -50,6 +50,31 @@ function(ggml_add_backend_library backend)
     endif()
 endfunction()
 
+option(GGML_HEXAGON_FUSA "ggml-hexagon: build for functional-safety DSP firmware and check the settings it needs" OFF)
+set(GGML_HEXAGON_FUSA_SHELL "$ENV{GGML_HEXAGON_FUSA_SHELL}" CACHE FILEPATH
+    "ggml-hexagon: DSP firmware shell (fastrpc_shell_*) to check the skel imports against; optional")
+if (GGML_HEXAGON_FUSA)
+    if (NOT GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS OR NOT GGML_HEXAGON_HTP_YIELD_IN_CPY)
+        message(FATAL_ERROR "GGML_HEXAGON_FUSA needs GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS and GGML_HEXAGON_HTP_YIELD_IN_CPY")
+    endif()
+    if (NOT EXISTS "${GGML_HEXAGON_SWIV_UTILITY}")
+        message(FATAL_ERROR "GGML_HEXAGON_FUSA needs GGML_HEXAGON_SWIV_UTILITY (swiv_build_utility.py); got '${GGML_HEXAGON_SWIV_UTILITY}'")
+    endif()
+endif()
+
 include(cmake/build-id.cmake)
 include(GNUInstallDirs)
 add_subdirectory(ggml/src/ggml-hexagon)
+
+if (GGML_HEXAGON_FUSA)
+    # Check every skel after it is built: SWIV section, and imports against the firmware shell if given.
+    foreach(V IN LISTS GGML_HEXAGON_HTP_ARCHS)
+        add_custom_target(check-htp-${V} ALL
+            COMMAND ${CMAKE_SOURCE_DIR}/scripts/check-skel.sh
+                    ${CMAKE_BINARY_DIR}/ggml/src/ggml-hexagon/libggml-htp-${V}.so
+                    ${GGML_HEXAGON_HTP_TOOLS_ROOT} "${GGML_HEXAGON_FUSA_SHELL}"
+            DEPENDS htp-${V}
+            COMMENT "checking libggml-htp-${V}.so"
+            VERBATIM)
+    endforeach()
+endif()
