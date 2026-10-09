@@ -505,6 +505,30 @@ int op_get_rows(struct htp_ops_context * octx) {
          grctx.vtcm_layout.dst_bytes_per_thread  * n_threads,
          kparams->kernel_type, n_threads);
 
+#ifdef HTP_YIELD_IN_OPS
+    // Many rows (e.g. 280k quantized rows, about 60 ms on v73) run in rounds of about 8 MiB of
+    // output, so VTCM/HMX can be given away between rounds when a release is requested.
+    // Each round stages its own rows; the indices staged in VTCM are staged again after a yield.
+    const size_t   row_bytes = MAX((size_t) octx->dst->nb[1], (size_t) 1);
+    const uint32_t round     = MAX(n_threads, (uint32_t) MIN((size_t) tasks, (8u << 20) / row_bytes) / n_threads * n_threads);
+    if (round < tasks) {
+        for (uint32_t done = 0; done < tasks;) {
+            const uint32_t n = MIN(round, tasks - done);
+            grctx.task_start       = task_start + done;
+            grctx.tasks            = n;
+            grctx.tasks_per_thread = fastdiv(n + n_threads - 1, &octx->n_threads_div);
+            work_queue_run(octx->ctx->work_queue, q_func, &grctx, n_threads);
+            done += n;
+            if (done < tasks && atomic_load(&octx->ctx->vtcm_needs_release)) {
+                htp_vtcm_yield(octx->ctx);
+                if (grctx.read_index == get_rows_read_index_vtcm) {
+                    get_rows_dma_src1(octx, (uint8_t *) grctx.src1_data, elem_size);
+                }
+            }
+        }
+        return HTP_STATUS_OK;
+    }
+#endif
     work_queue_run(octx->ctx->work_queue, q_func, &grctx, n_threads);
     return HTP_STATUS_OK;
 }

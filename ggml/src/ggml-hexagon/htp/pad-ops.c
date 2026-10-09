@@ -569,19 +569,34 @@ int op_pad(struct htp_ops_context * octx) {
          dst->ne[0],  dst->ne[1],  dst->ne[2],  dst->ne[3],
          lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
 
+    worker_callback_t fn;
     switch (kparams->kernel_type) {
-        case HTP_PAD_KERNEL_HVX_CIRCULAR_DMA:
-            work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx_circular_dma, &pctx, n_threads);
-            break;
-        case HTP_PAD_KERNEL_HVX_CIRCULAR:
-            work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx_circular,     &pctx, n_threads);
-            break;
-        case HTP_PAD_KERNEL_HVX_DMA:
-            work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx_dma,          &pctx, n_threads);
-            break;
-        default:
-            work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx,              &pctx, n_threads);
-            break;
+        case HTP_PAD_KERNEL_HVX_CIRCULAR_DMA: fn = pad_job_per_thread_hvx_circular_dma; break;
+        case HTP_PAD_KERNEL_HVX_CIRCULAR:     fn = pad_job_per_thread_hvx_circular;     break;
+        case HTP_PAD_KERNEL_HVX_DMA:          fn = pad_job_per_thread_hvx_dma;          break;
+        default:                              fn = pad_job_per_thread_hvx;              break;
+    }
+
+#ifdef HTP_YIELD_IN_OPS
+    // Many rows run in rounds of about 4 MiB of output, so VTCM/HMX can be given away between
+    // rounds when a release is requested. Each round stages its own rows.
+    const size_t   row_bytes = MAX((size_t) dst->nb[1], (size_t) 1);
+    const uint32_t round     = MAX(n_threads, (uint32_t) MIN((size_t) nrows, (4u << 20) / row_bytes) / n_threads * n_threads);
+#else
+    const uint32_t round = nrows;
+#endif
+    for (uint32_t done = 0; done < nrows;) {
+        const uint32_t n = MIN(round, nrows - done);
+        pctx.row_start        = row_start + done;
+        pctx.total_dst_rows   = n;
+        pctx.nrows_per_thread = fastdiv(n + n_threads - 1, &octx->n_threads_div);
+        work_queue_run(octx->ctx->work_queue, fn, &pctx, n_threads);
+        done += n;
+#ifdef HTP_YIELD_IN_OPS
+        if (done < nrows && atomic_load(&octx->ctx->vtcm_needs_release)) {
+            htp_vtcm_yield(octx->ctx);
+        }
+#endif
     }
 
     return HTP_STATUS_OK;
