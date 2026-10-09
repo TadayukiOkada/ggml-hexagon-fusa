@@ -181,10 +181,9 @@ IM2COL_PATCHEMBED_BODY(im2col_patchembed_f32_thread, float, hvx_copy_f32_uu, hvx
         uint8_t *      dstb_base        = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;                              \
         float *        srcb2[2]         = { (float *) srcb_base, (float *) (srcb_base + ictx->pe_src_row_bytes) };             \
         DST_CTYPE *    dstb2[2]   = { (DST_CTYPE *) dstb_base, (DST_CTYPE *) (dstb_base + ictx->pe_dst_row_bytes) };           \
-        const uint32_t nrows      = N * OH;                                                                                    \
         const uint32_t per_thread = ictx->pe_rows_per_thread;                                                                  \
-        const uint32_t row_start  = per_thread * ith;                                                                          \
-        const uint32_t row_end    = MIN(row_start + per_thread, nrows);                                                        \
+        const uint32_t row_start  = ictx->pe_row_base + per_thread * ith;                                                      \
+        const uint32_t row_end    = MIN(row_start + per_thread, ictx->pe_row_base + ictx->pe_nrows);                           \
         if (row_start >= row_end)                                                                                              \
             return;                                                                                                            \
         const uint32_t nbpr         = (OW + owb - 1) / owb;                                                                    \
@@ -489,6 +488,32 @@ static bool im2col_blocked_dma_fits(struct htp_ops_context *    octx,
     return false;
 }
 
+// Run a row kernel (N*OH output rows). With HTP_YIELD_IN_OPS the rows go in rounds of about
+// 2 MiB of output, and VTCM/HMX is given away between rounds when a release is requested
+// (a strided audio conv runs about 130 ms on v73). Each round stages its own rows.
+static void im2col_run_rows(struct htp_ops_context * octx, struct htp_im2col_context * ictx, worker_callback_t fn,
+                            uint32_t row_base, uint32_t nrows, uint32_t pth, size_t row_bytes) {
+#ifdef HTP_YIELD_IN_OPS
+    const uint32_t round = MAX(pth, (uint32_t) MIN((size_t) nrows, (2u << 20) / MAX(row_bytes, (size_t) 1)) / pth * pth);
+#else
+    const uint32_t round = nrows;
+    (void) row_bytes;
+#endif
+    for (uint32_t done = 0; done < nrows;) {
+        const uint32_t n = MIN(round, nrows - done);
+        ictx->pe_row_base        = row_base + done;
+        ictx->pe_nrows           = n;
+        ictx->pe_rows_per_thread = (n + pth - 1) / pth;
+        work_queue_run(octx->ctx->work_queue, fn, ictx, pth);
+        done += n;
+#ifdef HTP_YIELD_IN_OPS
+        if (done < nrows && atomic_load(&octx->ctx->vtcm_needs_release)) {
+            htp_vtcm_yield(octx->ctx);
+        }
+#endif
+    }
+}
+
 int op_im2col(struct htp_ops_context * octx) {
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
@@ -553,17 +578,15 @@ int op_im2col(struct htp_ops_context * octx) {
             ictx.pe_nrows    = nrows;
             const bool exact = im2col_use_patchembed_dma(octx);
             if (exact && im2col_patchembed_dma_fits(octx, &ictx, pth)) {
-                ictx.pe_rows_per_thread = (nrows + pth - 1) / pth;
-                work_queue_run(octx->ctx->work_queue,
-                    dst->type == HTP_TYPE_F16 ? im2col_patchembed_dma_thread
-                                              : im2col_patchembed_dma_f32_thread, &ictx, pth);
+                im2col_run_rows(octx, &ictx, dst->type == HTP_TYPE_F16 ? im2col_patchembed_dma_thread
+                                                                       : im2col_patchembed_dma_f32_thread,
+                                row_base, nrows, pth, dst->nb[2]);
                 return HTP_STATUS_OK;
             }
             if (!exact && im2col_blocked_dma_fits(octx, &ictx, pth)) {
-                ictx.pe_rows_per_thread = (nrows + pth - 1) / pth;
-                work_queue_run(octx->ctx->work_queue,
-                    dst->type == HTP_TYPE_F16 ? im2col_blocked_dma_thread
-                                              : im2col_blocked_dma_f32_thread, &ictx, pth);
+                im2col_run_rows(octx, &ictx, dst->type == HTP_TYPE_F16 ? im2col_blocked_dma_thread
+                                                                       : im2col_blocked_dma_f32_thread,
+                                row_base, nrows, pth, dst->nb[2]);
                 return HTP_STATUS_OK;
             }
         }
@@ -577,10 +600,25 @@ int op_im2col(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (dst->type == HTP_TYPE_F16) {
-        work_queue_run(octx->ctx->work_queue, im2col_patchembed_thread, &ictx, n_threads);
-    } else {
-        work_queue_run(octx->ctx->work_queue, im2col_patchembed_f32_thread, &ictx, n_threads);
+    const worker_callback_t fn = dst->type == HTP_TYPE_F16 ? im2col_patchembed_thread : im2col_patchembed_f32_thread;
+#ifdef HTP_YIELD_IN_OPS
+    // Patches in rounds of about 2 MiB of output, as for the row kernels.
+    const uint32_t round = MAX(n_threads, (uint32_t) MIN((size_t) npatches, (2u << 20) / MAX((size_t) dst->nb[1], (size_t) 1)));
+#else
+    const uint32_t round = npatches;
+#endif
+    for (uint32_t done = 0; done < npatches;) {
+        const uint32_t n = MIN(round, npatches - done);
+        ictx.patch_base          = patch_base + done;
+        ictx.npatches            = n;
+        ictx.npatches_per_thread = (n + n_threads - 1) / n_threads;
+        work_queue_run(octx->ctx->work_queue, fn, &ictx, n_threads);
+        done += n;
+#ifdef HTP_YIELD_IN_OPS
+        if (done < npatches && atomic_load(&octx->ctx->vtcm_needs_release)) {
+            htp_vtcm_yield(octx->ctx);
+        }
+#endif
     }
     return HTP_STATUS_OK;
 }
