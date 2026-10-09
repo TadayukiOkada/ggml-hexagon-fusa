@@ -1,0 +1,5 @@
+/build*/
+/pkg*/
+CMakeUserPresets.json
+*.tar.gz
+__pycache__/
