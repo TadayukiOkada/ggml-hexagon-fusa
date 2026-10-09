@@ -1,0 +1,65 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index fc9afba..c01ba13 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2947,9 +2947,11 @@ struct test_repeat : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
+     const std::array<int, 4> nr;
++    const bool view;
++    const bool weights;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR3(type, ne, nr);
++        return VARS_TO_STR5(type, ne, nr, view, weights);
+     }
+ 
+     size_t op_size(ggml_tensor * t) override {
+@@ -2958,16 +2960,29 @@ struct test_repeat : public test_case {
+ 
+     test_repeat(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne = {10, 5, 4, 3},
+-            std::array<int, 4> nr = {2, 2, 2, 2})
+-        : type(type), ne(ne), nr(nr) {}
++            std::array<int, 4> nr = {2, 2, 2, 2},
++            bool view = false, bool weights = false)
++        : type(type), ne(ne), nr(nr), view(view), weights(weights) {}
++
++    bool use_weight_context() override { return weights; }
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
++        return build_graph(ctx, nullptr);
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+         ggml_tensor * target = ggml_new_tensor_4d(ctx, type, ne[0]*nr[0], ne[1]*nr[1], ne[2]*nr[2], ne[3]*nr[3]);
+         ggml_set_name(target, "target");
+ 
+-        ggml_tensor * src = ggml_new_tensor(ctx, type, 4, ne.data());
++        ggml_context * ctx_src = weights && ctx_weights ? ctx_weights : ctx;
++        ggml_tensor * src = view ? ggml_new_tensor_4d(ctx_src, type, ne[0] + 1, ne[1] + 1, ne[2] + 1, ne[3]) :
++                                  ggml_new_tensor(ctx_src, type, 4, ne.data());
+         ggml_set_param(src);
+         ggml_set_name(src, "src");
++        if (view) {
++            src = ggml_view_4d(ctx, src, ne[0], ne[1], ne[2], ne[3], src->nb[1], src->nb[2], src->nb[3], ggml_type_size(type));
++            ggml_set_name(src, "src_view");
++        }
+ 
+         ggml_tensor * out = ggml_repeat(ctx, src, target);
+         ggml_set_name(out, "out");
+@@ -10129,6 +10144,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_repeat(GGML_TYPE_BF16, {10, 5, 4, ne3}, {2, 1, 1, 1}));
+     }
+ 
++    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
++        for (int64_t width : {1, 3, 5, 8, 31, 32, 33, 63, 64, 65, 127, 129, 4097, 16385}) {
++            test_cases.emplace_back(new test_repeat(type, {width, 3, 2, 1}, {5, 2, 1, 2}, true, true));
++        }
++        test_cases.emplace_back(new test_repeat(type, {1, 4096, 1, 1}, {1024, 1, 1, 1}, false, true));
++        test_cases.emplace_back(new test_repeat(type, {1, 4096, 1, 1}, {1024, 1, 1, 1}, true));
++    }
++
+     for (bool view : {false, true}) {
+         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {1, 1, 1, 1}, view));
+         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {2, 1, 1, 1}, view));

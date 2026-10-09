@@ -8821,11 +8821,25 @@ static bool ggml_hexagon_supported_repeat(const struct ggml_hexagon_session * se
     // src and dst must be the same type
     if (src0->type != dst->type) return false;
 
-    // dst dims must be multiples of src dims
-    if (dst->ne[0] % src0->ne[0] != 0) return false;
-    if (dst->ne[1] % src0->ne[1] != 0) return false;
-    if (dst->ne[2] % src0->ne[2] != 0) return false;
-    if (dst->ne[3] % src0->ne[3] != 0) return false;
+    const size_t type_size = ggml_type_size(src0->type);
+    if (src0->nb[0] != type_size || dst->nb[0] != type_size) return false;
+
+    uint64_t src_size = type_size;
+    uint64_t dst_size = type_size;
+    uint32_t nrows = 1;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (src0->ne[i] <= 0 || dst->ne[i] <= 0 || src0->ne[i] > UINT32_MAX || dst->ne[i] > UINT32_MAX ||
+            src0->nb[i] > UINT32_MAX || dst->nb[i] > UINT32_MAX || dst->ne[i] % src0->ne[i] != 0) return false;
+        const uint64_t src_offset = (uint64_t) (src0->ne[i] - 1) * src0->nb[i];
+        const uint64_t dst_offset = (uint64_t) (dst->ne[i] - 1) * dst->nb[i];
+        if (src_offset > UINT32_MAX - src_size || dst_offset > UINT32_MAX - dst_size) return false;
+        src_size += src_offset;
+        dst_size += dst_offset;
+        if (i > 0) {
+            if ((uint64_t) dst->ne[i] > UINT32_MAX / nrows) return false;
+            nrows *= dst->ne[i];
+        }
+    }
 
     // require contiguous tensors (no transposition)
     if (ggml_is_transposed(src0) || ggml_is_transposed(dst)) return false;
