@@ -1082,6 +1082,7 @@ typedef struct {
     uint32_t                  kv_start;
     uint32_t                  q_start;
     uint32_t                  ib3;
+    bool                      first_block;  // first KV block of this Q block (fully masked blocks are skipped)
     bool                      has_alibi;  // true when max_bias != 0 (need slope * mask + add)
     __fp16 *                  slopes;
     const struct htp_tensor * mask;
@@ -1449,7 +1450,7 @@ static inline void fa_softmax_impl(
 
         HVX_Vector v_l_curr0;
         HVX_Vector v_l_curr1;
-        if (args->kv_start == 0 && factx->sinks != NULL) {
+        if (args->first_block && factx->sinks != NULL) {
             // First KV block with sinks: m_prev holds the seeded sink value (not -inf),
             // so exp_m_diff = exp2(sink - m_curr) is the sink's contribution to the
             // denominator. l_prev is 0 here, so add exp_m_diff directly instead of
@@ -1804,6 +1805,61 @@ static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor 
 }
 
 // ============================================================================
+// KV blocks a Q block needs
+// ============================================================================
+
+// The softmax treats mask values at or below -16 as -inf, so a KV block whose mask rows are all at
+// or below that adds nothing to the Q block: causal and sliding-window masks leave whole blocks like
+// that. The ranges are found once per op (the mask is shared by the heads) and the KV loop runs over
+// [lo, hi) only. Q blocks with no unmasked value keep the full range, as before.
+#define FA_SKIP_MAX_QBLOCKS 512
+
+typedef struct {
+    const uint8_t * mask;          // first mask row of the op
+    size_t          mask_nb1;
+    uint32_t        Br, Bc;
+    uint32_t        neq1, nek1;
+    uint32_t        n_q_blocks, n_kv_blocks;
+    uint8_t *       valid;         // [n_q_blocks][n_kv_blocks]: the block has an unmasked value
+} fa_kv_range_args_t;
+
+static bool fa_mask_block_any(const fa_kv_range_args_t * a, uint32_t r0, uint32_t nr, uint32_t c0, uint32_t nc) {
+    const HVX_Vector thr  = Q6_Vh_vsplat_R(0xcc00);  // -16.0
+    const HVX_Vector ninf = Q6_Vh_vsplat_R(0xfc00);
+    const uint8_t *  base = a->mask + (size_t) r0 * a->mask_nb1 + (size_t) c0 * sizeof(__fp16);
+    hex_l2fetch(base, nc * sizeof(__fp16), a->mask_nb1, nr);
+    for (uint32_t r = 0; r < nr; r++) {
+        const __fp16 * row = (const __fp16 *) (base + (size_t) r * a->mask_nb1);
+        HVX_Vector     m   = ninf;
+        uint32_t       c   = 0;
+        for (; c + 64 <= nc; c += 64) {
+            m = Q6_Vhf_vmax_VhfVhf(m, hvx_vmemu(row + c));
+        }
+        if (c < nc) {
+            m = Q6_Vhf_vmax_VhfVhf(m, Q6_V_vmux_QVV(Q6_Q_vsetq2_R((nc - c) * sizeof(__fp16)), hvx_vmemu(row + c), ninf));
+        }
+        const HVX_VectorPred gt = Q6_Q_vcmp_gt_VhfVhf(hvx_vec_reduce_max_f16(m), thr);
+        if (Q6_R_vextract_VR(Q6_V_vand_QR(gt, 0x01010101), 0) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// threads take (Q block, KV block) pairs in turn
+static void fa_kv_range_thread(unsigned int n, unsigned int i, void * data) {
+    const fa_kv_range_args_t * a = (const fa_kv_range_args_t *) data;
+    const uint32_t n_pairs = a->n_q_blocks * a->n_kv_blocks;
+    for (uint32_t p = i; p < n_pairs; p += n) {
+        const uint32_t qb = p / a->n_kv_blocks;
+        const uint32_t kb = p - qb * a->n_kv_blocks;
+        const uint32_t r0 = qb * a->Br;
+        const uint32_t c0 = kb * a->Bc;
+        a->valid[p] = fa_mask_block_any(a, r0, hex_smin(a->Br, a->neq1 - r0), c0, hex_smin(a->Bc, a->nek1 - c0));
+    }
+}
+
+// ============================================================================
 // Core HMX flash attention algorithm (GQA-merged)
 // ============================================================================
 
@@ -2038,12 +2094,43 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     const size_t q_src_stride               = q_transposed ? q->nb[2] : q->nb[1];
     const size_t q_row_bytes_untransposed   = factx.G * factx.DK * qo_element_size;
     const size_t q_row_bytes_trans_factor   = factx.DK * qo_element_size;
-    const uint32_t kv_rows0                 = hex_smin(Bc, nek1);
 
     // ======== Reusable job descriptors for pipeline ========
     hmx_fa_qk_job_t       qk_job;
     hmx_fa_o_update_job_t ou_job;
     hmx_fa_o_norm_job_t   on_job;
+
+    // KV block range per Q block (all blocks unless the mask is shared by heads and sequences)
+    uint16_t kv_lo[FA_SKIP_MAX_QBLOCKS];
+    uint16_t kv_hi[FA_SKIP_MAX_QBLOCKS];
+    const bool skip_masked = mask && factx.mask_broadcast && mask->ne[3] == 1 && n_q_blocks <= FA_SKIP_MAX_QBLOCKS &&
+                             factx.n_kv_blocks <= 0xffff && (size_t) n_q_blocks * factx.n_kv_blocks <= ctx->ddr_spad_size;
+    if (skip_masked) {
+        fa_kv_range_args_t ra = {
+            .mask = (const uint8_t *) (uintptr_t) mask->data, .mask_nb1 = mask->nb[1],
+            .Br = Br, .Bc = Bc, .neq1 = neq1, .nek1 = nek1,
+            .n_q_blocks = n_q_blocks, .n_kv_blocks = factx.n_kv_blocks, .valid = (uint8_t *) ctx->ddr_spad_base,
+        };
+        work_queue_run(ctx->work_queue, fa_kv_range_thread, &ra, hex_smin(ctx->n_threads, n_q_blocks * factx.n_kv_blocks));
+        for (uint32_t qb = 0; qb < n_q_blocks; qb++) {
+            const uint8_t * v = ra.valid + (size_t) qb * factx.n_kv_blocks;
+            uint32_t lo = factx.n_kv_blocks, hi = 0;
+            for (uint32_t kb = 0; kb < factx.n_kv_blocks; kb++) {
+                if (v[kb]) {
+                    lo = lo < kb ? lo : kb;
+                    hi = kb + 1;
+                }
+            }
+            if (lo >= hi) {  // nothing unmasked: run all blocks, as without skipping
+                lo = 0;
+                hi = factx.n_kv_blocks;
+            }
+            kv_lo[qb] = (uint16_t) lo;
+            kv_hi[qb] = (uint16_t) hi;
+        }
+    }
+    #define FA_BLK_LO(qs) (skip_masked ? (uint32_t) kv_lo[(qs) / Br] : 0u)
+    #define FA_BLK_HI(qs) (skip_masked ? (uint32_t) kv_hi[(qs) / Br] : factx.n_kv_blocks)
 
     // Q/K/V/mask DMAs for a step are pushed at the end of the previous step, except for
     // the first step and the step after VTCM was given away.
@@ -2057,6 +2144,11 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             const size_t   n_rows_g    = n_rows_q * G;
             const size_t   g_br_actual = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS);
             const size_t   n_row_tiles = g_br_actual / HMX_FP16_TILE_N_ROWS;
+
+            const uint32_t blk_lo   = FA_BLK_LO(q_start);
+            const uint32_t n_blocks = FA_BLK_HI(q_start) - blk_lo;
+            const uint32_t kv0      = blk_lo * Bc;                 // first KV row of the range
+            const uint32_t kv_rows0 = hex_smin(Bc, nek1 - kv0);
 
             for (uint32_t kv_head = kv_head_min; kv_head < kv_head_max; ++kv_head) {
                 const uint32_t ik2 = kv_head;
@@ -2074,19 +2166,19 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     const size_t n_rows      = q_transposed ? factx.G : n_rows_q;
                     dma_queue_push(dma_q, dma_make_data(factx.vtcm_q_dma, q_ptr), q_row_bytes, hex_smax(q_src_stride, q_row_bytes), q_row_bytes, n_rows);
 
-                    if (factx.n_kv_blocks > 0) {
-                        const dma_addr_t k_src = k->data + ik2 * k->nb[2] + ik3 * k->nb[3];
+                    if (n_blocks > 0) {
+                        const dma_addr_t k_src = k->data + kv0 * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3];
                         dma_queue_push(dma_q, dma_make_data(factx.vtcm_k_fp16[0], k_src), size_k_row_padded, k->nb[1], size_k_row, kv_rows0);
 
-                        const dma_addr_t v_src = v->data + iv2 * v->nb[2] + iv3 * v->nb[3];
+                        const dma_addr_t v_src = v->data + kv0 * v->nb[1] + iv2 * v->nb[2] + iv3 * v->nb[3];
                         dma_queue_push(dma_q, dma_make_data(factx.vtcm_v_fp16[0], v_src), size_v_row_padded, v->nb[1], size_v_row, kv_rows0);
 
                         if (factx.pipeline && mask) {
                             if (__builtin_expect(factx.mask_broadcast, true)) {
-                                const dma_addr_t ms_src = mask->data + q_start * mask->nb[1] + im3 * mask->nb[3] + 0;
+                                const dma_addr_t ms_src = mask->data + q_start * mask->nb[1] + im3 * mask->nb[3] + kv0 * sizeof(__fp16);
                                 dma_cache_fa_push(dma_q, &factx.m_cache, ms_src, m_line_bytes, mask->nb[1], kv_rows0 * sizeof(__fp16), n_rows_q);
                             } else {
-                                fa_push_mask_dma_gqa(dma_q, mask, q_start, im3, 0, kv_head, G, m_line_bytes, kv_rows0, n_rows_q, &factx);
+                                fa_push_mask_dma_gqa(dma_q, mask, q_start, im3, kv0, kv_head, G, m_line_bytes, kv_rows0, n_rows_q, &factx);
                             }
                         }
                     }
@@ -2118,15 +2210,15 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     hmx_fa_qk_job_t qk_job[2];
                     hmx_fa_o_update_job_t ou_job[2];
 
-                    // Prefetch block 1 early if there are multiple blocks
-                    if (factx.n_kv_blocks > 1) {
-                        fa_prefetch_block(dma_q, k, v, mask, 1, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
+                    // Prefetch the range's second block early if there are multiple blocks
+                    if (n_blocks > 1) {
+                        fa_prefetch_block(dma_q, k, v, mask, blk_lo + 1, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                           ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, 1, &factx);
                     }
 
-                    // Prep and start QK-dot(0)
+                    // Prep and start QK-dot of the range's first block
                     void * curr_k0 = (void *) dma_queue_pop(dma_q).dst;
-                    fa_phase_k_interleave(&factx, kv_rows0, k_src_stride, curr_k0, 0, 0);
+                    fa_phase_k_interleave(&factx, kv_rows0, k_src_stride, curr_k0, kv0, 0);
 
                     qk_job[0].q_tiles        = factx.vtcm_q_tiles;
                     qk_job[0].k_tiles        = factx.vtcm_k_tiles[0];
@@ -2138,8 +2230,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     qk_job[0].hmx_scales     = factx.vtcm_hmx_scales_qk;
                     hmx_queue_push(hmx_q, hmx_queue_make_desc(hmx_fa_qk_dot_worker, &qk_job[0]));
 
-                    for (uint32_t kv_blk = 0; kv_blk < factx.n_kv_blocks; ++kv_blk) {
-                        const uint32_t kv_start    = kv_blk * Bc;
+                    for (uint32_t kv_blk = 0; kv_blk < n_blocks; ++kv_blk) {
+                        const uint32_t kv_start    = (blk_lo + kv_blk) * Bc;
                         const uint32_t kv_rows     = hex_smin(Bc, nek1 - kv_start);
                         const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
 
@@ -2174,7 +2266,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             ou_job[prev_buf].hmx_scales  = factx.vtcm_hmx_scales_id;
                             ou_job[prev_buf].n_row_tiles = n_row_tiles;
                             ou_job[prev_buf].n_col_tiles =
-                                hmx_ceil_div(hex_smin(Bc, nek1 - (kv_blk - 1) * Bc), HMX_FP16_TILE_N_COLS);
+                                hmx_ceil_div(hex_smin(Bc, nek1 - (kv_start - Bc)), HMX_FP16_TILE_N_COLS);
                             ou_job[prev_buf].n_row_tiles_g_br = n_row_tiles_g_br;
                             ou_job[prev_buf].n_tiles_per_bc   = n_tiles_per_bc;
                             ou_job[prev_buf].DV               = DV_pad;
@@ -2182,8 +2274,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         // ---- 4. Pop and run K-prep for next block & push next QK-dot ----
-                        if (kv_blk + 1 < factx.n_kv_blocks) {
-                            const uint32_t next_start = (kv_blk + 1) * Bc;
+                        if (kv_blk + 1 < n_blocks) {
+                            const uint32_t next_start = kv_start + Bc;
                             const uint32_t next_rows  = hex_smin(Bc, nek1 - next_start);
                             const size_t   next_buf   = 1 - buf_idx;
 
@@ -2221,6 +2313,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.kv_start             = kv_start;
                         sargs.q_start              = q_start;
                         sargs.ib3                  = ib3;
+                        sargs.first_block          = kv_blk == 0;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
                         sargs.mask                 = mask;
                         sargs.mask_vtcm            = current_mask_vtcm;
@@ -2237,8 +2330,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         // Prefetch block kv_blk + 2
-                        if (kv_blk + 2 < factx.n_kv_blocks) {
-                            fa_prefetch_block(dma_q, k, v, mask, kv_blk + 2, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
+                        if (kv_blk + 2 < n_blocks) {
+                            fa_prefetch_block(dma_q, k, v, mask, blk_lo + kv_blk + 2, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                               ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, buf_idx, &factx);
                         }
 
@@ -2246,8 +2339,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     }
 
                     // Epilogue
-                    if (factx.n_kv_blocks > 0) {
-                        const uint32_t last_blk = factx.n_kv_blocks - 1;
+                    if (n_blocks > 0) {
+                        const uint32_t last_blk = blk_lo + n_blocks - 1;
                         const size_t last_cols  = hmx_ceil_div(hex_smin(Bc, nek1 - last_blk * Bc), HMX_FP16_TILE_N_COLS);
                         ou_job[0].o_curr           = o_tile_curr;
                         ou_job[0].o_prev           = o_tile_prev;
@@ -2273,8 +2366,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                 } else {
                     // Fallback path
-                    for (uint32_t kv_blk = 0; kv_blk < factx.n_kv_blocks; ++kv_blk) {
-                        const uint32_t kv_start    = kv_blk * Bc;
+                    for (uint32_t kv_blk = 0; kv_blk < n_blocks; ++kv_blk) {
+                        const uint32_t kv_start    = (blk_lo + kv_blk) * Bc;
                         const uint32_t kv_rows     = hex_smin(Bc, nek1 - kv_start);
                         const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
 
@@ -2287,8 +2380,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             }
                         }
 
-                        if (kv_blk + 1 < factx.n_kv_blocks) {
-                            const uint32_t  prefetch_start = (kv_blk + 1) * Bc;
+                        if (kv_blk + 1 < n_blocks) {
+                            const uint32_t  prefetch_start = kv_start + Bc;
                             const uint32_t  prefetch_rows  = hex_smin(Bc, nek1 - prefetch_start);
                             const size_t    prefetch_buf   = 1 - buf_idx;
                             const dma_addr_t k_prefetch_src = k->data + prefetch_start * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3];
@@ -2345,6 +2438,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.kv_start             = kv_start;
                         sargs.q_start              = q_start;
                         sargs.ib3                  = ib3;
+                        sargs.first_block          = kv_blk == 0;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
                         sargs.mask                 = mask;
                         sargs.mask_vtcm            = current_mask_vtcm;
@@ -2366,7 +2460,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             ou_job.DV               = DV_pad;
 
                             hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_fa_o_update_worker, &ou_job));
-                            if (kv_blk + 1 == factx.n_kv_blocks) {
+                            if (kv_blk + 1 == n_blocks) {
                                 // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                                 htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
                                 fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
@@ -2406,12 +2500,15 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                 if (has_next && !yield_after) {
                     const uint32_t next_n_rows_q = hex_smin(Br, neq1 - next_q_start);
+                    const uint32_t next_kv0      = FA_BLK_LO(next_q_start) * Bc;
+                    const uint32_t next_rows0    = hex_smin(Bc, nek1 - next_kv0);
+                    const uint32_t next_n_blocks = FA_BLK_HI(next_q_start) - FA_BLK_LO(next_q_start);
                     const dma_addr_t next_q_ptr = q->data + next_q_start * q->nb[1] + (next_kv_head * factx.G) * q->nb[2] + next_ib3 * q->nb[3];
                     const size_t next_q_row_bytes = q_transposed ? next_n_rows_q * q_row_bytes_trans_factor : q_row_bytes_untransposed;
                     const size_t next_n_rows      = q_transposed ? factx.G : next_n_rows_q;
                     dma_queue_push(dma_q, dma_make_data(factx.vtcm_q_dma, next_q_ptr), next_q_row_bytes, hex_smax(q_src_stride, next_q_row_bytes), next_q_row_bytes, next_n_rows);
 
-                    if (factx.n_kv_blocks > 0) {
+                    if (next_n_blocks > 0) {
                         const uint32_t next_ik2 = next_kv_head;
                         const uint32_t next_iv2 = next_kv_head;
                         uint32_t next_ik3 = ik3;
@@ -2421,11 +2518,11 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             next_iv3 = fastdiv(next_ib3, &kparams->broadcast_rv3);
                         }
 
-                        const dma_addr_t next_k_src = k->data + next_ik2 * k->nb[2] + next_ik3 * k->nb[3];
-                        dma_queue_push(dma_q, dma_make_data(factx.vtcm_k_fp16[0], next_k_src), size_k_row_padded, k->nb[1], size_k_row, kv_rows0);
+                        const dma_addr_t next_k_src = k->data + next_kv0 * k->nb[1] + next_ik2 * k->nb[2] + next_ik3 * k->nb[3];
+                        dma_queue_push(dma_q, dma_make_data(factx.vtcm_k_fp16[0], next_k_src), size_k_row_padded, k->nb[1], size_k_row, next_rows0);
 
-                        const dma_addr_t next_v_src = v->data + next_iv2 * v->nb[2] + next_iv3 * v->nb[3];
-                        dma_queue_push(dma_q, dma_make_data(factx.vtcm_v_fp16[0], next_v_src), size_v_row_padded, v->nb[1], size_v_row, kv_rows0);
+                        const dma_addr_t next_v_src = v->data + next_kv0 * v->nb[1] + next_iv2 * v->nb[2] + next_iv3 * v->nb[3];
+                        dma_queue_push(dma_q, dma_make_data(factx.vtcm_v_fp16[0], next_v_src), size_v_row_padded, v->nb[1], size_v_row, next_rows0);
 
                         if (factx.pipeline && mask) {
                             uint32_t next_im3 = im3;
@@ -2433,10 +2530,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                                 next_im3 = fastmodulo(next_ib3, mask->ne[3], &factx.src3_div3);
                             }
                             if (__builtin_expect(factx.mask_broadcast, true)) {
-                                const dma_addr_t ms_src = mask->data + next_q_start * mask->nb[1] + next_im3 * mask->nb[3] + 0;
-                                dma_cache_fa_push(dma_q, &factx.m_cache, ms_src, m_line_bytes, mask->nb[1], kv_rows0 * sizeof(__fp16), next_n_rows_q);
+                                const dma_addr_t ms_src = mask->data + next_q_start * mask->nb[1] + next_im3 * mask->nb[3] + next_kv0 * sizeof(__fp16);
+                                dma_cache_fa_push(dma_q, &factx.m_cache, ms_src, m_line_bytes, mask->nb[1], next_rows0 * sizeof(__fp16), next_n_rows_q);
                             } else {
-                                fa_push_mask_dma_gqa(dma_q, mask, next_q_start, next_im3, 0, next_kv_head, G, m_line_bytes, kv_rows0, next_n_rows_q, &factx);
+                                fa_push_mask_dma_gqa(dma_q, mask, next_q_start, next_im3, next_kv0, next_kv_head, G, m_line_bytes, next_rows0, next_n_rows_q, &factx);
                             }
                         }
                     }
@@ -2473,6 +2570,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             }
         }
     }
+
+    #undef FA_BLK_LO
+    #undef FA_BLK_HI
 
     return HTP_STATUS_OK;
 }
