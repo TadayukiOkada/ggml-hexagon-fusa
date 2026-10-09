@@ -1,0 +1,30 @@
+{
+  "version": 4,
+  "configurePresets": [
+    {
+      "name": "arm64-oe-linux",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "toolchainFile": "${sourceDir}/cmake/arm64-oe-linux.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GGML_NATIVE": "OFF",
+        "GGML_OPENMP": "OFF",
+        "GGML_OPENCL": "OFF",
+        "LLAMA_OPENSSL": "OFF",
+        "HEXAGON_SDK_ROOT": "$env{HEXAGON_SDK_ROOT}",
+        "HEXAGON_TOOLS_ROOT": "$env{HEXAGON_TOOLS_ROOT}",
+        "PREBUILT_LIB_DIR": "linux_aarch64"
+      }
+    },
+    {
+      "name": "arm64-oe-linux-release",
+      "displayName": "ARM64 OE Linux, upstream defaults (SDK 6.x, all HTP archs)",
+      "inherits": "arm64-oe-linux",
+      "cacheVariables": {
+        "LLAMA_BUILD_TESTS": "ON"
+      }
+    }
+  ]
+}
