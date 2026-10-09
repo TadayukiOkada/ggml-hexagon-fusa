@@ -7,9 +7,9 @@ miss its deadline (yield points are only between ops and inside some copies).
 This groups the profile-op lines by op, shapes and types, and reports count,
 mean, p95 and max time, flagging groups whose max exceeds the budget with !!.
 Ops that release VTCM/HMX inside the op when built with
-GGML_HEXAGON_HTP_YIELD_IN_CPY (--yielding, default CONT,CPY) are marked ~~
-instead: their op time is not the time the resources are held, at least on
-the paths that yield.
+GGML_HEXAGON_HTP_YIELD_IN_CPY / _IN_OPS (--yielding, see YIELDING) are marked
+~~ instead: their op time is not the time the resources are held, at least on
+the paths that yield. For builds without those options pass --yielding "".
 
 usage: scripts/op-budget.py [--budget-ms 25] [--top 30] [--fail] LOG...
        (reads stdin when no LOG is given)
@@ -25,6 +25,14 @@ from collections import defaultdict
 LINE = re.compile(
     r"(?P<dev>HTP\d+(?::\d+)?) profile-op (?P<op>[A-Z_0-9+]+)\|(?P<fields>.*)\|usec (?P<usec>\d+) cycles (?P<cycles>\d+)"
 )
+
+
+# Ops that release VTCM/HMX on request inside the op in builds with GGML_HEXAGON_HTP_YIELD_IN_CPY
+# (CONT, CPY) and GGML_HEXAGON_HTP_YIELD_IN_OPS (flash attention, IM2COL, unary ops).
+YIELDING = ["CONT", "CPY", "FLASH_ATTN_EXT", "IM2COL",
+            "SCALE", "CLAMP", "LEAKY_RELU", "SQR", "SQRT", "NEG", "EXP", "SIGMOID", "SILU", "GELU",
+            "GELU_QUICK", "GELU_ERF", "SOFTPLUS", "TANH", "ABS", "LOG", "RELU", "STEP",
+            "NORM", "RMS_NORM", "RMS_NORM_MUL", "L2_NORM", "TRI"]
 
 
 def parse(stream, groups):
@@ -49,8 +57,9 @@ def main():
     ap.add_argument("--budget-ms", type=float, default=25.0,
                     help="per-op budget in ms (default 25, half of a 50 ms self-test period)")
     ap.add_argument("--top", type=int, default=30, help="rows to print, longest max first (0 = all)")
-    ap.add_argument("--yielding", default="CONT,CPY",
-                    help="ops that yield inside the op, marked ~~ and not counted for --fail (default CONT,CPY)")
+    ap.add_argument("--yielding", default=",".join(YIELDING),
+                    help="ops that yield inside the op, marked ~~ and not counted for --fail "
+                         "(default: those that do with GGML_HEXAGON_HTP_YIELD_IN_CPY and _IN_OPS)")
     ap.add_argument("--fail", action="store_true", help="exit with 1 when any other op exceeds the budget")
     args = ap.parse_args()
 
