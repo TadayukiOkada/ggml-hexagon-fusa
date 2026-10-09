@@ -144,6 +144,7 @@ enum ggml_hexagon_fusion_flags {
     GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
     GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
     GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
+    GGML_HEXAGON_FUSE_MUL_MAT_GLU   = (1 << 7), // 128
 };
 
 static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
@@ -3903,6 +3904,81 @@ struct ggml_hexagon_opbatch {
         return false;
     }
 
+    // GEGLU / SWIGLU (split form, act(a) * b) of the two outputs of an HMX MUL_MAT_NX: the matmul
+    // computes gate and up columns side by side and its store writes act(gate) * up, so neither
+    // output goes to DDR.
+    bool try_fuse_mul_mat_glu(const htp_opnode & node) {
+        if (n_ops == 0) return false;
+        if (node.opcode != HTP_OP_GLU_GEGLU && node.opcode != HTP_OP_GLU_SWIGLU) return false;
+
+        htp_opnode & last_node = ops[n_ops - 1];
+        if (last_node.opcode != HTP_OP_MUL_MAT_NX || last_node.outputs.size() != 2 || last_node.inputs.size() != 3) {
+            return false;
+        }
+
+        const ggml_tensor * glu = node.node;
+        const ggml_tensor * a   = glu->src[0];
+        const ggml_tensor * b   = glu->src[1];
+        if (!a || !b) return false;
+
+        const ggml_tensor * d0 = last_node.outputs[0];
+        const ggml_tensor * d1 = last_node.outputs[1];
+        int gate;
+        if (a == d0 && b == d1) {
+            gate = 0;
+        } else if (a == d1 && b == d0) {
+            gate = 1;
+        } else {
+            return false;
+        }
+
+        if (!ggml_hexagon_tensor_is_fuseable(d0) || !ggml_hexagon_tensor_is_fuseable(d1)) return false;
+        if ((d0->flags | d1->flags) & GGML_TENSOR_FLAG_OUTPUT) return false;
+        if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) return false;
+        if (!ggml_are_same_shape(a, glu) || !ggml_are_same_shape(b, glu)) return false;
+        if (!ggml_is_contiguous_rows(glu) || glu->nb[1] != a->nb[1]) return false;
+
+        const struct htp_mm_kernel_params * kp = (const struct htp_mm_kernel_params *) last_node.kernel_params;
+        if (!kp->n_hmx || !kp->pipeline || kp->n_weights != 2 || ((kp->n_chunk / 2) & ~31) == 0) return false;
+
+        if (!try_fuse_common({ glu })) {
+            return false;
+        }
+
+        struct htp_mm_kernel_params kparams = *kp;
+        kparams.glu = node.opcode == HTP_OP_GLU_GEGLU ? HTP_MM_GLU_GEGLU : HTP_MM_GLU_SWIGLU;
+
+        const ggml_tensor * w_gate = last_node.inputs[gate];
+        const ggml_tensor * w_up   = last_node.inputs[1 - gate];
+        const ggml_tensor * x      = last_node.inputs[2];
+
+        last_node.name = "MUL_MAT_NX+GLU";
+        last_node.inputs.clear();
+        last_node.inputs.push_back(w_gate);
+        last_node.inputs.push_back(w_up);
+        last_node.inputs.push_back(x);
+        last_node.outputs.clear();
+        last_node.outputs.push_back(glu);
+        last_node.fused.push_back(node.node);
+        memcpy(last_node.kernel_params, &kparams, sizeof(kparams));
+
+        htp_op_desc & o = h_ops[n_ops - 1];
+        memcpy(o.kernel_params, &kparams, sizeof(kparams));
+        o.src[0] = add_tensor(w_gate);
+        o.src[1] = add_tensor(w_up);
+        o.src[2] = add_tensor(x);
+        for (uint32_t s = 3; s < HTP_OP_MAX_INPUTS; s++) {
+            o.src[s] = 0xffff;
+        }
+        o.dst[0] = add_tensor(glu);
+        for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
+            o.dst[d] = 0xffff;
+        }
+
+        HEX_VERBOSE("ggml-hex: %s fused MUL_MAT_NX+GLU (#%u)\n", sess->c_name(), n_ops - 1);
+        return true;
+    }
+
     bool try_fuse_mul_mat_id_nx(const htp_opnode & node) {
         if (n_ops == 0 || node.opcode != HTP_OP_MUL_MAT_ID) return false;
         if (!is_mergeable_mul_mat_id(node.node)) return false;
@@ -4110,6 +4186,7 @@ struct ggml_hexagon_opbatch {
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_MUL)  && try_fuse_rms_norm_mul(node))  return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_GLU)   && try_fuse_mul_mat_glu(node))   return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node)) return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_CPY)       && try_fuse_gdn_cpy(node))       return true;
         return false;

@@ -92,6 +92,13 @@ enum htp_mm_kernel_type {
 };
 
 // Op-specific struct for precomputed matmul params
+// GLU fused into the epilogue of an HMX MUL_MAT_NX of a gate and an up weight: dst = act(gate) * up
+enum htp_mm_glu {
+    HTP_MM_GLU_NONE   = 0,
+    HTP_MM_GLU_GEGLU  = 1,
+    HTP_MM_GLU_SWIGLU = 2,
+};
+
 struct htp_mm_kernel_params {
     uint8_t  kernel_type;        // enum htp_mm_kernel_type
     uint8_t  pipeline;           // 1 = pipelined execution, 0 = standard
@@ -102,6 +109,8 @@ struct htp_mm_kernel_params {
     uint8_t  n_act_threads;      // Number of threads for activation preparation
     uint8_t  n_prefetch;         // Prefetch lookahead buffers/rows in VTCM
     uint8_t  n_weights;          // Number of weights for fused NX
+    uint8_t  glu;                // fused NX of a gate and an up weight + GLU (enum htp_mm_glu), 0 = none
+    uint8_t  reserved[3];
 
     int32_t  m_chunk;            // Row chunk size (M chunk)
     int32_t  n_chunk;            // Col chunk size (N chunk)

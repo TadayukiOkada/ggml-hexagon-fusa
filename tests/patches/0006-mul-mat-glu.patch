@@ -1,0 +1,67 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f684845..8f45d04 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5576,6 +5576,45 @@ struct test_mul_mat_id_shared : public test_case {
+     }
+ };
+ 
++// FFN gate/up matmuls feeding a split GLU, run as one graph: backends may fuse the GLU into the matmul
++struct test_mul_mat_glu : public test_case {
++    const ggml_type type;
++    const ggml_glu_op op;
++    const int64_t k;        // model width
++    const int64_t m;        // FFN width
++    const int64_t n;        // tokens
++    const bool up_first;    // the graph computes the up matmul first
++
++    std::string vars() override { return VARS_TO_STR6(type, op, k, m, n, up_first); }
++    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_GLU"; }
++    bool run_whole_graph() override { return true; }
++    double max_nmse_err() override { return 5e-4; }
++
++    test_mul_mat_glu(ggml_type type, ggml_glu_op op, int64_t k, int64_t m, int64_t n, bool up_first)
++        : type(type), op(op), k(k), m(m), n(n), up_first(up_first) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_tensor * gate = ggml_new_tensor_2d(ctx, type, k, m);
++        ggml_tensor * up   = ggml_new_tensor_2d(ctx, type, k, m);
++        ggml_set_name(x, "x");
++        ggml_set_name(gate, "gate");
++        ggml_set_name(up, "up");
++        ggml_tensor * g;
++        ggml_tensor * u;
++        if (up_first) {
++            u = ggml_mul_mat(ctx, up, x);
++            g = ggml_mul_mat(ctx, gate, x);
++        } else {
++            g = ggml_mul_mat(ctx, gate, x);
++            u = ggml_mul_mat(ctx, up, x);
++        }
++        ggml_tensor * out = ggml_glu_split(ctx, g, u, op);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_OUT_PROD
+ struct test_out_prod : public test_case {
+     const ggml_type type_a;
+@@ -11923,6 +11962,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // FFN gate/up + GLU (fusable into the matmul): HMX row counts, a partial last chunk, both graph orders
++    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
++        for (ggml_glu_op op : {GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU}) {
++            for (int64_t n : {1, 70, 512}) {
++                test_cases.emplace_back(new test_mul_mat_glu(type, op, 256, 1056, n, false));
++            }
++            test_cases.emplace_back(new test_mul_mat_glu(type, op, 512, 2048, 256, true));
++        }
++    }
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER
