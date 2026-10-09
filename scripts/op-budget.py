@@ -31,8 +31,9 @@ LINE = re.compile(
 # (CONT, CPY) and GGML_HEXAGON_HTP_YIELD_IN_OPS (flash attention, IM2COL, GET_ROWS, PAD, unary ops,
 # SOFT_MAX, SET_ROWS, the binary ops, multi-row sorts, the HMX 2D matmul), plus fence waits with GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS.
 # "OP:tag" only counts the op with that tag: the kernel
-# path for matmuls and flash attention (e.g. hmx-tiled), otherwise multi-row or single-row.
-YIELDING = ["CONT", "CPY", "FENCE_WAIT", "FLASH_ATTN_EXT", "IM2COL", "GET_ROWS", "PAD", "MUL_MAT:hmx-tiled",
+# path for matmuls and flash attention (e.g. hmx-tiled, hmx-flat for the HMX 2D matmul),
+# otherwise multi-row or single-row.
+YIELDING = ["CONT", "CPY", "FENCE_WAIT", "FLASH_ATTN_EXT", "IM2COL", "GET_ROWS", "PAD", "MUL_MAT:hmx-tiled", "MUL_MAT:hmx-flat",
             "SOFT_MAX", "SET_ROWS", "ADD", "SUB", "MUL", "DIV", "ADD_ID", "ARGSORT:multi-row", "TOP_K:multi-row",
             "SCALE", "CLAMP", "LEAKY_RELU", "SQR", "SQRT", "NEG", "EXP", "SIGMOID", "SILU", "GELU",
             "GELU_QUICK", "GELU_ERF", "SOFTPLUS", "TANH", "ABS", "LOG", "RELU", "STEP",
