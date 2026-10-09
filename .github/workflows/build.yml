@@ -1,0 +1,55 @@
+name: build
+
+# Builds the host side and the v73/v75/v79/v81 skels with the public Snapdragon
+# toolchain containers (Hexagon SDK 6.6), which keeps the other HTP generations
+# building. The FuSa configuration needs an older SDK and the firmware's SWIV
+# utility, which these containers do not have; it is built outside CI.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    container: ghcr.io/snapdragon-toolchain/${{ matrix.image }}:v0.7
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: android
+            image: arm64-android
+            preset: arm64-android-release
+          - target: linux
+            image: arm64-linux
+            preset: arm64-linux-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Configure
+        run: |
+          git config --global --add safe.directory '*'
+          cmake --preset ${{ matrix.preset }} -B build
+
+      - name: Build
+        run: cmake --build build -j $(nproc)
+
+      - name: Package
+        run: scripts/package.sh --split build pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ggml-hexagon-fusa-${{ matrix.target }}
+          path: pkg
