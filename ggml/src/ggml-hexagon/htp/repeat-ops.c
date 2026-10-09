@@ -36,6 +36,21 @@ struct htp_repeat_context {
     bool     copy_direct;
 };
 
+// DMA setup and masked HVX stores cost more than memcpy for small outputs and short rows.
+static inline bool repeat_copy_direct(uint64_t dst_size, size_t src_row_size, size_t dst_row_size) {
+    if (dst_size <= 8192) {
+        return true;
+    }
+#if __HVX_ARCH__ == 73
+    // On v73 the HVX expansion already wins for output rows up to 512 bytes once the
+    // source row is 48 bytes or longer (11-78% faster on the EVK); below that memcpy wins.
+    return dst_row_size <= 512 && src_row_size < 48;
+#else
+    (void) src_row_size;
+    return dst_row_size <= 512;
+#endif
+}
+
 static void repeat_row(uint8_t * dst, uint8_t * src, uint32_t row_bytes, uint32_t dst_bytes, uint32_t type_size) {
     if (row_bytes == type_size) {
         uint32_t bits = 0;
@@ -288,6 +303,7 @@ int op_repeat(struct htp_ops_context * octx) {
     }
 #endif
 
+    const size_t src_row_size = src0->ne[0] * type_size;
     const size_t dst_row_size = dst->ne[0] * type_size;
 
     uint32_t row_start = 0;
@@ -321,8 +337,7 @@ int op_repeat(struct htp_ops_context * octx) {
         .row_start        = row_start,
         .type_size        = type_size,
         .size_per_thread  = MIN(16 * 1024, (octx->ctx->vtcm_size / n_threads) & ~(size_t) 127),
-        // DMA setup and masked HVX stores cost more than memcpy for short rows.
-        .copy_direct      = (dst_size <= 8192 || dst_row_size <= 512) && !htp_tensor_is_extended(src0) && src_size - 1 <= UINT32_MAX - src0->data,
+        .copy_direct      = repeat_copy_direct(dst_size, src_row_size, dst_row_size) && !htp_tensor_is_extended(src0) && src_size - 1 <= UINT32_MAX - src0->data,
     };
 
     FARF(HIGH, "repeat: (%ux%ux%ux%u) -> (%ux%ux%ux%u) nr=(%u,%u,%u,%u)\n",
