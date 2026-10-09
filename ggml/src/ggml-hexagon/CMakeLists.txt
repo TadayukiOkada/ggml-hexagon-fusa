@@ -44,6 +44,24 @@ message(STATUS "hexagon: using ${GGML_HEXAGON_HTP_SDK_ROOT} and ${GGML_HEXAGON_H
 # Functional safety firmware only loads libraries with an SWIV CRC section. Set this to swiv_build_utility.py to embed one.
 set(GGML_HEXAGON_SWIV_UTILITY "$ENV{SWIV_BUILD_UTILITY}" CACHE FILEPATH "ggml-hexagon: embed an SWIV CRC into HTP libraries using this script")
 
+# Host library and skels embed the same build ID; the host checks it when it opens a session.
+# GGML_HEXAGON_BUILD_SRC_ID identifies the sources (set by the top-level project); the rest is the skel configuration.
+if (NOT GGML_HEXAGON_BUILD_SRC_ID)
+    set(GGML_HEXAGON_BUILD_SRC_ID "unknown")
+endif()
+get_filename_component(_htp_sdk_ver "${GGML_HEXAGON_HTP_SDK_ROOT}" NAME)
+set(_htp_yield "y")
+foreach(_opt GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY GGML_HEXAGON_HTP_DEBUG)
+    if (${_opt})
+        string(APPEND _htp_yield "1")
+    else()
+        string(APPEND _htp_yield "0")
+    endif()
+endforeach()
+set(GGML_HEXAGON_BUILD_ID "${GGML_HEXAGON_BUILD_SRC_ID}.${_htp_yield}.sdk${_htp_sdk_ver}.${GGML_HEXAGON_TOOLV}")
+message(STATUS "hexagon: build ID ${GGML_HEXAGON_BUILD_ID}")
+file(WRITE ${CMAKE_BINARY_DIR}/hexagon-build-id.txt "${GGML_HEXAGON_BUILD_ID}\n")
+
 add_library(htp_iface OBJECT
     ${CMAKE_CURRENT_BINARY_DIR}/htp_iface_stub.c)
 
@@ -74,6 +92,7 @@ ggml_add_backend_library(${TARGET_NAME}
     ../../include/ggml-hexagon.h)
 
 target_link_libraries(${TARGET_NAME} PRIVATE htp_iface)
+target_compile_definitions(${TARGET_NAME} PRIVATE GGML_HEXAGON_BUILD_ID="${GGML_HEXAGON_BUILD_ID}")
 
 target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -94,6 +113,7 @@ function(build_htp_skel V)
             -DHEXAGON_HTP_YIELD_IN_CPY=${GGML_HEXAGON_HTP_YIELD_IN_CPY}
             -DDSP_VERSION=${V}
             -DHEXAGON_SWIV_UTILITY=${GGML_HEXAGON_SWIV_UTILITY}
+            -DHEXAGON_BUILD_ID=${GGML_HEXAGON_BUILD_ID}
             -DPREBUILT_LIB_DIR="${GGML_HEXAGON_TOOLV}_${V}")
     list(APPEND HTP_SKELS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so)
     list(APPEND HTP_PROJECTS htp-${V})

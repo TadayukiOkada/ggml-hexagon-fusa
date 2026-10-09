@@ -50,5 +50,6 @@ function(ggml_add_backend_library backend)
     endif()
 endfunction()
 
+include(cmake/build-id.cmake)
 include(GNUInstallDirs)
 add_subdirectory(ggml/src/ggml-hexagon)

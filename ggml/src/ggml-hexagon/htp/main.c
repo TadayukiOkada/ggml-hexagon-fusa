@@ -698,6 +698,24 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     return AEE_SUCCESS;
 }
 
+#ifndef HTP_BUILD_ID
+#define HTP_BUILD_ID "unknown"
+#endif
+
+// The host library carries the same ID and refuses a skel from another build.
+AEEResult htp_iface_build_id(remote_handle64 handle, char * id, int id_len) {
+    (void)handle;
+    if (!id || id_len <= 0) {
+        return AEE_EBADPARM;
+    }
+    if ((size_t) id_len < sizeof(HTP_BUILD_ID)) {
+        id[0] = '\0';
+        return AEE_EBUFFERTOOSMALL;
+    }
+    memcpy(id, HTP_BUILD_ID, sizeof(HTP_BUILD_ID));
+    return AEE_SUCCESS;
+}
+
 static void htp_error_callback(dspqueue_t queue, int error, void * context) {
     // No errors expected on the DSP.
     FARF(ERROR, "Error callback: 0x%08x", (unsigned) error);
