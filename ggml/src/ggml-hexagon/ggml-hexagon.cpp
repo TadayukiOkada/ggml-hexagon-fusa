@@ -132,6 +132,7 @@ static int    opt_ar_scatter = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD 
 static u32vec opt_pmu_evt { 0x3, 0x111, 0x100, 0x105, 0x240, 0x256, 0x7D, 0x8C };
 
 static int opt_opbatch  = 1280; // max number of ops in a batch
+static int opt_opbatch_first = 64; // ops after which the first batch of a graph is sent (0 = off)
 static int opt_opqueue  = 8;   // max number of pending batches
 static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
 static int opt_oppoll   = 0;    // polling for batch completions
@@ -8371,9 +8372,14 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
     }
 
-    // Queue and execute
+    // Queue and execute. The first ops go out in a small batch, so the DSP works while the host
+    // prepares the rest (about 1 us per op on the host, a token of a 2B model is ~800 ops).
+    size_t n_enqueued = 0;
     for (const auto & node : *nodes_ptr) {
         sess->enqueue_op(node);
+        if (++n_enqueued == (size_t) opt_opbatch_first && nodes_ptr->size() > 2 * n_enqueued) {
+            sess->flush_async();
+        }
     }
 
     if (sess->last_error > HTP_STATUS_OK) {
@@ -9663,6 +9669,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
 
     const char * str_verbose  = getenv("GGML_HEXAGON_VERBOSE");
     const char * str_opbatch  = getenv("GGML_HEXAGON_OPBATCH");
+    const char * str_opbatch_first = getenv("GGML_HEXAGON_OPBATCH_FIRST");
     const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
@@ -9722,6 +9729,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_opfilter  = str_opfilter ? new std::regex(str_opfilter, RE_ICASE) : NULL;
     opt_verbose   = str_verbose  ? atoi(str_verbose)                      : 0;
     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
+    opt_opbatch_first = str_opbatch_first ? strtoul(str_opbatch_first, NULL, 0) : opt_opbatch_first;
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
