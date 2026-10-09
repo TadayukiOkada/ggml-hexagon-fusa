@@ -932,8 +932,9 @@ static void pack_mxfp4_quants(block_mxfp4 * x, const uint8_t * qs, unsigned int 
     }
 }
 
-// repack q4_0 data into q4_0_tiled tensor
-static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset, size_t size) {
+// repack q4_0 data into q4_0_tiled tensor. vrmpy_order: the Q4_0 layout (see below); IQ4_NL tiles keep
+// the pair layout (byte 32 * cp + row holds k = 2cp low and 2cp + 1 high) that its kernels read.
+static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset, size_t size, bool vrmpy_order) {
     const block_q4_0 * src_matrix = (const block_q4_0 *) data;
     int64_t ne0 = t->ne[0];
     int64_t ne1 = t->ne[1];
@@ -977,11 +978,19 @@ static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset,
                 // gives the four k per row that vrmpy consumes (the activations are quantized in the same
                 // order), and the even and odd bytes are the k pairs that an HMX weight vector holds.
                 static const int sigma[4] = { 0, 2, 1, 3 };
-                for (int v = 0; v < 4; v++) {
-                    for (int row = 0; row < 32; row++) {
-                        for (int j = 0; j < 4; j++) {
-                            const int k = 8 * v + sigma[j];
-                            tile_dst[v * 128 + row * 4 + j] = (tile_quants[row][k + 4] << 4) | tile_quants[row][k];
+                if (vrmpy_order) {
+                    for (int v = 0; v < 4; v++) {
+                        for (int row = 0; row < 32; row++) {
+                            for (int j = 0; j < 4; j++) {
+                                const int k = 8 * v + sigma[j];
+                                tile_dst[v * 128 + row * 4 + j] = (tile_quants[row][k + 4] << 4) | tile_quants[row][k];
+                            }
+                        }
+                    }
+                } else {
+                    for (int cp = 0; cp < 16; cp++) {
+                        for (int row = 0; row < 32; row++) {
+                            tile_dst[cp * 32 + row] = (tile_quants[row][2 * cp + 1] << 4) | tile_quants[row][2 * cp];
                         }
                     }
                 }
@@ -996,8 +1005,8 @@ static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset,
     }
 }
 
-// repack q4_0_tiled tensor into q4_0 data
-static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset, size_t size) {
+// repack q4_0_tiled tensor into q4_0 data (vrmpy_order: see repack_q4_0_tiled)
+static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset, size_t size, bool vrmpy_order) {
     block_q4_0 * dst_matrix = (block_q4_0 *) data;
     int64_t ne0 = t->ne[0];
     int64_t ne1 = t->ne[1];
@@ -1042,13 +1051,23 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset,
 
                 uint8_t tile_quants[32][32];
                 static const int sigma[4] = { 0, 2, 1, 3 };  // see repack_q4_0_tiled
-                for (int v = 0; v < 4; v++) {
-                    for (int row = 0; row < 32; row++) {
-                        for (int j = 0; j < 4; j++) {
-                            const int k = 8 * v + sigma[j];
-                            uint8_t val = tile_src[v * 128 + row * 4 + j];
-                            tile_quants[row][k]     = val & 0x0F;
-                            tile_quants[row][k + 4] = val >> 4;
+                if (vrmpy_order) {
+                    for (int v = 0; v < 4; v++) {
+                        for (int row = 0; row < 32; row++) {
+                            for (int j = 0; j < 4; j++) {
+                                const int k = 8 * v + sigma[j];
+                                uint8_t val = tile_src[v * 128 + row * 4 + j];
+                                tile_quants[row][k]     = val & 0x0F;
+                                tile_quants[row][k + 4] = val >> 4;
+                            }
+                        }
+                    }
+                } else {
+                    for (int cp = 0; cp < 16; cp++) {
+                        for (int row = 0; row < 32; row++) {
+                            uint8_t val = tile_src[cp * 32 + row];
+                            tile_quants[row][2 * cp + 0] = val & 0x0F;
+                            tile_quants[row][2 * cp + 1] = val >> 4;
                         }
                     }
                 }
@@ -2416,7 +2435,7 @@ static void repack_tiled_q5_K(void * data, const ggml_tensor * t, size_t offset,
 static void repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t size) {
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            repack_q4_0_tiled(tensor, data, 0, size);
+            repack_q4_0_tiled(tensor, data, 0, size, true);
             break;
 
         case GGML_TYPE_Q4_1:
@@ -2432,7 +2451,7 @@ static void repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t 
             break;
 
         case GGML_TYPE_IQ4_NL:
-            repack_q4_0_tiled(tensor, data, 0, size);
+            repack_q4_0_tiled(tensor, data, 0, size, false);
             break;
 
         case GGML_TYPE_MXFP4:
@@ -2524,7 +2543,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         case GGML_TYPE_Q4_0:
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
-            repack_tiled_q4_0(data, tensor, offset, size);
+            repack_tiled_q4_0(data, tensor, offset, size, true);
             break;
 
         case GGML_TYPE_Q4_1:
@@ -2554,7 +2573,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         case GGML_TYPE_IQ4_NL:
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
-            repack_tiled_q4_0(data, tensor, offset, size);
+            repack_tiled_q4_0(data, tensor, offset, size, false);
             break;
 
         case GGML_TYPE_MXFP4:
@@ -2679,7 +2698,7 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            repack_tiled_q4_0(temp_buf.data(), tensor, offset, temp_size);
+            repack_tiled_q4_0(temp_buf.data(), tensor, offset, temp_size, true);
             break;
 
         case GGML_TYPE_Q4_1:
@@ -2699,7 +2718,7 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
             break;
 
         case GGML_TYPE_IQ4_NL:
-            repack_tiled_q4_0(temp_buf.data(), tensor, offset, temp_size);
+            repack_tiled_q4_0(temp_buf.data(), tensor, offset, temp_size, false);
             break;
 
         case GGML_TYPE_MXFP4:
