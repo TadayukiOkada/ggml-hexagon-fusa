@@ -5,10 +5,14 @@
 #
 # usage: scripts/device-tests.sh <package dir> <out dir> [--ops] [--long] [--bench MODEL.gguf]...
 #
-#   --ops     test-backend-ops-hex against the CPU, one process per op, on HTP0
-#   --long    single ops that run for tens of ms, checked against the CPU once each with
-#             GGML_HEXAGON_PROFILE=1; feed long_*.log to scripts/op-budget.py (perf mode would
-#             repeat a 100 ms op thousands of times)
+#   --ops     test-backend-ops-hex against the CPU, one process per op, on HTP0, with
+#             GGML_HEXAGON_PROFILE=1: run scripts/op-budget.py --fail on test_*.log from a
+#             device without the self-test before running --ops on functional-safety firmware
+#   --long    single ops that run for tens of ms (GGML_TEST_LONG_OPS=1), checked against the
+#             CPU once each with GGML_HEXAGON_PROFILE=1; feed long_*.log to scripts/op-budget.py.
+#             Some of them hold VTCM/HMX for over 100 ms in one op: do not run this on
+#             functional-safety firmware, whose NSP self-test then times out and stops the DSP.
+#             Measure op times on a device without the self-test.
 #   --bench   llama-bench pp512, pp2048 and tg128 on HTP0 for each model
 #
 # Environment: ADSP_LIBRARY_PATH as the board needs it (run.sh puts the package first),
@@ -47,7 +51,7 @@ if [ $ops -eq 1 ]; then
     grep -aoE '^  [A-Z_0-9]+\(' "$out/support.log" | tr -d ' (' | sort -u > "$out/ops.txt"
     echo "ops: $(wc -l < "$out/ops.txt")" | tee -a "$summary"
     for op in $(cat "$out/ops.txt"); do
-        run 3600 "$out/test_$op.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$op"
+        GGML_HEXAGON_PROFILE=1 run 3600 "$out/test_$op.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$op"
         rc=$?
         echo "test $op rc=$rc $(grep -aE '[0-9]+/[0-9]+ tests passed' "$out/test_$op.log" | tail -1 | tr -s ' ')" | tee -a "$summary"
         [ $rc -ne 0 ] && sleep "$pause"
@@ -65,7 +69,7 @@ if [ $long -eq 1 ]; then
         "fa FLASH_ATTN_EXT hsk=128,hsv=128,nh=8,nr23=\[2,1\],kv=(512|4096|8192|16384),nb=512,"
     do
         set -- $spec
-        GGML_HEXAGON_PROFILE=1 run 1800 "$out/long_$1.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$2" -p "$3"
+        GGML_TEST_LONG_OPS=1 GGML_HEXAGON_PROFILE=1 run 1800 "$out/long_$1.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$2" -p "$3"
         rc=$?
         echo "long $1 rc=$rc" | tee -a "$summary"
         [ $rc -ne 0 ] && sleep "$pause"

@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index cdbfd1a31..5bb7a35c9 100644
+index 9627c48..8f4fa26 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1495,15 +1495,15 @@ struct test_case {
@@ -21,7 +21,7 @@ index cdbfd1a31..5bb7a35c9 100644
                      ud->ok = false;
                      return true;
                  }
-@@ -9339,6 +9339,69 @@ static const ggml_type other_types[] = {
+@@ -9481,6 +9481,69 @@ static const ggml_type other_types[] = {
  #pragma optimize("", off)
  #endif
  
@@ -91,18 +91,22 @@ index cdbfd1a31..5bb7a35c9 100644
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
-@@ -11629,6 +11692,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11819,6 +11882,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
-+    for (auto & tc : make_test_cases_long_ops()) {
-+        test_cases.emplace_back(std::move(tc));
++    // Long single ops run for tens of ms each, which can exceed a functional-safety
++    // self-test period on the DSP. Only include them when asked to.
++    if (getenv("GGML_TEST_LONG_OPS")) {
++        for (auto & tc : make_test_cases_long_ops()) {
++            test_cases.emplace_back(std::move(tc));
++        }
 +    }
 +
      return test_cases;
  }
  #ifdef _MSC_VER
-@@ -12109,6 +12176,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12327,6 +12398,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
      }
  
