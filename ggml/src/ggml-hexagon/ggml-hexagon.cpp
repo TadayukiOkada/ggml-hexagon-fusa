@@ -3718,6 +3718,55 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
+    // MUL of an RMS_NORM+MUL+ADD output by one value (gemma's per-layer output scale): the norm op scales
+    // the rows after adding the residual, as the scalar MUL computes it
+    bool try_fuse_rms_norm_mul_add_scale(const htp_opnode & node) {
+        if (n_ops == 0) return false;
+        if (node.opcode != HTP_OP_MUL) return false;
+
+        htp_opnode & last_node = ops[n_ops - 1];
+        if (last_node.opcode != HTP_OP_RMS_NORM_MUL || last_node.inputs.size() != 3) return false;
+
+        const ggml_tensor * add = last_node.dst();
+        const ggml_tensor * out = node.dst();
+        const ggml_tensor * a   = node.src0();
+        const ggml_tensor * b   = node.src1();
+        if (!ggml_hexagon_tensor_is_fuseable(add)) return false;
+
+        const ggml_tensor * scale;
+        if (a == add) {
+            scale = b;
+        } else if (b == add) {
+            scale = a;
+        } else {
+            return false;
+        }
+
+        if (scale->type != GGML_TYPE_F32 || ggml_nelements(scale) != 1) return false;
+        if (out->type != GGML_TYPE_F32 || !ggml_are_same_shape(out, add) || !ggml_is_contiguous(out)) return false;
+
+        if (!try_fuse_common(scale, out)) {
+            return false;
+        }
+
+        struct htp_unary_kernel_params * kp = (struct htp_unary_kernel_params *) last_node.kernel_params;
+        kp->mul_src3 = 1;
+
+        last_node.name = "RMS_NORM+MUL+ADD+SCALE";
+        last_node.inputs.push_back(scale);
+        last_node.outputs.clear();
+        last_node.outputs.push_back(out);
+        last_node.fused.push_back(node.node);
+
+        htp_op_desc & o = h_ops[n_ops - 1];
+        memcpy(o.kernel_params, kp, sizeof(*kp));
+        o.src[3] = add_tensor(scale);
+        o.dst[0] = add_tensor(out);
+
+        HEX_VERBOSE("ggml-hex: %s fused RMS_NORM+MUL+ADD+SCALE (#%u)\n", sess->c_name(), n_ops - 1);
+        return true;
+    }
+
     // SCALE, TANH, SCALE on the output of a matrix-vector product (the final logit softcap) run in
     // the epilogue of the repacked HVX matvec.
     bool try_fuse_mul_mat_post(const htp_opnode & node) {
@@ -4364,6 +4413,7 @@ struct ggml_hexagon_opbatch {
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_MUL)  && try_fuse_rms_norm_mul(node))  return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_ADD)  && try_fuse_rms_norm_mul_add(node)) return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_ADD)  && try_fuse_rms_norm_mul_add_scale(node)) return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_POST)  && try_fuse_mul_mat_post(node))  return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_GLU)   && try_fuse_mul_mat_glu(node))   return true;
@@ -8501,9 +8551,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     ggml_node_has_n_uses(graph, i, 1)) {
                     extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
                 }
-            } else if (graph->nodes[i]->op == GGML_OP_MUL || graph->nodes[i]->op == GGML_OP_SCALE ||
+            } else if (graph->nodes[i]->op == GGML_OP_MUL || graph->nodes[i]->op == GGML_OP_SCALE || graph->nodes[i]->op == GGML_OP_ADD ||
                        (graph->nodes[i]->op == GGML_OP_UNARY && ggml_get_unary_op(graph->nodes[i]) == GGML_UNARY_OP_TANH)) {
-                // the MUL of an RMS_NORM+MUL feeding an ADD, and the steps of a logit softcap
+                // the MUL of an RMS_NORM+MUL feeding an ADD, the ADD of an RMS_NORM+MUL+ADD feeding a scale,
+                // and the steps of a logit softcap
                 if (ggml_node_has_n_uses(graph, i, 1)) {
                     extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
                 }

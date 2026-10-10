@@ -1,0 +1,53 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5725,6 +5725,37 @@
+     }
+ };
+ 
++// post-norm with the residual added and the rows scaled by one value (gemma's per-layer output scale),
++// run as one graph: backends may fuse the chain
++struct test_rms_norm_add_scale : public test_case {
++    const int64_t n;
++    const int64_t rows;
++    const bool    residual_first;  // add(residual, norm) instead of add(norm, residual)
++
++    std::string vars() override { return VARS_TO_STR3(n, rows, residual_first); }
++    std::string op_desc(ggml_tensor *) override { return "RMS_NORM_ADD_SCALE"; }
++    bool run_whole_graph() override { return true; }
++
++    test_rms_norm_add_scale(int64_t n, int64_t rows, bool residual_first)
++        : n(n), rows(rows), residual_first(residual_first) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, rows);
++        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++        ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, rows);
++        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
++        ggml_set_name(x, "x");
++        ggml_set_name(w, "w");
++        ggml_set_name(r, "r");
++        ggml_set_name(s, "s");
++        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
++        out = residual_first ? ggml_add(ctx, r, out) : ggml_add(ctx, out, r);
++        out = ggml_mul(ctx, out, s);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_OUT_PROD
+ struct test_out_prod : public test_case {
+     const ggml_type type_a;
+@@ -12106,6 +12137,11 @@
+         test_cases.emplace_back(new test_mul_mat_softcap(type, 1536, 32768, 3));
+     }
+ 
++    for (int64_t rows : {1, 7, 512}) {
++        test_cases.emplace_back(new test_rms_norm_add_scale(1536, rows, true));
++    }
++    test_cases.emplace_back(new test_rms_norm_add_scale(2048, 33, false));
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER

@@ -12,6 +12,7 @@ struct htp_unary_kernel_params {
     uint32_t  block;
     uint32_t  broadcast_weight;
     uint32_t  add_src2;                   // RMS_NORM_MUL: dst = rms_norm(src0) * src1 + src2 (the residual)
+    uint32_t  mul_src3;                   // RMS_NORM_MUL with add_src2: dst *= src3 (one f32 value) after the residual
     uint32_t  vtcm_src2_size_per_thread;
 
     uint32_t  vtcm_src0_size_per_thread;

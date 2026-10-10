@@ -64,6 +64,7 @@ struct htp_unary_context {
     dma_addr_t                data_src0;
     dma_addr_t                data_src1;            // weight/scale tensor for RMS_NORM_MUL
     dma_addr_t                data_src2;            // residual added by RMS_NORM_MUL (add_src2)
+    float                     scale3;               // value of src3 that RMS_NORM_MUL multiplies by (mul_src3)
     dma_addr_t                data_dst;
 
     size_t                    src0_data_row_size;   // actual data bytes per row
@@ -243,12 +244,15 @@ static void rms_norm_mul_f32(const void * restrict src,
     }
 }
 
-// dst += residual, as the ADD op computes it
+// dst += residual, as the ADD op computes it, and dst *= the scale, as the scalar MUL op computes it
 static void rms_norm_mul_add_residual_f32(void * restrict dst, const void * restrict res, const uint32_t num_rows,
                                           const struct htp_unary_context * uctx) {
     for (uint32_t ir = 0; ir < num_rows; ir++) {
         uint8_t * d = (uint8_t *) dst + ir * uctx->dst_row_size_aligned;
         hvx_add_f32_aaa(d, d, (const uint8_t *) res + ir * uctx->dst_row_size_aligned, uctx->nc);
+        if (uctx->kparams->mul_src3) {
+            hvx_mul_scalar_f32_aa(d, d, uctx->scale3, uctx->nc);
+        }
     }
 }
 
@@ -1753,6 +1757,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         .data_src0             = src0->data,
         .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? src1->data : 0,
         .data_src2             = kparams->add_src2 ? octx->src[2]->data : 0,
+        .scale3                = kparams->mul_src3 ? *(const float *) (uintptr_t) octx->src[3]->data : 0.0f,
         .data_dst              = dst->data,
 
         .src0_data_row_size    = src0_data_row_size,
