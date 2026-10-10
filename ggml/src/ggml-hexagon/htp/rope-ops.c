@@ -532,6 +532,32 @@ static void inline rope_neox_f32_inplace(struct htp_rope_context * rctx, uint8_t
     }
 }
 
+// sin/cos cache of position pos[i2] (the four position arrays for M-RoPE)
+static inline void rope_theta_cache_update(struct htp_rope_context * rctx, const int32_t * pos, uint32_t i2,
+                                           uint32_t ne2, uint32_t ne0, bool is_vision, float * theta_cache) {
+    // VISION rotates the full row; other modes only rotate n_dims.
+    const uint32_t n_cache = is_vision ? ne0 : (uint32_t) rctx->n_dims;
+    const bool is_mrope = (rctx->mode & HTP_ROPE_TYPE_MROPE) != 0;
+    if (is_mrope) {
+        // src1 holds four position arrays stacked along ne0:
+        // pos[i2], pos[i2+ne2], pos[i2+ne2*2], pos[i2+ne2*3]
+        const bool is_imrope = (rctx->mode == HTP_ROPE_TYPE_IMROPE);
+        mrope_cache_init(
+            (float) pos[i2],
+            (float) pos[i2 + ne2],
+            (float) pos[i2 + ne2 * 2],
+            (float) pos[i2 + ne2 * 3],
+            rctx->sections, is_imrope, is_vision,
+            rctx->freq_scale, rctx->freq_factors, rctx->corr_dims,
+            n_cache, rctx->ext_factor, rctx->attn_factor,
+            theta_cache, rctx->theta_scale, rctx->theta_powers, rctx->theta_scale_32);
+    } else {
+        rope_cache_init(pos[i2], rctx->freq_scale, rctx->freq_factors, rctx->corr_dims,
+                        n_cache, rctx->ext_factor, rctx->attn_factor,
+                        theta_cache, rctx->theta_scale, rctx->theta_powers, rctx->theta_scale_32);
+    }
+}
+
 static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
     struct htp_rope_context * rctx = (struct htp_rope_context *) data;
     struct htp_ops_context * octx = rctx->octx;
@@ -578,6 +604,69 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
     uint32_t prev_i2 = (uint32_t) -1;
     uint32_t cur_slot = 0;
 
+    // Rows evenly spaced across heads and positions (Q/K as the matmuls leave them): one DMA pipeline
+    // over all rows of the thread, with blocks that may span positions and HTP_ROPE_SPAD_NSLOTS - 1
+    // blocks in flight, instead of a new pipeline for every position.
+    const bool rows_uniform = nb02 == ne1 * nb01 && nb2 == ne1 * nb1 && (ne3 == 1 || (nb03 == ne2 * nb02 && nb3 == ne2 * nb2));
+    if (rows_uniform) {
+        const uint32_t   B      = HTP_ROPE_SPAD_BLOCK;
+        const uint32_t   NS     = HTP_ROPE_SPAD_NSLOTS;
+        const size_t     rsa    = rctx->src0_row_size_aligned;
+        const uint32_t   n_rows = src0_end_row - src0_start_row;
+        const uint32_t   nblk   = (n_rows + B - 1) / B;
+        const dma_addr_t s0     = src0->data + (size_t) src0_start_row * nb01;
+        const dma_addr_t d0     = dst->data + (size_t) src0_start_row * nb1;
+        const uint32_t   ne     = is_vision ? ne0 : rctx->n_dims;
+
+        // a write (here a dummy) before each read, so that the pops come in pairs
+        for (uint32_t b = 0; b < nblk && b < NS - 1; b++) {
+            uint8_t * slot = rope_spad_slot(src0_spad_base, b % NS, rsa);
+            dma_queue_push(dma_q, dma_make_data(dst->data, slot), 0, 0, 0, 0);
+            dma_queue_push(dma_q, dma_make_data(slot, s0 + (size_t) b * B * nb01),
+                           rsa, rctx->src0_row_stride, rctx->src0_row_size, MIN(B, n_rows - b * B));
+        }
+
+        for (uint32_t b = 0; b < nblk; b++) {
+            dma_queue_pop(dma_q);
+            uint8_t * spad = (uint8_t *) dma_queue_pop(dma_q).dst;
+
+            const uint32_t r0 = src0_start_row + b * B;
+            const uint32_t nr = MIN(B, src0_end_row - r0);
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, r0);
+            for (uint32_t r = 0; r < nr;) {  // runs of rows with one position
+                const uint32_t rem2 = fastmodulo(r0 + r, ne2 * ne1, &rctx->div_ne2_ne1);
+                const uint32_t i2   = fastdiv(rem2, &rctx->div_ne1);
+                const uint32_t i1   = rem2 - i2 * ne1;
+                const uint32_t run  = MIN(nr - r, ne1 - i1);
+                if (i2 != prev_i2) {
+                    prev_i2 = i2;
+                    rope_theta_cache_update(rctx, pos, i2, ne2, ne0, is_vision, theta_cache);
+                }
+                if (is_neox || is_vision) {
+                    rope_neox_f32_inplace(rctx, spad + r * rsa, run, ne, theta_cache);
+                } else {
+                    rope_basic_f32_inplace(rctx, spad + r * rsa, run, theta_cache);
+                }
+                r += run;
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, r0);
+
+            dma_queue_push(dma_q, dma_make_data(d0 + (size_t) b * B * nb1, spad),
+                           rctx->dst_row_stride, rsa, rctx->dst_row_size, nr);
+
+            const uint32_t pb = b + NS - 1;
+            if (pb < nblk) {  // into the slot whose write was queued last round
+                uint8_t * pslot = rope_spad_slot(src0_spad_base, pb % NS, rsa);
+                dma_queue_push(dma_q, dma_make_data(pslot, s0 + (size_t) pb * B * nb01),
+                               rsa, rctx->src0_row_stride, rctx->src0_row_size, MIN(B, n_rows - pb * B));
+            }
+        }
+
+        dma_queue_flush(dma_q);
+        return;
+    }
+
     for (uint32_t i3 = i3_start; i3 < ne3; i3++) { // batch
         const uint32_t i2_init = (i3 == i3_start) ? i2_start : 0;
         for (uint32_t i2 = i2_init; i2 < ne2; i2++) { // seq-len
@@ -609,29 +698,8 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                 // Update theta cache
                 if (i2 != prev_i2) {
                     prev_i2 = i2;
-
                     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, i2);
-                    // VISION rotates the full row; other modes only rotate n_dims.
-                    const uint32_t n_cache = is_vision ? ne0 : (uint32_t) rctx->n_dims;
-                    const bool is_mrope = (rctx->mode & HTP_ROPE_TYPE_MROPE) != 0;
-                    if (is_mrope) {
-                        // src1 holds four position arrays stacked along ne0:
-                        // pos[i2], pos[i2+ne2], pos[i2+ne2*2], pos[i2+ne2*3]
-                        const bool is_imrope = (rctx->mode == HTP_ROPE_TYPE_IMROPE);
-                        mrope_cache_init(
-                            (float) pos[i2],
-                            (float) pos[i2 + ne2],
-                            (float) pos[i2 + ne2 * 2],
-                            (float) pos[i2 + ne2 * 3],
-                            rctx->sections, is_imrope, is_vision,
-                            rctx->freq_scale, freq_factors, rctx->corr_dims,
-                            n_cache, rctx->ext_factor, rctx->attn_factor,
-                            theta_cache, rctx->theta_scale, rctx->theta_powers, rctx->theta_scale_32);
-                    } else {
-                       rope_cache_init(pos[i2], rctx->freq_scale, freq_factors, rctx->corr_dims,
-                                        n_cache, rctx->ext_factor, rctx->attn_factor,
-                                        theta_cache, rctx->theta_scale, rctx->theta_powers, rctx->theta_scale_32);
-                    }
+                    rope_theta_cache_update(rctx, pos, i2, ne2, ne0, is_vision, theta_cache);
                     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, i2);
                 }
 
