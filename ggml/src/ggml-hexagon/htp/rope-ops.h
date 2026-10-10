@@ -18,6 +18,9 @@ struct htp_rope_kernel_params {
     uint32_t src0_row_size_aligned;
     uint32_t freq_factors_offset;
     uint32_t freq_factors_size;
+    uint32_t norm;                // RMS_NORM+MUL first, with the weight src[3] (Q/K norm before RoPE)
+    float    norm_eps;
+    uint32_t norm_w_offset;       // VTCM offset of the norm weight (after the freq factors)
 
     struct fastdiv_values div_ne2_ne1;
     struct fastdiv_values div_ne1;

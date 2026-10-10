@@ -1,0 +1,78 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5756,6 +5756,58 @@
+     }
+ };
+ 
++// RMS_NORM+MUL feeding ROPE (the Q/K norms before RoPE), run as one graph: backends may fuse the chain
++struct test_rms_norm_rope : public test_case {
++    const int64_t hd;
++    const int64_t nh;
++    const int64_t nt;
++    const int     mode;
++    const bool    ff;
++
++    std::string vars() override { return VARS_TO_STR5(hd, nh, nt, mode, ff); }
++    std::string op_desc(ggml_tensor *) override { return "RMS_NORM_ROPE"; }
++    bool run_whole_graph() override { return true; }
++    double max_maa_err() override { return 1e-3; }
++    // the backend's sin/cos: head dim 512 with frequency factors comes near 1e-7 with or without the fusion
++    double max_nmse_err() override { return 1e-6; }
++
++    test_rms_norm_rope(int64_t hd, int64_t nh, int64_t nt, int mode, bool ff)
++        : hd(hd), nh(nh), nt(nt), mode(mode), ff(ff) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nh, nt);
++        ggml_tensor * w    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
++        ggml_tensor * pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nt);
++        ggml_tensor * freq = ff ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd / 2) : nullptr;
++        ggml_set_name(x, "x");
++        ggml_set_name(w, "w");
++        ggml_set_name(pos, "pos");
++        if (freq) {
++            ggml_set_name(freq, "freq");
++        }
++        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
++        out = ggml_rope_ext(ctx, out, pos, freq, hd, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32) {
++                std::vector<int> data(nt);
++                for (int i = 0; i < nt; i++) {
++                    data[i] = rand() % 4096;
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, nt * sizeof(int));
++            } else if (strcmp(t->name, "freq") == 0) {
++                init_tensor_uniform(t, 0.9f, 1.1f);
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
+ // GGML_OP_OUT_PROD
+ struct test_out_prod : public test_case {
+     const ggml_type type_a;
+@@ -12142,6 +12194,15 @@
+     }
+     test_cases.emplace_back(new test_rms_norm_add_scale(2048, 33, false));
+ 
++    for (int mode : {GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_NORMAL}) {
++        for (int64_t nt : {1, 7, 64}) {
++            test_cases.emplace_back(new test_rms_norm_rope(256, 8, nt, mode, false));
++            test_cases.emplace_back(new test_rms_norm_rope(128, 16, nt, mode, false));
++        }
++        test_cases.emplace_back(new test_rms_norm_rope(256, 1, 33, mode, false));
++        test_cases.emplace_back(new test_rms_norm_rope(512, 8, 7, mode, true));
++    }
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER

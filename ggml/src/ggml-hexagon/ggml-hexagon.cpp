@@ -3767,6 +3767,69 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
+    // ROPE of an RMS_NORM+MUL output (the Q/K norms of gemma, Qwen3 and others): the rope op loads the
+    // norm input and normalizes each row in VTCM, as the norm op does, before rotating it
+    bool try_fuse_rms_norm_mul_rope(const htp_opnode & node) {
+        if (n_ops == 0) return false;
+        if (node.opcode != HTP_OP_ROPE) return false;
+
+        htp_opnode & last_node = ops[n_ops - 1];
+        if (last_node.opcode != HTP_OP_RMS_NORM_MUL || last_node.inputs.size() != 2 || last_node.outputs.size() != 1) return false;
+
+        const ggml_tensor * nout = last_node.dst();
+        const ggml_tensor * x    = last_node.inputs[0];
+        const ggml_tensor * w    = last_node.inputs[1];
+        const ggml_tensor * rope = node.node;
+        if (rope->src[0] != nout || !ggml_hexagon_tensor_is_fuseable(nout)) return false;
+        if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || ggml_nrows(w) != 1 || w->ne[0] != x->ne[0]) return false;
+        if (!ggml_are_same_shape(x, nout) || x->nb[0] != sizeof(float)) return false;
+
+        if (!try_fuse_common({ x, w, rope->src[1], rope->src[2], rope })) {
+            return false;
+        }
+
+        struct htp_rope_kernel_params kparams;
+        memcpy(&kparams, node.kernel_params, sizeof(kparams));
+        kparams.norm          = 1;
+        memcpy(&kparams.norm_eps, last_node.node->op_params, sizeof(float));
+        kparams.norm_w_offset = kparams.freq_factors_offset + kparams.freq_factors_size;
+        kparams.vtcm_size     = kparams.norm_w_offset + hex_round_up(x->ne[0] * sizeof(float), 256);
+        if ((size_t) kparams.vtcm_size > sess->vtcm_size) return false;
+
+        const std::vector<ggml_tensor *> norm_fused = last_node.fused;
+        ggml_tensor *                    norm_node  = last_node.node;
+
+        last_node = node;
+        last_node.name = "RMS_NORM+MUL+ROPE";
+        last_node.inputs.clear();
+        last_node.inputs.push_back(x);
+        last_node.inputs.push_back(rope->src[1]);
+        last_node.inputs.push_back(rope->src[2]);  // freq factors, may be null
+        last_node.inputs.push_back(w);
+        last_node.fused.push_back(norm_node);
+        last_node.fused.insert(last_node.fused.end(), norm_fused.begin(), norm_fused.end());
+        memcpy(last_node.kernel_params, &kparams, sizeof(kparams));
+
+        htp_op_desc & o = h_ops[n_ops - 1];
+        memcpy(o.params, rope->op_params, sizeof(rope->op_params));
+        memcpy(o.kernel_params, &kparams, sizeof(kparams));
+        o.opcode = HTP_OP_ROPE;
+        o.src[0] = add_tensor(x);
+        o.src[1] = add_tensor(rope->src[1]);
+        o.src[2] = rope->src[2] ? add_tensor(rope->src[2]) : 0xffff;
+        o.src[3] = add_tensor(w);
+        for (uint32_t i = 4; i < HTP_OP_MAX_INPUTS; i++) {
+            o.src[i] = 0xffff;
+        }
+        o.dst[0] = add_tensor(rope);
+        for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
+            o.dst[d] = 0xffff;
+        }
+
+        HEX_VERBOSE("ggml-hex: %s fused RMS_NORM+MUL+ROPE (#%u)\n", sess->c_name(), n_ops - 1);
+        return true;
+    }
+
     // SCALE, TANH, SCALE on the output of a matrix-vector product (the final logit softcap) run in
     // the epilogue of the repacked HVX matvec.
     bool try_fuse_mul_mat_post(const htp_opnode & node) {
@@ -4414,6 +4477,7 @@ struct ggml_hexagon_opbatch {
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_ADD)  && try_fuse_rms_norm_mul_add(node)) return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_ADD)  && try_fuse_rms_norm_mul_add_scale(node)) return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_MUL)  && try_fuse_rms_norm_mul_rope(node)) return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_POST)  && try_fuse_mul_mat_post(node))  return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_GLU)   && try_fuse_mul_mat_glu(node))   return true;
