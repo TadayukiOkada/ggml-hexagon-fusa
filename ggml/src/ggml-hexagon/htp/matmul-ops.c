@@ -2169,7 +2169,7 @@ static void transfer_output_chunk_worker_fn(unsigned int n, unsigned int i, void
 
         float        *dst      = st->dst      + chunk_idx * st->dst_stride;
         const float  *src2     = st->src2     ? (st->src2     + chunk_idx * st->src2_stride) : NULL;
-        transfer_output_chunk_fp16_to_fp32(dst, src2, st->vtcm_src, chunk_idx, chunk_size, st->n_cols, st->dst_stride, st->src2_stride, st->dst_cols);
+        transfer_output_chunk_fp16_to_fp32(dst, src2, st->vtcm_src, chunk_idx, chunk_size, st->n_cols, st->dst_stride, st->src2_stride, st->dst_cols, st->writeback);
     }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, start_chunk_idx);
@@ -2557,6 +2557,7 @@ typedef struct {
     uint32_t                  src2_stride;
     uint32_t                  dst_cols;
     struct fastdiv_values     n_threads_div;
+    bool                            writeback;
 } output_transfer_col_chunk_state_t;
 
 static void transfer_output_chunk_col_chunk_worker_fn(unsigned int n, unsigned int i, void *data) {
@@ -2585,7 +2586,7 @@ static void transfer_output_chunk_col_chunk_worker_fn(unsigned int n, unsigned i
     if (chunk_dst_cols > 0) {
         transfer_output_chunk_fp16_to_fp32_col_chunk(
             dst, src2, vtcm_src, 0, st->n_rows, c_len, st->n_cols,
-            st->dst_stride, st->src2_stride, (uint32_t)chunk_dst_cols
+            st->dst_stride, st->src2_stride, (uint32_t)chunk_dst_cols, st->writeback
         );
     }
 
@@ -2611,6 +2612,7 @@ static void transfer_output_chunk_threaded(struct htp_context *ctx, float *dst, 
         col_state.n_threads_div = n_threads_div;
         col_state.traces = ctx->trace;
         col_state.ctx = ctx;
+        col_state.writeback = ctx->mm_out_writeback;
 
         worker_pool_run_func(ctx->worker_pool, transfer_output_chunk_col_chunk_worker_fn, &col_state, n_threads);
         return;
@@ -2634,6 +2636,7 @@ static void transfer_output_chunk_threaded(struct htp_context *ctx, float *dst, 
     state.src2_stride       = src2_stride;
     state.dst_cols          = dst_cols;
     state.traces            = ctx->trace;
+    state.writeback         = ctx->mm_out_writeback;
 
     if (actual_threads <= 1) {
         transfer_output_chunk_worker_fn(1, 0, &state);
@@ -2655,6 +2658,7 @@ typedef struct {
     uint32_t                dst_cols;
     struct fastdiv_values   n_threads_div;
     struct htp_thread_trace * traces;
+    bool                            writeback;
 } output_transfer_glu_state_t;
 
 // Threads take row pairs; the column blocks of a row pair are independent, so the unrolled loop
@@ -2724,6 +2728,12 @@ static void NAME(unsigned int n, unsigned int i, void *data) {                  
                                 VEC_GLU(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(pg)), Q6_Vsf_equals_Vqf32(Q6_V_hi_W(pu))));         \
             }                                                                                                             \
         }                                                                                                                 \
+        if (st->writeback) {                                                                                              \
+            hex_l2clean(out0, limit_c * sizeof(float));                                                                   \
+            if (has_r1) {                                                                                                 \
+                hex_l2clean(out1, limit_c * sizeof(float));                                                               \
+            }                                                                                                             \
+        }                                                                                                                 \
     }                                                                                                                     \
                                                                                                                           \
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, p_first);                                                          \
@@ -2751,6 +2761,7 @@ static void transfer_output_chunk_glu_threaded(struct htp_context * ctx, float *
     st.dst_cols      = (uint32_t) dst_cols;
     st.n_threads_div = (n_use == (int) ctx->n_threads) ? ctx->n_threads_div : init_fastdiv_values(n_use);
     st.traces        = ctx->trace;
+    st.writeback     = ctx->mm_out_writeback;
 
     const worker_callback_t fn = glu == HTP_MM_GLU_GEGLU ? transfer_output_chunk_geglu_worker_fn
                                                          : transfer_output_chunk_swiglu_worker_fn;
@@ -3265,6 +3276,16 @@ sync_pass: __attribute__((unused));
     return 0;
 }
 
+// The output stores wrote their lines back (ctx->mm_out_writeback): rows [m_start, m_start + m_rows)
+// of a dst with contiguous f32 rows need no flush before the next op reads them.
+static void hmx_mm_mark_rows_clean(struct htp_context * ctx, const struct htp_tensor * dst, uint32_t m_start, uint32_t m_rows) {
+    if (dst->nb[1] != dst->ne[0] * sizeof(float)) {
+        return;
+    }
+    const uint32_t start = dst->data + m_start * dst->nb[1];
+    htp_range_mark_clean(ctx, start, start + m_rows * dst->nb[1]);
+}
+
 static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_kernel_params * kparams) {
     struct htp_context * ctx = octx->ctx;
     struct htp_thread_trace * tr = &ctx->trace[0];
@@ -3670,6 +3691,13 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
                     }
                 }
             }
+        }
+    }
+
+    if (ctx->mm_out_writeback) {
+        const uint32_t n_dsts = kparams->glu ? 1 : n_weights;
+        for (uint32_t p = 0; p < n_dsts; ++p) {
+            hmx_mm_mark_rows_clean(ctx, octx->dsts[p], (uint32_t) m_start, (uint32_t) m_rows);
         }
     }
 
@@ -4195,9 +4223,15 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     // byte offset, act_stride is in activation elements (F16 or F32)
     const dma_addr_t act_addr = act->data + (size_t) m_start * act_stride * act_elem_size;
 
+    // the output stores write their lines back when the written rows are one contiguous range
+    const bool batched    = kparams->kernel_type == HTP_MM_KERNEL_HMX_F16_BATCHED;
+    const bool dst_contig = dst->nb[1] == dst->ne[0] * sizeof(float) && dst->nb[2] == dst->ne[1] * dst->nb[1] &&
+                            dst->nb[3] == dst->ne[2] * dst->nb[2];
+    octx->ctx->mm_out_writeback = dst_contig && (!batched ? dst->ne[2] * dst->ne[3] == 1 : octx->ctx->mdev.count == 1);
+
     int ret = -1;
     const int n_threads = kparams->n_threads;
-    if (kparams->kernel_type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
+    if (batched) {
         hmx_mm_f16_f32_batched_params_t batch_params = {
             .dst             = dst_ptr,
             .bias_addr       = src2_addr,
@@ -4251,9 +4285,19 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
         );
     }
 
+    const bool written_back = octx->ctx->mm_out_writeback;
+    octx->ctx->mm_out_writeback = false;
+
     if (ret != 0) {
         FARF(ERROR, "HMX matmul failed (ret=%d)\n", ret);
         return HTP_STATUS_INTERNAL_ERR;
+    }
+    if (written_back) {
+        if (batched) {
+            htp_range_mark_clean(octx->ctx, dst->data, dst->data + dst->ne[3] * dst->nb[3]);
+        } else {
+            hmx_mm_mark_rows_clean(octx->ctx, dst, (uint32_t) m_start, (uint32_t) m_rows);
+        }
     }
     return HTP_STATUS_OK;
 }
@@ -4928,7 +4972,10 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     }
 
     if (kparams->n_hmx) {
-        return hmx_mm_nx_2d_f32(octx, kparams);
+        octx->ctx->mm_out_writeback = true;
+        const int ret = hmx_mm_nx_2d_f32(octx, kparams);
+        octx->ctx->mm_out_writeback = false;
+        return ret;
     }
 
     struct htp_thread_trace * tr = &octx->ctx->trace[0];

@@ -947,7 +947,8 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
     uint32_t total_n_cols,
     uint32_t dst_stride,
     uint32_t src2_stride,
-    uint32_t dst_cols
+    uint32_t dst_cols,
+    bool writeback  // write the stored lines back (dccleana) row by row
 ) {
     const size_t tile_row_stride = hmx_ceil_div(total_n_cols, HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS;
 
@@ -1012,6 +1013,15 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
                 hvx_vec_store_u(output_row_base + c + dst_stride, valid_c * sizeof(float), v_out1);
             }
         }
+
+        // write the lines back now, while HMX computes the next chunk, instead of flushing them
+        // before the next op reads them by DMA
+        if (writeback) {
+            hex_l2clean(output_row_base, limit_c * sizeof(float));
+            if (r + 1 < n_rows) {
+                hex_l2clean(output_row_base + dst_stride, limit_c * sizeof(float));
+            }
+        }
     }
 }
 
@@ -1024,10 +1034,11 @@ static inline void transfer_output_chunk_fp16_to_fp32(
     uint32_t n_cols,
     uint32_t dst_stride,
     uint32_t src2_stride,
-    uint32_t dst_cols
+    uint32_t dst_cols,
+    bool writeback
 ) {
     transfer_output_chunk_fp16_to_fp32_col_chunk(
-        dst, src2, vtcm_src, start_row, n_rows, n_cols, n_cols, dst_stride, src2_stride, dst_cols
+        dst, src2, vtcm_src, start_row, n_rows, n_cols, n_cols, dst_stride, src2_stride, dst_cols, writeback
     );
 }
 
@@ -1043,6 +1054,7 @@ typedef struct {
     uint32_t       src2_stride; // DDR row stride for residual
     uint32_t       dst_cols;    // Actual output columns
     struct htp_thread_trace * traces;
+    bool          writeback;
 } output_transfer_task_state_t;
 
 // activations : fp32 -> fp16

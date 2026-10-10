@@ -111,6 +111,7 @@ struct htp_context {
 
     uint64_t               max_vmem;
     struct htp_dirty_range dirty_ranges[HTP_MAX_DIRTY_RANGES];
+    bool                   mm_out_writeback;  // HMX matmul output stores write their lines back
 
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
     void *                 ddr_spad_base;

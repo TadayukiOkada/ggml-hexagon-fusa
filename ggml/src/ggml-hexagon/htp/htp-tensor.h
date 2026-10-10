@@ -139,5 +139,7 @@ struct htp_context;
 void htp_flush_dirty_ranges(struct htp_context * ctx);
 void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n);
 void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n);
+// [start, end) was stored by HVX and written back (dccleana) by the threads that stored it
+void htp_range_mark_clean(struct htp_context * ctx, uint32_t start, uint32_t end);
 
 #endif // HTP_TENSOR_H
