@@ -364,6 +364,23 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     }                                                                                                                                      \
 }
 
+// SCALE / TANH ops fused into the matvec (the final logit softcap: scale, tanh, scale), with the
+// vector operations of the SCALE and TANH ops. Applied to each output tile in VTCM while the next
+// weight tiles stream in.
+static inline void hvx_mm_post_tile(float * tile, const struct htp_mm_kernel_params * kp) {
+    HVX_Vector v = *(HVX_Vector *) tile;
+    v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(v, hvx_vec_splat_f32(kp->post_scale[0])),
+                                                   hvx_vec_splat_f32(kp->post_bias[0])));
+    if (kp->post >= 2) {
+        v = hvx_vec_tanh_f32(v);
+    }
+    if (kp->post >= 3) {
+        v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(v, hvx_vec_splat_f32(kp->post_scale[1])),
+                                                       hvx_vec_splat_f32(kp->post_bias[1])));
+    }
+    *(HVX_Vector *) tile = v;
+}
+
 #define MATVEC_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X1)                                                              \
 static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                               \
     htp_matmul_preamble;                                                                                                 \
@@ -436,6 +453,9 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
                                                                                                                          \
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                           \
         DOT_2X1(ne10, dst_ptr, w_tile, act_col, valid_rows, NULL);                                                       \
+        if (kparams->post) {                                                                                             \
+            hvx_mm_post_tile(dst_ptr, kparams);                                                                          \
+        }                                                                                                                \
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                            \
                                                                                                                          \
         if (push_ct < ct_end) {                                                                                          \
@@ -1824,6 +1844,10 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     worker_callback_t matmul_job_func;
     uint32_t n_quant_tasks = 1;
     const bool is_batched = (ne12 > 1 || ne13 > 1 || ne02 > 1 || ne03 > 1);
+    // the fused epilogue ops (kparams->post) exist in the repacked matvec only
+    if (kparams->post && (is_batched || act_nrows != 1 || !is_repacked || octx->src[2])) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
     if (is_batched) {
         if (is_repacked) {
             switch (src0->type) {

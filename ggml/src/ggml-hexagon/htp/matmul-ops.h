@@ -110,7 +110,8 @@ struct htp_mm_kernel_params {
     uint8_t  n_prefetch;         // Prefetch lookahead buffers/rows in VTCM
     uint8_t  n_weights;          // Number of weights for fused NX
     uint8_t  glu;                // fused NX of a gate and an up weight + GLU (enum htp_mm_glu), 0 = none
-    uint8_t  reserved[2];
+    uint8_t  post;               // matvec epilogue: 1 = scale, 2 = scale, tanh, 3 = scale, tanh, scale
+    uint8_t  reserved;
     uint8_t  src2_stream;        // HMX 2-D: a full-matrix src2 streams through per-thread VTCM row blocks
 
     int32_t  m_chunk;            // Row chunk size (M chunk)
@@ -123,6 +124,8 @@ struct htp_mm_kernel_params {
     int32_t  vtcm_act_size;      // activation scratchpad size in VTCM
     int32_t  vtcm_bias_size;     // bias scratchpad size in VTCM (fused only)
     int32_t  vtcm_dst_size;      // dst scratchpad size in VTCM
+    float    post_scale[2];      // SCALE ops of the epilogue: x * scale + bias
+    float    post_bias[2];
 
     // Precomputed division values
     struct fastdiv_values div_ne12_ne1;

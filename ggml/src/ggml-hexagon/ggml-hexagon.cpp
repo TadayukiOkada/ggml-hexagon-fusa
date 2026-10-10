@@ -147,6 +147,7 @@ enum ggml_hexagon_fusion_flags {
     GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
     GGML_HEXAGON_FUSE_MUL_MAT_GLU   = (1 << 7), // 128
     GGML_HEXAGON_FUSE_RMS_NORM_ADD  = (1 << 8), // 256
+    GGML_HEXAGON_FUSE_MUL_MAT_POST  = (1 << 9), // 512
 };
 
 static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
@@ -3714,6 +3715,55 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
+    // SCALE, TANH, SCALE on the output of a matrix-vector product (the final logit softcap) run in
+    // the epilogue of the repacked HVX matvec.
+    bool try_fuse_mul_mat_post(const htp_opnode & node) {
+        if (n_ops == 0) return false;
+        htp_opnode & last_node = ops[n_ops - 1];
+        if (last_node.opcode != HTP_OP_MUL_MAT || last_node.inputs.size() != 2 || last_node.outputs.size() != 1) return false;
+
+        const struct htp_mm_kernel_params * kp = (const struct htp_mm_kernel_params *) last_node.kernel_params;
+        const int  post     = kp->post;
+        const bool is_scale = node.opcode == HTP_OP_SCALE;
+        const bool is_tanh  = node.opcode == HTP_OP_UNARY_TANH;
+        if (!((post == 0 && is_scale) || (post == 1 && is_tanh) || (post == 2 && is_scale))) return false;
+
+        const ggml_tensor * w   = last_node.inputs[0];
+        const ggml_tensor * x   = last_node.inputs[1];
+        const ggml_tensor * mo  = last_node.dst();
+        const ggml_tensor * out = node.dst();
+        if (kp->n_hmx || kp->collapse || !ggml_hexagon_is_repack_type(w->type)) return false;
+        if (ggml_nrows(x) != 1 || w->ne[2] * w->ne[3] != 1) return false;
+        if (node.src0() != mo || !ggml_hexagon_tensor_is_fuseable(mo)) return false;
+        if (out->type != GGML_TYPE_F32 || mo->type != GGML_TYPE_F32 || !ggml_are_same_shape(out, mo) ||
+            !ggml_is_contiguous(out)) return false;
+
+        if (!try_fuse_common({ out })) {
+            return false;
+        }
+
+        struct htp_mm_kernel_params kparams = *kp;
+        if (is_scale) {
+            const int i = post == 0 ? 0 : 1;
+            memcpy(&kparams.post_scale[i], &node.node->op_params[0], sizeof(float));
+            memcpy(&kparams.post_bias[i],  &node.node->op_params[1], sizeof(float));
+        }
+        kparams.post = (uint8_t) (post + 1);
+
+        last_node.name = kparams.post == 3 ? "MUL_MAT+SOFTCAP" : "MUL_MAT+POST";
+        last_node.outputs.clear();
+        last_node.outputs.push_back(out);
+        last_node.fused.push_back(node.node);
+        memcpy(last_node.kernel_params, &kparams, sizeof(kparams));
+
+        htp_op_desc & o = h_ops[n_ops - 1];
+        memcpy(o.kernel_params, &kparams, sizeof(kparams));
+        o.dst[0] = add_tensor(out);
+
+        HEX_VERBOSE("ggml-hex: %s fused MUL_MAT+%s (#%u)\n", sess->c_name(), is_scale ? "SCALE" : "TANH", n_ops - 1);
+        return true;
+    }
+
     bool try_fuse_mul_mat_add(const htp_opnode & node) {
         if (n_ops == 0) return false;
         if (node.opcode != HTP_OP_ADD) return false;
@@ -4254,6 +4304,7 @@ struct ggml_hexagon_opbatch {
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_MUL)  && try_fuse_rms_norm_mul(node))  return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_ADD)  && try_fuse_rms_norm_mul_add(node)) return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_POST)  && try_fuse_mul_mat_post(node))  return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_GLU)   && try_fuse_mul_mat_glu(node))   return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node)) return true;
@@ -8359,8 +8410,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     ggml_node_has_n_uses(graph, i, 1)) {
                     extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
                 }
-            } else if (graph->nodes[i]->op == GGML_OP_MUL) {
-                // the MUL of an RMS_NORM+MUL feeding an ADD
+            } else if (graph->nodes[i]->op == GGML_OP_MUL || graph->nodes[i]->op == GGML_OP_SCALE ||
+                       (graph->nodes[i]->op == GGML_OP_UNARY && ggml_get_unary_op(graph->nodes[i]) == GGML_UNARY_OP_TANH)) {
+                // the MUL of an RMS_NORM+MUL feeding an ADD, and the steps of a logit softcap
                 if (ggml_node_has_n_uses(graph, i, 1)) {
                     extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
                 }
