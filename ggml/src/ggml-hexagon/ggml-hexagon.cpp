@@ -148,6 +148,7 @@ enum ggml_hexagon_fusion_flags {
     GGML_HEXAGON_FUSE_MUL_MAT_GLU   = (1 << 7), // 128
     GGML_HEXAGON_FUSE_RMS_NORM_ADD  = (1 << 8), // 256
     GGML_HEXAGON_FUSE_MUL_MAT_POST  = (1 << 9), // 512
+    GGML_HEXAGON_FUSE_NORM_MUL_MAT  = (1 << 10), // 1024
 };
 
 static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
@@ -477,6 +478,7 @@ struct ggml_hexagon_tensor_extra {
     std::vector<uint8_t> shadow_buf;
     size_t               shadow_size { 0 };
     uint32_t             flags { 0 };
+    uint32_t             n_mm_uses { 0 };  // RMS_NORM+MUL output used only as the activation of this many matmuls
 };
 
 static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
@@ -3858,6 +3860,55 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
+    // An RMS_NORM+MUL right before a MUL_MAT_NX that takes all uses of its output: the NX op
+    // normalizes its activation rows itself (kparams.norm), and the norm op is dropped.
+    void try_absorb_norm_into_nx() {
+        if (n_ops < 2 || !ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_NORM_MUL_MAT)) return;
+
+        htp_opnode & nx   = ops[n_ops - 1];
+        htp_opnode & norm = ops[n_ops - 2];
+        if (nx.opcode != HTP_OP_MUL_MAT_NX || norm.opcode != HTP_OP_RMS_NORM_MUL) return;
+        if (norm.inputs.size() != 2 || norm.outputs.size() != 1) return;
+
+        struct htp_mm_kernel_params kparams;
+        memcpy(&kparams, nx.kernel_params, sizeof(kparams));
+        const uint32_t nw = kparams.n_weights;
+        if (kparams.norm || kparams.glu || nx.inputs.size() != nw + 1) return;
+
+        const ggml_tensor * x   = nx.inputs[nw];
+        const ggml_tensor * src = norm.inputs[0];
+        const ggml_tensor * w   = norm.inputs[1];
+        if (norm.outputs[0] != x || !x->extra) return;
+        if (((const ggml_hexagon_tensor_extra *) x->extra)->n_mm_uses != nw) return;
+        if (x->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) return;
+        if (ggml_nrows(w) != 1 || w->ne[0] != x->ne[0] || !ggml_are_same_shape(src, x)) return;
+        if (!ggml_is_contiguous(src) || !ggml_is_contiguous(x)) return;
+
+        memcpy(&kparams.norm_eps, norm.node->op_params, sizeof(float));
+        kparams.norm = 1;
+
+        if (!try_fuse_common({ src, w })) return;
+
+        nx.inputs[nw] = src;
+        nx.inputs.push_back(w);
+        nx.fused.push_back(norm.node);
+        nx.fused.insert(nx.fused.end(), norm.fused.begin(), norm.fused.end());
+        nx.name = "RMS_NORM+MUL_MAT_NX";
+        memcpy(nx.kernel_params, &kparams, sizeof(kparams));
+
+        htp_op_desc o = h_ops[n_ops - 1];
+        memcpy(o.kernel_params, &kparams, sizeof(kparams));
+        o.src[nw]     = add_tensor(src);
+        o.src[nw + 1] = add_tensor(w);
+
+        // the NX op takes the norm op's place
+        h_ops[n_ops - 2] = o;
+        ops[n_ops - 2]   = nx;
+        n_ops--;
+
+        HEX_VERBOSE("ggml-hex: %s fused RMS_NORM+MUL_MAT_NX (N=%u, #%u)\n", sess->c_name(), nw, n_ops - 1);
+    }
+
     bool try_fuse_mul_mat_nx(const htp_opnode & node) {
         if (n_ops == 0 || node.opcode != HTP_OP_MUL_MAT) return false;
         if (!is_mergeable_mul_mat(node.node)) return false;
@@ -3935,6 +3986,7 @@ struct ggml_hexagon_opbatch {
             }
 
             HEX_VERBOSE("ggml-hex: %s fused MUL_MAT_NX (N=%u, #%u)\n", sess->c_name(), curr_n + 1, n_ops - 1);
+            try_absorb_norm_into_nx();
             return true;
         }
 
@@ -4006,6 +4058,7 @@ struct ggml_hexagon_opbatch {
             }
 
             HEX_VERBOSE("ggml-hex: %s fused MUL_MAT_NX (N=2, #%u)\n", sess->c_name(), n_ops - 1);
+            try_absorb_norm_into_nx();
             return true;
         }
 
@@ -4021,7 +4074,8 @@ struct ggml_hexagon_opbatch {
         if (node.opcode != HTP_OP_GLU_GEGLU && node.opcode != HTP_OP_GLU_SWIGLU) return false;
 
         htp_opnode & last_node = ops[n_ops - 1];
-        if (last_node.opcode != HTP_OP_MUL_MAT_NX || last_node.outputs.size() != 2 || last_node.inputs.size() != 3) {
+        if (last_node.opcode != HTP_OP_MUL_MAT_NX || last_node.outputs.size() != 2 ||
+            last_node.inputs.size() != (((const struct htp_mm_kernel_params *) last_node.kernel_params)->norm ? 4u : 3u)) {
             return false;
         }
 
@@ -4069,12 +4123,16 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * w_gate = last_node.inputs[gate];
         const ggml_tensor * w_up   = last_node.inputs[1 - gate];
         const ggml_tensor * x      = last_node.inputs[2];
+        const ggml_tensor * norm_w = kparams.norm ? last_node.inputs[3] : nullptr;
 
-        last_node.name = "MUL_MAT_NX+GLU";
+        last_node.name = kparams.norm ? "RMS_NORM+MUL_MAT_NX+GLU" : "MUL_MAT_NX+GLU";
         last_node.inputs.clear();
         last_node.inputs.push_back(w_gate);
         last_node.inputs.push_back(w_up);
         last_node.inputs.push_back(x);
+        if (norm_w) {
+            last_node.inputs.push_back(norm_w);
+        }
         last_node.outputs.clear();
         last_node.outputs.push_back(glu);
         last_node.fused.push_back(node.node);
@@ -4085,7 +4143,8 @@ struct ggml_hexagon_opbatch {
         o.src[0] = add_tensor(w_gate);
         o.src[1] = add_tensor(w_up);
         o.src[2] = add_tensor(x);
-        for (uint32_t s = 3; s < HTP_OP_MAX_INPUTS; s++) {
+        o.src[3] = norm_w ? add_tensor(norm_w) : 0xffff;
+        for (uint32_t s = 4; s < HTP_OP_MAX_INPUTS; s++) {
             o.src[s] = 0xffff;
         }
         o.dst[0] = add_tensor(glu);
@@ -8379,6 +8438,29 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
     return true;
 }
 
+// Number of matmuls taking node i as their activation when those are all its uses, else 0.
+static uint32_t ggml_hexagon_count_mm_uses(const ggml_cgraph * graph, int i) {
+    const ggml_tensor * t = graph->nodes[i];
+    if (t->view_src || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    uint32_t n = 0;
+    for (int j = i + 1; j < graph->n_nodes; j++) {
+        const ggml_tensor * c = graph->nodes[j];
+        if (c->view_src == t) {
+            return 0;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (c->src[s] != t) continue;
+            if (c->op != GGML_OP_MUL_MAT || s != 1) {
+                return 0;
+            }
+            n++;
+        }
+    }
+    return n == (uint32_t) ggml_node_get_use_count(graph, i) ? n : 0;
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -8416,6 +8498,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 if (ggml_node_has_n_uses(graph, i, 1)) {
                     extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
                 }
+            }
+
+            extra->n_mm_uses = 0;
+            if (graph->nodes[i]->op == GGML_OP_MUL && i > 0 && graph->nodes[i - 1]->op == GGML_OP_RMS_NORM) {
+                extra->n_mm_uses = ggml_hexagon_count_mm_uses(graph, i);
             }
         }
 

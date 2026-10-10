@@ -1,0 +1,72 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5e866e9..a02806e 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5680,6 +5680,51 @@ struct test_mul_mat_softcap : public test_case {
+     }
+ };
+ 
++// RMS norm (times a weight) feeding the matmuls of a layer (Q/K/V, or gate/up and a GLU), run as one
++// graph: backends may normalize the activation rows inside the matmul
++struct test_norm_mul_mat : public test_case {
++    const ggml_type type;
++    const int64_t k;
++    const int64_t m;
++    const int64_t n;
++    const int n_mm;     // matmuls on the normalized activation (summed into the output)
++    const bool glu;     // 2 matmuls into a GEGLU instead
++
++    std::string vars() override { return VARS_TO_STR6(type, k, m, n, n_mm, glu); }
++    std::string op_desc(ggml_tensor *) override { return "NORM_MUL_MAT"; }
++    bool run_whole_graph() override { return true; }
++    double max_nmse_err() override { return 5e-4; }
++
++    test_norm_mul_mat(ggml_type type, int64_t k, int64_t m, int64_t n, int n_mm, bool glu)
++        : type(type), k(k), m(m), n(n), n_mm(n_mm), glu(glu) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_tensor * wn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
++        ggml_set_name(x, "x");
++        ggml_set_name(wn, "wn");
++        ggml_tensor * t = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), wn);
++        ggml_tensor * out = nullptr;
++        if (glu) {
++            ggml_tensor * g = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, k, m), t);
++            ggml_tensor * u = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, k, m), t);
++            out = ggml_glu_split(ctx, g, u, GGML_GLU_OP_GEGLU);
++        } else {
++            std::vector<ggml_tensor *> mm;
++            for (int i = 0; i < n_mm; i++) {
++                mm.push_back(ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, k, m), t));
++            }
++            // add(mm0, add(mm1, mm2)): the graph lists the matmuls next to each other
++            out = mm[n_mm - 1];
++            for (int i = n_mm - 2; i >= 0; i--) {
++                out = ggml_add(ctx, mm[i], out);
++            }
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_OUT_PROD
+ struct test_out_prod : public test_case {
+     const ggml_type type_a;
+@@ -12037,6 +12082,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // RMS norm + the matmuls on its output (the norm fusable into the matmul): one token (HVX), a few
++    // and many tokens (HMX)
++    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
++        for (int64_t n : {1, 70, 512}) {
++            test_cases.emplace_back(new test_norm_mul_mat(type, 1024, 1056, n, 3, false));
++            test_cases.emplace_back(new test_norm_mul_mat(type, 1024, 1056, n, 2, true));
++        }
++    }
++
+     // matmul + residual (fusable into the HMX store) and matvec + logit softcap (fusable into the
+     // repacked matvec)
+     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_Q6_K}) {
