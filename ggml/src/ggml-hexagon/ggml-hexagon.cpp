@@ -7778,6 +7778,11 @@ static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session
     if (dst->type != src0->type) {
         return false;
     }
+    // the f16 kernels (execute_op_activations_f16) have no GEGLU_ERF / GEGLU_QUICK
+    if (src0->type == GGML_TYPE_F16 && op->op == GGML_OP_GLU &&
+        (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU_ERF || ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU_QUICK)) {
+        return false;
+    }
 
     if (!ggml_is_contiguous_1(src0)) {
         return false;
