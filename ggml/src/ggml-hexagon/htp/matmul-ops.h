@@ -110,7 +110,8 @@ struct htp_mm_kernel_params {
     uint8_t  n_prefetch;         // Prefetch lookahead buffers/rows in VTCM
     uint8_t  n_weights;          // Number of weights for fused NX
     uint8_t  glu;                // fused NX of a gate and an up weight + GLU (enum htp_mm_glu), 0 = none
-    uint8_t  reserved[3];
+    uint8_t  reserved[2];
+    uint8_t  src2_stream;        // HMX 2-D: a full-matrix src2 streams through per-thread VTCM row blocks
 
     int32_t  m_chunk;            // Row chunk size (M chunk)
     int32_t  n_chunk;            // Col chunk size (N chunk)
@@ -519,6 +520,9 @@ static inline void htp_mm_hmx_vtcm_layout_build(
 
     L->total_bytes = off;
 }
+
+// VTCM per thread for streaming a full-matrix src2 (the residual) into the HMX output store
+#define HTP_MM_SRC2_STREAM_BYTES (64 * 1024)
 
 static inline void htp_mm_hvx_vtcm_layout_build(
     struct htp_mm_hvx_vtcm_layout * L,

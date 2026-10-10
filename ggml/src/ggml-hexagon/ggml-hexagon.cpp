@@ -5996,10 +5996,30 @@ static void ggml_hexagon_precompute_fused_matmul_add_params(
                                            ? ggml_hexagon_tensor_collapse_rows(src2)
                                            : (src2 ? *src2 : ggml_tensor{});
         const struct ggml_tensor * p_src2 = src2 ? &src2_collapsed : nullptr;
+        // see below for a full-matrix src2
+        if (p_src2 && p_src2->ne[1] > 1) {
+            ggml_hexagon_precompute_matmul_params_impl(sess, src0, &src1_collapsed, &dst_collapsed, p_src2->nb[1],
+                                                       (size_t) HTP_MM_SRC2_STREAM_BYTES * sess->n_threads, kparams);
+            kparams->collapse = 1;
+            if (kparams->n_hmx && kparams->kernel_type == HTP_MM_KERNEL_HMX_2D) {
+                kparams->src2_stream = 1;
+                return;
+            }
+        }
         const size_t src2_size = p_src2 ? hex_round_up(ggml_nbytes(p_src2), 128) : 0;
         ggml_hexagon_precompute_matmul_params_impl(sess, src0, &src1_collapsed, &dst_collapsed, p_src2 ? p_src2->nb[1] : 0, src2_size, kparams);
         kparams->collapse = 1;
         return;
+    }
+    // A full-matrix src2 (the residual) on the 2-D HMX kernel stays in DDR: the output store streams its
+    // rows through a small VTCM area per thread, so the matmul keeps its chunk sizes. Other kernels take
+    // src2 into VTCM.
+    if (src2 && src2->ne[1] * src2->ne[2] * src2->ne[3] > 1) {
+        ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, src2->nb[1], (size_t) HTP_MM_SRC2_STREAM_BYTES * sess->n_threads, kparams);
+        if (kparams->n_hmx && kparams->kernel_type == HTP_MM_KERNEL_HMX_2D) {
+            kparams->src2_stream = 1;
+            return;
+        }
     }
     const size_t src2_size = src2 ? hex_round_up(ggml_nbytes(src2), 128) : 0;
     ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, src2 ? src2->nb[1] : 0, src2_size, kparams);

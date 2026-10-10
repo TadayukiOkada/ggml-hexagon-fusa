@@ -1,0 +1,98 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8f45d04..5e866e9 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5615,6 +5615,71 @@ struct test_mul_mat_glu : public test_case {
+     }
+ };
+ 
++// matmul with the residual added to its output (o / down projection), run as one graph: backends may
++// add the residual in the matmul store
++struct test_mul_mat_add_residual : public test_case {
++    const ggml_type type;
++    const int64_t k;
++    const int64_t m;
++    const int64_t n;
++    const bool residual_first;  // add(residual, mm) instead of add(mm, residual)
++
++    std::string vars() override { return VARS_TO_STR5(type, k, m, n, residual_first); }
++    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ADD_RESIDUAL"; }
++    bool run_whole_graph() override { return true; }
++    double max_nmse_err() override { return 5e-4; }
++
++    test_mul_mat_add_residual(ggml_type type, int64_t k, int64_t m, int64_t n, bool residual_first)
++        : type(type), k(k), m(m), n(n), residual_first(residual_first) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
++        ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
++        ggml_set_name(x, "x");
++        ggml_set_name(w, "w");
++        ggml_set_name(r, "r");
++        ggml_tensor * mm  = ggml_mul_mat(ctx, w, x);
++        ggml_tensor * out = residual_first ? ggml_add(ctx, r, mm) : ggml_add(ctx, mm, r);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
++// final logit softcap on a matrix-vector product (scale, tanh, scale), run as one graph: backends may
++// apply it in the matmul store. n_post = 1, 2 or 3 of its steps.
++struct test_mul_mat_softcap : public test_case {
++    const ggml_type type;
++    const int64_t k;
++    const int64_t m;
++    const int n_post;
++
++    std::string vars() override { return VARS_TO_STR4(type, k, m, n_post); }
++    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_SOFTCAP"; }
++    bool run_whole_graph() override { return true; }
++    double max_nmse_err() override { return 5e-4; }
++
++    test_mul_mat_softcap(ggml_type type, int64_t k, int64_t m, int n_post)
++        : type(type), k(k), m(m), n_post(n_post) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
++        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
++        ggml_set_name(x, "x");
++        ggml_set_name(w, "w");
++        ggml_tensor * out = ggml_mul_mat(ctx, w, x);
++        out = ggml_scale(ctx, out, 1.0f / 3.0f);
++        if (n_post >= 2) {
++            out = ggml_tanh(ctx, out);
++        }
++        if (n_post >= 3) {
++            out = ggml_scale(ctx, out, 3.0f);
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_OUT_PROD
+ struct test_out_prod : public test_case {
+     const ggml_type type_a;
+@@ -11972,6 +12037,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // matmul + residual (fusable into the HMX store) and matvec + logit softcap (fusable into the
++    // repacked matvec)
++    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_Q6_K}) {
++        for (int64_t n : {70, 512}) {
++            test_cases.emplace_back(new test_mul_mat_add_residual(type, 512, 1056, n, false));
++        }
++        test_cases.emplace_back(new test_mul_mat_add_residual(type, 1024, 2048, 256, true));
++    }
++    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K}) {
++        for (int n_post : {1, 2, 3}) {
++            test_cases.emplace_back(new test_mul_mat_softcap(type, 512, 1056, n_post));
++        }
++        test_cases.emplace_back(new test_mul_mat_softcap(type, 1536, 32768, 3));
++    }
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER

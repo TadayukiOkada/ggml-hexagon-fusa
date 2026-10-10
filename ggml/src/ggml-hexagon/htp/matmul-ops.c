@@ -2645,6 +2645,103 @@ static void transfer_output_chunk_threaded(struct htp_context *ctx, float *dst, 
     }
 }
 
+// Output store with a full-matrix src2 (the residual) from DDR: the workers take row ranges and
+// DMA their src2 rows into VTCM in blocks, double-buffered. Job 0 (the main thread) stores nothing,
+// since its DMA queue carries the weight transfers.
+typedef struct {
+    struct htp_context *      ctx;
+    float *                   dst;
+    const float *             src2;
+    const __fp16 *            vtcm_src;
+    uint8_t *                 stage;          // HTP_MM_SRC2_STREAM_BYTES per thread
+    uint32_t                  n_rows;
+    uint32_t                  n_cols;
+    uint32_t                  dst_stride;
+    uint32_t                  src2_stride;
+    uint32_t                  dst_cols;
+    uint32_t                  stage_rows;     // rows per block (even)
+    uint32_t                  stage_stride;   // floats per staged row
+    struct fastdiv_values     n_workers_div;
+    bool                      writeback;
+} output_transfer_stream_state_t;
+
+static void transfer_output_chunk_stream_worker_fn(unsigned int n, unsigned int i, void * data) {
+    const output_transfer_stream_state_t * st = (const output_transfer_stream_state_t *) data;
+    if (i == 0) {
+        return;
+    }
+
+    const uint32_t n_pairs = (st->n_rows + 1) / 2;
+    const uint32_t p_first = fastdiv(n_pairs * (i - 1), &st->n_workers_div);
+    const uint32_t p_last  = fastdiv(n_pairs * i, &st->n_workers_div);
+    if (p_first >= p_last) {
+        return;
+    }
+    const uint32_t r_first = p_first * 2;
+    const uint32_t r_last  = hex_smin(p_last * 2, st->n_rows);
+
+    struct htp_thread_trace * tr = &st->ctx->trace[i];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, r_first);
+
+    dma_queue *    q         = st->ctx->dma[i];
+    uint8_t *      stage     = st->stage + (size_t) i * HTP_MM_SRC2_STREAM_BYTES;
+    const uint32_t R         = st->stage_rows;
+    const size_t   row_bytes = (size_t) hex_smin(st->n_cols, st->dst_cols) * sizeof(float);
+    const size_t   stage_rb  = (size_t) st->stage_stride * sizeof(float);
+
+    for (uint32_t b = 0; b < 2; b++) {
+        const uint32_t r = r_first + b * R;
+        if (r < r_last) {
+            dma_queue_push(q, dma_make_data(stage + b * (HTP_MM_SRC2_STREAM_BYTES / 2), (dma_addr_t) (st->src2 + (size_t) r * st->src2_stride)),
+                           stage_rb, st->src2_stride * sizeof(float), row_bytes, hex_smin(R, r_last - r));
+        }
+    }
+
+    for (uint32_t r = r_first; r < r_last; r += R) {
+        uint8_t *      res = (uint8_t *) dma_queue_pop(q).dst;
+        const uint32_t nb  = hex_smin(R, r_last - r);
+        transfer_output_chunk_fp16_to_fp32_col_chunk(st->dst + (size_t) r * st->dst_stride, (const float *) res, st->vtcm_src, r, nb,
+                                                     st->n_cols, st->n_cols, st->dst_stride, st->stage_stride, st->dst_cols, st->writeback);
+        const uint32_t rn = r + 2 * R;
+        if (rn < r_last) {
+            dma_queue_push(q, dma_make_data(res, (dma_addr_t) (st->src2 + (size_t) rn * st->src2_stride)),
+                           stage_rb, st->src2_stride * sizeof(float), row_bytes, hex_smin(R, r_last - rn));
+        }
+    }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, r_first);
+}
+
+// transfer_output_chunk_threaded, or the streaming store when stage (VTCM) is given
+static void transfer_output_chunk_any(struct htp_context *ctx, float *dst, const float *src2, const __fp16 *vtcm_src,
+                                      int n_rows, int n_cols, int dst_stride, uint32_t src2_stride, int dst_cols, int n_threads,
+                                      uint8_t * stage) {
+    const uint32_t stage_stride = hex_round_up((uint32_t) n_cols, 32);
+    const uint32_t stage_rows   = (uint32_t) ((HTP_MM_SRC2_STREAM_BYTES / 2) / (stage_stride * sizeof(float))) & ~1u;
+    if (!stage || !src2 || n_threads < 2 || stage_rows < 2 || n_rows <= 0) {
+        transfer_output_chunk_threaded(ctx, dst, src2, vtcm_src, n_rows, n_cols, dst_stride, src2_stride, dst_cols, n_threads);
+        return;
+    }
+
+    output_transfer_stream_state_t st = {
+        .ctx           = ctx,
+        .dst           = dst,
+        .src2          = src2,
+        .vtcm_src      = vtcm_src,
+        .stage         = stage,
+        .n_rows        = (uint32_t) n_rows,
+        .n_cols        = (uint32_t) n_cols,
+        .dst_stride    = (uint32_t) dst_stride,
+        .src2_stride   = src2_stride,
+        .dst_cols      = (uint32_t) dst_cols,
+        .stage_rows    = hex_smin(stage_rows, 32),
+        .stage_stride  = stage_stride,
+        .n_workers_div = init_fastdiv_values(n_threads - 1),
+        .writeback     = ctx->mm_out_writeback,
+    };
+    worker_pool_run_func(ctx->worker_pool, transfer_output_chunk_stream_worker_fn, &st, n_threads);
+}
+
 // Store of a fused gate/up chunk: the HMX output holds the gate columns in its first half and the
 // up columns of the same output columns in the second half (up_tile_off column tiles further).
 typedef struct {
@@ -2963,7 +3060,8 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                                   const struct fastdiv_values * k_div,
                                   int tile_size,
                                   int aligned_tile_size,
-                                  int vtcm_size) {
+                                  int vtcm_size,
+                                  bool src2_stream) {  // full-matrix src2 from DDR, VTCM bias area = stream staging
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
@@ -3042,9 +3140,13 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
     void    *vtcm_scratch2   = VTCM_LAYOUT_PTR_OPTIONAL(void, base, L.off_dst[1], pipeline);
     __fp16  *vtcm_scales     = VTCM_LAYOUT_PTR(__fp16, base, L.off_scales);
 
-    const bool has_bias      = (src2_bytes > 0 && src2_addr != 0);
-    float   *vtcm_bias       = VTCM_LAYOUT_PTR_OPTIONAL(float, base, L.off_bias, has_bias);
+    const bool has_bias      = (src2_bytes > 0 && src2_addr != 0 && !src2_stream);
+    float   *vtcm_bias       = VTCM_LAYOUT_PTR_OPTIONAL(float, base, L.off_bias, src2_bytes > 0);
     hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+    // A streamed src2 (a full matrix such as the residual) stays in DDR; the output store DMAs its rows
+    // into the VTCM bias area, which holds HTP_MM_SRC2_STREAM_BYTES per thread.
+    const float *bias_base   = has_bias ? vtcm_bias : (src2_stream ? (const float *) src2_addr : NULL);
+    uint8_t     *stage       = src2_stream ? (uint8_t *) vtcm_bias : NULL;
 
     FARF(HIGH, "hmx-mm-2d: m %d k %d n %d wtype %d mc %zu nc %zu vtcm %zu/%zu",
          m, k, n, weight_type, m_chunk_n_rows, n_chunk_n_cols, vtcm_used, vtcm_budget);
@@ -3141,10 +3243,10 @@ pipelined_pass: __attribute__((unused));
                     const size_t nc_prev = (i - 1) * n_chunk_n_cols;
                     const size_t n_cols_prev = hex_smin(n - nc_prev, n_chunk_n_cols);
                     float *output_chunk = dst + (mr * dst_stride + nc_prev);
-                    const float *bias_chunk = has_bias ? (vtcm_bias + mr * src2_stride + nc_prev) : NULL;
+                    const float *bias_chunk = bias_base ? (bias_base + mr * src2_stride + nc_prev) : NULL;
                     int chunk_dst_cols = dst_cols - (int)nc_prev;
                     if (chunk_dst_cols > 0) {
-                        transfer_output_chunk_threaded(ctx, output_chunk, bias_chunk, vtcm_output_bufs[(i - 1) % 2], n_rows, n_cols_prev, dst_stride, src2_stride, chunk_dst_cols, n_threads);
+                        transfer_output_chunk_any(ctx, output_chunk, bias_chunk, vtcm_output_bufs[(i - 1) % 2], n_rows, n_cols_prev, dst_stride, src2_stride, chunk_dst_cols, n_threads, stage);
                     }
                 }
 
@@ -3155,9 +3257,9 @@ pipelined_pass: __attribute__((unused));
                 if (i + 1 < n_chunk_cnt && atomic_load(&ctx->vtcm_needs_release)) {
                     hmx_queue_pop(ctx->hmx_queue);
                     float *out_i = dst + (mr * dst_stride + nc);
-                    const float *bias_i = has_bias ? (vtcm_bias + mr * src2_stride + nc) : NULL;
+                    const float *bias_i = bias_base ? (bias_base + mr * src2_stride + nc) : NULL;
                     if (dst_cols - (int) nc > 0) {
-                        transfer_output_chunk_threaded(ctx, out_i, bias_i, vtcm_output_bufs[i % 2], n_rows, n_cols, dst_stride, src2_stride, dst_cols - (int) nc, n_threads);
+                        transfer_output_chunk_any(ctx, out_i, bias_i, vtcm_output_bufs[i % 2], n_rows, n_cols, dst_stride, src2_stride, dst_cols - (int) nc, n_threads, stage);
                     }
                     dma_queue_pop(weight_dma);
                     if (i + 2 < n_chunk_cnt) {
@@ -3176,10 +3278,10 @@ pipelined_pass: __attribute__((unused));
             const size_t nc_last = (n_chunk_cnt - 1) * n_chunk_n_cols;
             const size_t n_cols_last = hex_smin(n - nc_last, n_chunk_n_cols);
             float *output_chunk = dst + (mr * dst_stride + nc_last);
-            const float *bias_chunk = has_bias ? (vtcm_bias + mr * src2_stride + nc_last) : NULL;
+            const float *bias_chunk = bias_base ? (bias_base + mr * src2_stride + nc_last) : NULL;
             int chunk_dst_cols = dst_cols - (int)nc_last;
             if (chunk_dst_cols > 0) {
-                transfer_output_chunk_threaded(ctx, output_chunk, bias_chunk, vtcm_output_bufs[(n_chunk_cnt - 1) % 2], n_rows, n_cols_last, dst_stride, src2_stride, chunk_dst_cols, n_threads);
+                transfer_output_chunk_any(ctx, output_chunk, bias_chunk, vtcm_output_bufs[(n_chunk_cnt - 1) % 2], n_rows, n_cols_last, dst_stride, src2_stride, chunk_dst_cols, n_threads, stage);
             }
         }
     } else {
@@ -3252,10 +3354,10 @@ sync_pass: __attribute__((unused));
 
                 // D: Output Store
                 float *output_chunk = dst + (mr * dst_stride + nc);
-                const float *bias_chunk = has_bias ? (vtcm_bias + mr * src2_stride + nc) : NULL;
+                const float *bias_chunk = bias_base ? (bias_base + mr * src2_stride + nc) : NULL;
                 int chunk_dst_cols = dst_cols - (int)nc;
                 if (chunk_dst_cols > 0) {
-                    transfer_output_chunk_threaded(ctx, output_chunk, bias_chunk, vtcm_output, n_rows, n_cols, dst_stride, src2_stride, chunk_dst_cols, n_threads);
+                    transfer_output_chunk_any(ctx, output_chunk, bias_chunk, vtcm_output, n_rows, n_cols, dst_stride, src2_stride, chunk_dst_cols, n_threads, stage);
                 }
 
 #ifdef HTP_YIELD_IN_OPS
@@ -3742,7 +3844,7 @@ static int hmx_mm_f16_f32_batched_simple(struct htp_context *ctx,
                                 params->act_stride, params->act_elem_size, params->weight_stride * (int)sizeof(__fp16),
                                 HTP_TYPE_F16, params->k, params->dst_stride, params->bias_stride, params->n,
                                 m_chunk, n_chunk, pipeline, n_threads, act_threads,
-                                act_threads_div, k_div, 0, 0, vtcm_size);
+                                act_threads_div, k_div, 0, 0, vtcm_size, false);
         }
     }
     return ret;
@@ -4281,7 +4383,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
             kparams->n_act_threads,
             &kparams->div_n_act_threads,
             &kparams->div_ne00_padded,
-            kparams->tile_size, kparams->aligned_tile_size, kparams->vtcm_size
+            kparams->tile_size, kparams->aligned_tile_size, kparams->vtcm_size, kparams->src2_stream
         );
     }
 
