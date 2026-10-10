@@ -597,7 +597,8 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
                                                                                                                                   \
         for (uint32_t ct = ct_start; ct < ct_end; ct++) {                                                                         \
             const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;                                                           \
-            int valid_rows = (int)ne01 - (int)(ct * 32);                                                                          \
+            /* the output width: a repacked weight comes with ne[1] rounded up to its 32-row tiles */                             \
+            int valid_rows = (int)dst->ne[0] - (int)(ct * 32);                                                                    \
             valid_rows = MIN(32, MAX(0, valid_rows));                                                                             \
                                                                                                                                   \
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                \
@@ -1481,7 +1482,7 @@ static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
         for (uint32_t ct = ct_start; ct < ct_end; ct++) {
             const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
 
-            int valid_rows = (int)ne01 - (int)(ct * 32);
+            int valid_rows = (int)ne0 - (int)(ct * 32);
             valid_rows = MIN(32, MAX(0, valid_rows));
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
@@ -1569,7 +1570,7 @@ static void hvx_mv_id(unsigned int nth, unsigned int ith, void * data) {
         for (uint32_t ct = ct_start; ct < ct_end; ct++) {
             const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
 
-            int valid_rows = (int)ne01 - (int)(ct * 32);
+            int valid_rows = (int)ne0 - (int)(ct * 32);
             valid_rows = MIN(32, MAX(0, valid_rows));
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
@@ -1658,7 +1659,7 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
             for (uint32_t ct = ct_start; ct < ct_end; ct++) {
                 const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
 
-                int valid_rows = (int)src_w->ne[1] - (int)(ct * 32);
+                int valid_rows = (int)dst->ne[0] - (int)(ct * 32);
                 valid_rows = MIN(32, MAX(0, valid_rows));
 
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
@@ -1749,7 +1750,7 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
             for (uint32_t ct = ct_start; ct < ct_end; ct++) {
                 const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
 
-                int valid_rows = (int)src_w->ne[1] - (int)(ct * 32);
+                int valid_rows = (int)dst->ne[0] - (int)(ct * 32);
                 valid_rows = MIN(32, MAX(0, valid_rows));
 
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
