@@ -630,6 +630,9 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
     }
     hmx_interleave_rows_to_tiles(factx->vtcm_k_tiles[args->buf_idx], (const __fp16 *) args->curr_k, total_rows, factx->DK_pad,
                              args->src_stride, start, end);
+    // the tiles are written by scatters, which complete after the thread moves on: wait for them
+    // before HMX reads the tiles
+    hvx_gather_sync(factx->vtcm_k_tiles[args->buf_idx]);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
 }
 
@@ -1528,6 +1531,7 @@ static inline void fa_softmax_impl(
             Q6_vscatter_QRMVhV(q_32_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
         }
     }
+    hvx_gather_sync(factx->vtcm_d_tiles[args->buf_idx]);  // the D scatters done before HMX reads the tiles
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_SFM, (uint16_t) (args->q_start * G + vec_start * 64));
 }
 
@@ -1591,6 +1595,7 @@ static __attribute__((noinline)) void fa_build_d_diag_inv_l(struct hmx_fa_contex
         __fp16 * out_base = factx->vtcm_d_inv_l + i * HMX_FP16_TILE_N_ELMS;
         Q6_vscatter_QRMVhV(q_32_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
     }
+    hvx_gather_sync(factx->vtcm_d_inv_l);  // scatters done before HMX reads the tiles
 }
 
 static void fa_phase_softmax_and_build_d(struct hmx_fa_context * factx,
