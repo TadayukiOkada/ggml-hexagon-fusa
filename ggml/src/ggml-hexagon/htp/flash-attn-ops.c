@@ -1091,6 +1091,37 @@ typedef struct {
     struct fastdiv_values     thread_div;
 } fa_softmax_args_t;
 
+// 2^x in fp16 for the softmax: hvx_vec_exp2_f16 with a degree-4 polynomial instead of degree 6.
+// With the coefficients in fp16, degrees 4 to 6 have the same error on the fractional part
+// (about 1.5e-4 relative, set by the rounding of the coefficients), below half an fp16 ulp.
+static inline HVX_Vector fa_exp2_f16(HVX_Vector x_v) {
+    const HVX_Vector zero_v    = Q6_V_vzero();
+    const HVX_Vector half_hf_v = Q6_Vh_vsplat_R(0x3800);  // fp16 0.5
+
+    x_v = Q6_Vhf_vmax_VhfVhf(hvx_vec_splat_f16(-24.0f), x_v);
+
+    HVX_Vector x_minus_half = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(x_v, half_hf_v));
+    HVX_Vector k_v          = Q6_Vh_equals_Vhf(x_minus_half);
+    HVX_Vector f_v          = Q6_Vhf_equals_Vh(k_v);
+    HVX_Vector x_qf16       = Q6_Vqf16_vsub_VhfVhf(x_v, f_v);
+
+    HVX_Vector y = Q6_Vqf16_vmpy_Vqf16Vhf(x_qf16, Q6_Vh_vsplat_R(0x20ee));  // 0.00962830
+    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x2b25));        // 0.0558167
+    y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
+    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x33b0));        // 0.240234
+    y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
+    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x398c));        // 0.693359
+    y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
+    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x3c00));        // 1.0
+
+    y                          = Q6_Vhf_equals_Vqf16(y);
+    HVX_Vector y_exp           = Q6_Vuh_vlsr_VuhR(Q6_Vh_vasl_VhR(y, 1), 11);
+    y_exp                      = Q6_Vh_vadd_VhVh(k_v, y_exp);
+    HVX_VectorPred q_underflow = Q6_Q_vcmp_gt_VhVh(zero_v, y_exp);
+    y                          = Q6_Vh_vaslacc_VhVhR(y, k_v, 10);
+    return Q6_V_vmux_QVV(q_underflow, zero_v, y);
+}
+
 // acc (qf32) += the 64 fp16 values of p, as 32 pairwise sums
 static inline HVX_Vector fa_rowsum_acc(HVX_Vector acc, HVX_Vector p, HVX_Vector one_hf) {
 #if __HVX_ARCH__ >= 79
@@ -1371,10 +1402,10 @@ static inline void fa_softmax_impl(
                 HVX_Vector v_s_minus_m0_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci1], v_dup_m0);
                 HVX_Vector v_s_minus_m1_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci1], v_dup_m1);
 
-                HVX_Vector v_p_row0_hf_0  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_0));
-                HVX_Vector v_p_row1_hf_0  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_0));
-                HVX_Vector v_p_row0_hf_1  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_1));
-                HVX_Vector v_p_row1_hf_1  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_1));
+                HVX_Vector v_p_row0_hf_0  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_0));
+                HVX_Vector v_p_row1_hf_0  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_0));
+                HVX_Vector v_p_row0_hf_1  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_1));
+                HVX_Vector v_p_row1_hf_1  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_1));
 
                 __fp16 *     out_dtile0  = p_st_base + ci0 * HMX_FP16_TILE_N_ELMS * 2;
                 __fp16 *     out_dtile1  = p_st_base + ci1 * HMX_FP16_TILE_N_ELMS * 2;
@@ -1401,8 +1432,8 @@ static inline void fa_softmax_impl(
                 HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci], v_dup_m0);
                 HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci], v_dup_m1);
 
-                HVX_Vector v_p_row0_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0));
-                HVX_Vector v_p_row1_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1));
+                HVX_Vector v_p_row0_hf  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0));
+                HVX_Vector v_p_row1_hf  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1));
                 __fp16 *     out_dtile  = p_st_base + ci * HMX_FP16_TILE_N_ELMS * 2;
                 HVX_Vector * pv_p_out0  = ((HVX_Vector *) out_dtile) + r1 / 2;
                 HVX_Vector * pv_p_out1  = pv_p_out0 + 16;
@@ -1443,7 +1474,7 @@ static inline void fa_softmax_impl(
         HVX_Vector v_m_diff1 = HVX_OP_SUB_F32(m_prev_v1, v_m_curr1);
 
         HVX_Vector v_m_diff_f16   = hvx_vec_f32_to_f16(v_m_diff0, v_m_diff1);
-        HVX_Vector exp_m_diff_f16 = hvx_vec_exp2_f16(v_m_diff_f16);
+        HVX_Vector exp_m_diff_f16 = fa_exp2_f16(v_m_diff_f16);
 
         HVX_VectorPair exp_m_diff_pair = hvx_vec_f16_to_f32(exp_m_diff_f16);
         HVX_Vector exp_m_diff0 = Q6_V_lo_W(exp_m_diff_pair);
