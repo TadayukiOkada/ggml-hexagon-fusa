@@ -524,6 +524,12 @@ static inline void htp_mm_hmx_vtcm_layout_build(
 // VTCM per thread for streaming a full-matrix src2 (the residual) into the HMX output store
 #define HTP_MM_SRC2_STREAM_BYTES (64 * 1024)
 
+// VTCM after the HVX layout for a gate/up matmul with a fused GLU: an up tile of 2 x 32 floats per
+// thread, then the gate outputs of all activation rows
+static inline size_t htp_mm_hvx_glu_vtcm_size(uint32_t act_nrows, uint32_t ne01, uint32_t n_threads) {
+    return (size_t) n_threads * 64 * sizeof(float) + (size_t) act_nrows * hex_round_up(ne01, 32) * sizeof(float);
+}
+
 static inline void htp_mm_hvx_vtcm_layout_build(
     struct htp_mm_hvx_vtcm_layout * L,
     int kernel_type,

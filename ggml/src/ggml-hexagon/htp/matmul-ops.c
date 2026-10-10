@@ -118,6 +118,11 @@ struct htp_mm_context {
     const struct mmid_row_mapping * matrix_rows;
     uint32_t mapping_stride;
 
+    // fused GLU in the HVX NX kernel: gate outputs [act_nrows][glu_stride] and per-thread up tiles
+    float *  vtcm_glu_gate;
+    float *  vtcm_glu_up;
+    uint32_t glu_stride;
+
     // Dynamic VTCM pointers allocated sequentially
     uint8_t * vtcm_src0;
     uint8_t * vtcm_act;
@@ -455,6 +460,18 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     }                                                                                                                    \
 }
 
+// fused GLU store of one output column tile (n <= 32 values), gate and up in VTCM
+static inline void hvx_mm_glu_store(float * dst, const float * gate, const float * up, uint32_t n, uint32_t glu) {
+    const HVX_Vector g = hvx_vmem(gate);
+    const HVX_Vector u = hvx_vmem(up);
+    const HVX_Vector v = glu == HTP_MM_GLU_GEGLU ? hvx_vec_geglu_f32(g, u) : hvx_vec_swiglu_f32(g, u);
+    if (n == 32) {
+        hvx_vmemu(dst) = v;
+    } else {
+        hvx_vec_store_u(dst, n * sizeof(float), v);
+    }
+}
+
 #define MATMUL_NX_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X2, DOT_2X1)                                                           \
 static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                     \
     struct htp_mm_context * mmctx = data;                                                                                         \
@@ -479,11 +496,17 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
     uint32_t n_k_tiles_a = ne10 / 32;                                                                                             \
     uint32_t tile_row_transfer_size_aligned = hex_align_up(n_k_tiles_a * aligned_tile_size, 128);                                                    \
                                                                                                                                   \
+    /* fused GLU: the gate outputs go to VTCM, the up tile to a scratch, and the store writes act(gate) * up */                \
+    const uint32_t glu = kparams->glu;                                                                                            \
+    float * restrict glu_up = mmctx->vtcm_glu_up + ith * 64;                                                                      \
+                                                                                                                                  \
     for (uint32_t widx = 0; widx < n_weights; widx++) {                                                                           \
         const struct htp_tensor * restrict src_w = octx->src[widx];                                                               \
-        const struct htp_tensor * restrict dst   = octx->dsts[widx];                                                              \
+        const struct htp_tensor * restrict dst   = glu ? octx->dsts[0] : octx->dsts[widx];                                        \
         if (!src_w || !dst) continue;                                                                                             \
         dma_queue * dma_q = octx->ctx->dma[ith];                                                                                  \
+        const bool glu_gate = glu && widx == 0;                                                                                   \
+        const bool glu_out  = glu && widx == 1;                                                                                   \
                                                                                                                                   \
         const uint32_t ne00 = src_w->ne[0];                                                                                       \
         const uint32_t ne01 = src_w->ne[1];                                                                                       \
@@ -535,15 +558,33 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
                 float * restrict dst_row1 = (float *) (dst->data + ((ir1+1) * dst_row_size));                                     \
                 float * dst_ptr0 = &dst_row0[ct * 32];                                                                            \
                 float * dst_ptr1 = &dst_row1[ct * 32];                                                                            \
+                float * gate0    = mmctx->vtcm_glu_gate + (ir1 + 0) * mmctx->glu_stride + ct * 32;                                \
+                float * gate1    = gate0 + mmctx->glu_stride;                                                                     \
                                                                                                                                   \
-                DOT_2X2(ne10, dst_ptr0, dst_ptr1, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);                            \
+                if (glu_gate) {                                                                                                   \
+                    DOT_2X2(ne10, gate0, gate1, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);                              \
+                } else if (glu_out) {                                                                                             \
+                    DOT_2X2(ne10, glu_up, glu_up + 32, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);                       \
+                    hvx_mm_glu_store(dst_ptr0, gate0, glu_up, valid_rows, glu);                                                   \
+                    hvx_mm_glu_store(dst_ptr1, gate1, glu_up + 32, valid_rows, glu);                                              \
+                } else {                                                                                                          \
+                    DOT_2X2(ne10, dst_ptr0, dst_ptr1, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);                        \
+                }                                                                                                                 \
             }                                                                                                                     \
                                                                                                                                   \
             for (; ir1 < act_nrows; ++ir1) {                                                                                      \
                 const uint8_t * restrict act_col = (const uint8_t *) (act_data + ir1 * act_stride);                               \
                 float * restrict dst_row = (float *) (dst->data + (ir1 * dst_row_size));                                          \
                 float * dst_ptr = &dst_row[ct * 32];                                                                              \
-                DOT_2X1(ne10, dst_ptr, w_tile, act_col, valid_rows, NULL);                                                        \
+                float * gate    = mmctx->vtcm_glu_gate + ir1 * mmctx->glu_stride + ct * 32;                                       \
+                if (glu_gate) {                                                                                                   \
+                    DOT_2X1(ne10, gate, w_tile, act_col, valid_rows, NULL);                                                       \
+                } else if (glu_out) {                                                                                             \
+                    DOT_2X1(ne10, glu_up, w_tile, act_col, valid_rows, NULL);                                                     \
+                    hvx_mm_glu_store(dst_ptr, gate, glu_up, valid_rows, glu);                                                     \
+                } else {                                                                                                          \
+                    DOT_2X1(ne10, dst_ptr, w_tile, act_col, valid_rows, NULL);                                                    \
+                }                                                                                                                 \
             }                                                                                                                     \
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                 \
                                                                                                                                   \
@@ -5141,7 +5182,14 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, act->ne[0], act_nrows, octx->n_threads,
                                  0, src0_row_size, act_row_size, 0, kparams->n_prefetch, false, true);
 
-    const size_t vtcm_size = L.total_bytes;
+    size_t vtcm_size = L.total_bytes;
+    if (kparams->glu) {
+        if (kparams->n_weights != 2) {
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+        mmctx->glu_stride = hex_round_up(src0->ne[1], 32);
+        vtcm_size = hex_align_up(vtcm_size, 128) + htp_mm_hvx_glu_vtcm_size(act_nrows, src0->ne[1], octx->n_threads);
+    }
 
     if (octx->ctx->vtcm_size < vtcm_size) {
         FARF(ERROR, "matmul-nx: current VTCM reservation %zu is too small, needed %zu\n",
@@ -5154,6 +5202,10 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     mmctx->vtcm_act      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act);
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
+    if (kparams->glu) {
+        mmctx->vtcm_glu_up   = (float *) (base + hex_align_up(L.total_bytes, 128));
+        mmctx->vtcm_glu_gate = mmctx->vtcm_glu_up + octx->n_threads * 64;
+    }
 
     mmctx->vtcm_src0_stride    = is_repacked ? 0 : src0_row_size_padded;
     mmctx->vtcm_act_stride     = act_row_size;
@@ -5212,7 +5264,8 @@ int op_matmul_nx(struct htp_ops_context * octx) {
         htp_mm_tensor_collapse_rows(&act_collapsed, act, s1);
         octx->src[n_weights] = &act_collapsed;
 
-        for (uint32_t p = 0; p < n_weights; p++) {
+        const uint32_t n_dsts = kparams->glu ? 1 : n_weights;  // fused GLU: one output
+        for (uint32_t p = 0; p < n_dsts; p++) {
             orig_dsts[p] = octx->dsts[p];
             const struct htp_tensor * d = octx->dsts[p];
             const uint32_t sd = (d->ne[1] > 1) ? d->nb[1] : ((d->ne[2] > 1) ? d->nb[2] : d->nb[3]);
@@ -5223,7 +5276,7 @@ int op_matmul_nx(struct htp_ops_context * octx) {
         const int status = op_matmul_nx_impl(octx);
 
         octx->src[n_weights] = act;
-        for (uint32_t p = 0; p < n_weights; p++) {
+        for (uint32_t p = 0; p < n_dsts; p++) {
             octx->dsts[p] = orig_dsts[p];
         }
         return status;

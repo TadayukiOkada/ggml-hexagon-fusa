@@ -3905,9 +3905,10 @@ struct ggml_hexagon_opbatch {
         return false;
     }
 
-    // GEGLU / SWIGLU (split form, act(a) * b) of the two outputs of an HMX MUL_MAT_NX: the matmul
-    // computes gate and up columns side by side and its store writes act(gate) * up, so neither
-    // output goes to DDR.
+    // GEGLU / SWIGLU (split form, act(a) * b) of the two outputs of a MUL_MAT_NX, so neither output
+    // goes to DDR. On HMX the matmul computes gate and up columns side by side and its store writes
+    // act(gate) * up; the HVX kernel (a few rows) keeps the gate outputs in VTCM and writes
+    // act(gate) * up with each up tile.
     bool try_fuse_mul_mat_glu(const htp_opnode & node) {
         if (n_ops == 0) return false;
         if (node.opcode != HTP_OP_GLU_GEGLU && node.opcode != HTP_OP_GLU_SWIGLU) return false;
@@ -3940,7 +3941,16 @@ struct ggml_hexagon_opbatch {
         if (!ggml_is_contiguous_rows(glu) || glu->nb[1] != a->nb[1]) return false;
 
         const struct htp_mm_kernel_params * kp = (const struct htp_mm_kernel_params *) last_node.kernel_params;
-        if (!kp->n_hmx || !kp->pipeline || kp->n_weights != 2 || ((kp->n_chunk / 2) & ~31) == 0) return false;
+        if (kp->n_weights != 2) return false;
+        if (kp->n_hmx) {
+            if (!kp->pipeline || ((kp->n_chunk / 2) & ~31) == 0) return false;
+        } else {
+            const ggml_tensor * x = last_node.inputs[2];
+            const uint32_t act_nrows = (uint32_t) (x->ne[1] * x->ne[2] * x->ne[3]);
+            const size_t   vtcm      = hex_align_up((size_t) kp->vtcm_size, 128) +
+                                       htp_mm_hvx_glu_vtcm_size(act_nrows, (uint32_t) d0->ne[0], kp->n_threads);
+            if (kp->kernel_type != HTP_MM_KERNEL_HVX_QUANT_ROW || vtcm > sess->vtcm_size) return false;
+        }
 
         if (!try_fuse_common({ glu })) {
             return false;
