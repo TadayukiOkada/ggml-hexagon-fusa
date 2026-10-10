@@ -1820,30 +1820,39 @@ typedef struct {
     uint32_t        Br, Bc;
     uint32_t        neq1, nek1;
     uint32_t        n_q_blocks, n_kv_blocks;
-    uint8_t *       valid;         // [n_q_blocks][n_kv_blocks]: the block has an unmasked value
+    uint8_t *       flags;         // [n_q_blocks][n_kv_blocks]: FA_BLK_VALID | FA_BLK_ZERO
 } fa_kv_range_args_t;
 
-static bool fa_mask_block_any(const fa_kv_range_args_t * a, uint32_t r0, uint32_t nr, uint32_t c0, uint32_t nc) {
+#define FA_BLK_VALID 1  // some mask value above -16: the block contributes
+#define FA_BLK_ZERO  2  // all mask values are +-0: the softmax can ignore the mask
+
+static uint8_t fa_mask_block_flags(const fa_kv_range_args_t * a, uint32_t r0, uint32_t nr, uint32_t c0, uint32_t nc) {
     const HVX_Vector thr  = Q6_Vh_vsplat_R(0xcc00);  // -16.0
     const HVX_Vector ninf = Q6_Vh_vsplat_R(0xfc00);
+    const HVX_Vector mag  = Q6_Vh_vsplat_R(0x7fff);
     const uint8_t *  base = a->mask + (size_t) r0 * a->mask_nb1 + (size_t) c0 * sizeof(__fp16);
     hex_l2fetch(base, nc * sizeof(__fp16), a->mask_nb1, nr);
+    HVX_Vector m  = ninf;           // max over the block
+    HVX_Vector nz = Q6_V_vzero();   // OR of the magnitudes
     for (uint32_t r = 0; r < nr; r++) {
         const __fp16 * row = (const __fp16 *) (base + (size_t) r * a->mask_nb1);
-        HVX_Vector     m   = ninf;
         uint32_t       c   = 0;
         for (; c + 64 <= nc; c += 64) {
-            m = Q6_Vhf_vmax_VhfVhf(m, hvx_vmemu(row + c));
+            const HVX_Vector v = hvx_vmemu(row + c);
+            m  = Q6_Vhf_vmax_VhfVhf(m, v);
+            nz = Q6_V_vor_VV(nz, Q6_V_vand_VV(v, mag));
         }
         if (c < nc) {
-            m = Q6_Vhf_vmax_VhfVhf(m, Q6_V_vmux_QVV(Q6_Q_vsetq2_R((nc - c) * sizeof(__fp16)), hvx_vmemu(row + c), ninf));
-        }
-        const HVX_VectorPred gt = Q6_Q_vcmp_gt_VhfVhf(hvx_vec_reduce_max_f16(m), thr);
-        if (Q6_R_vextract_VR(Q6_V_vand_QR(gt, 0x01010101), 0) != 0) {
-            return true;
+            const HVX_VectorPred q = Q6_Q_vsetq2_R((nc - c) * sizeof(__fp16));
+            const HVX_Vector     v = hvx_vmemu(row + c);
+            m  = Q6_Vhf_vmax_VhfVhf(m, Q6_V_vmux_QVV(q, v, ninf));
+            nz = Q6_V_vor_VV(nz, Q6_V_vmux_QVV(q, Q6_V_vand_VV(v, mag), Q6_V_vzero()));
         }
     }
-    return false;
+    const HVX_VectorPred gt = Q6_Q_vcmp_gt_VhfVhf(hvx_vec_reduce_max_f16(m), thr);
+    const bool valid = Q6_R_vextract_VR(Q6_V_vand_QR(gt, 0x01010101), 0) != 0;
+    const bool zero  = Q6_R_vextract_VR(hvx_vec_reduce_max_i32(nz), 0) == 0;
+    return (valid ? FA_BLK_VALID : 0) | (zero ? FA_BLK_ZERO : 0);
 }
 
 // threads take (Q block, KV block) pairs in turn
@@ -1855,8 +1864,48 @@ static void fa_kv_range_thread(unsigned int n, unsigned int i, void * data) {
         const uint32_t kb = p - qb * a->n_kv_blocks;
         const uint32_t r0 = qb * a->Br;
         const uint32_t c0 = kb * a->Bc;
-        a->valid[p] = fa_mask_block_any(a, r0, hex_smin(a->Br, a->neq1 - r0), c0, hex_smin(a->Bc, a->nek1 - c0));
+        a->flags[p] = fa_mask_block_flags(a, r0, hex_smin(a->Br, a->neq1 - r0), c0, hex_smin(a->Bc, a->nek1 - c0));
     }
+}
+
+// The flags of this mask and blocking: computed once per batch (the layers share their masks)
+static const uint8_t * fa_mask_flags_get(struct htp_context * ctx, const fa_kv_range_args_t * a0) {
+    const size_t n = (size_t) a0->n_q_blocks * a0->n_kv_blocks;
+    for (uint32_t e = 0; e < ctx->fa_mask_n; e++) {
+        if (ctx->fa_mask[e].mask == (uint32_t) (uintptr_t) a0->mask && ctx->fa_mask[e].nb1 == a0->mask_nb1 &&
+            ctx->fa_mask[e].neq1 == a0->neq1 && ctx->fa_mask[e].nek1 == a0->nek1 &&
+            ctx->fa_mask[e].Br == a0->Br && ctx->fa_mask[e].Bc == a0->Bc) {
+            return ctx->fa_mask_flags + ctx->fa_mask[e].off;
+        }
+    }
+    // place after the last entry (entries are packed, 128-byte aligned)
+    uint32_t next = 0;
+    if (ctx->fa_mask_n) {
+        const uint32_t e = ctx->fa_mask_n - 1;
+        const uint32_t qb = (ctx->fa_mask[e].neq1 + ctx->fa_mask[e].Br - 1) / ctx->fa_mask[e].Br;
+        const uint32_t kb = (ctx->fa_mask[e].nek1 + ctx->fa_mask[e].Bc - 1) / ctx->fa_mask[e].Bc;
+        next = ctx->fa_mask[e].off + (uint32_t) hex_align_up((size_t) qb * kb, 128);
+    }
+    if (!ctx->fa_mask_flags || ctx->fa_mask_n >= HTP_FA_MASK_CACHE || next + n > ctx->fa_mask_flags_size) {
+        if (!ctx->fa_mask_flags || n > ctx->fa_mask_flags_size) {
+            return NULL;
+        }
+        ctx->fa_mask_n = 0;  // full: start over
+        next = 0;
+    }
+    fa_kv_range_args_t a = *a0;
+    a.flags = ctx->fa_mask_flags + next;
+    work_queue_run(ctx->work_queue, fa_kv_range_thread, &a, hex_smin(ctx->n_threads, n));
+
+    const uint32_t e = ctx->fa_mask_n++;
+    ctx->fa_mask[e].mask = (uint32_t) (uintptr_t) a0->mask;
+    ctx->fa_mask[e].nb1  = (uint32_t) a0->mask_nb1;
+    ctx->fa_mask[e].neq1 = a0->neq1;
+    ctx->fa_mask[e].nek1 = a0->nek1;
+    ctx->fa_mask[e].Br   = a0->Br;
+    ctx->fa_mask[e].Bc   = a0->Bc;
+    ctx->fa_mask[e].off  = next;
+    return a.flags;
 }
 
 // ============================================================================
@@ -2100,37 +2149,41 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     hmx_fa_o_update_job_t ou_job;
     hmx_fa_o_norm_job_t   on_job;
 
-    // KV block range per Q block (all blocks unless the mask is shared by heads and sequences)
-    uint16_t kv_lo[FA_SKIP_MAX_QBLOCKS];
-    uint16_t kv_hi[FA_SKIP_MAX_QBLOCKS];
+    // KV block range per Q block (all blocks unless the mask is shared by heads and sequences), and
+    // which blocks have an all-zero mask
+    uint16_t        kv_lo[FA_SKIP_MAX_QBLOCKS];
+    uint16_t        kv_hi[FA_SKIP_MAX_QBLOCKS];
+    const uint8_t * blk_flags = NULL;
     const bool skip_masked = mask && factx.mask_broadcast && mask->ne[3] == 1 && n_q_blocks <= FA_SKIP_MAX_QBLOCKS &&
-                             factx.n_kv_blocks <= 0xffff && (size_t) n_q_blocks * factx.n_kv_blocks <= ctx->ddr_spad_size;
+                             factx.n_kv_blocks <= 0xffff;
     if (skip_masked) {
-        fa_kv_range_args_t ra = {
+        const fa_kv_range_args_t ra = {
             .mask = (const uint8_t *) (uintptr_t) mask->data, .mask_nb1 = mask->nb[1],
             .Br = Br, .Bc = Bc, .neq1 = neq1, .nek1 = nek1,
-            .n_q_blocks = n_q_blocks, .n_kv_blocks = factx.n_kv_blocks, .valid = (uint8_t *) ctx->ddr_spad_base,
+            .n_q_blocks = n_q_blocks, .n_kv_blocks = factx.n_kv_blocks, .flags = NULL,
         };
-        work_queue_run(ctx->work_queue, fa_kv_range_thread, &ra, hex_smin(ctx->n_threads, n_q_blocks * factx.n_kv_blocks));
-        for (uint32_t qb = 0; qb < n_q_blocks; qb++) {
-            const uint8_t * v = ra.valid + (size_t) qb * factx.n_kv_blocks;
-            uint32_t lo = factx.n_kv_blocks, hi = 0;
-            for (uint32_t kb = 0; kb < factx.n_kv_blocks; kb++) {
-                if (v[kb]) {
-                    lo = lo < kb ? lo : kb;
-                    hi = kb + 1;
-                }
-            }
-            if (lo >= hi) {  // nothing unmasked: run all blocks, as without skipping
-                lo = 0;
-                hi = factx.n_kv_blocks;
-            }
-            kv_lo[qb] = (uint16_t) lo;
-            kv_hi[qb] = (uint16_t) hi;
-        }
+        blk_flags = fa_mask_flags_get(ctx, &ra);
     }
-    #define FA_BLK_LO(qs) (skip_masked ? (uint32_t) kv_lo[(qs) / Br] : 0u)
-    #define FA_BLK_HI(qs) (skip_masked ? (uint32_t) kv_hi[(qs) / Br] : factx.n_kv_blocks)
+    for (uint32_t qb = 0; qb < n_q_blocks && blk_flags; qb++) {
+        const uint8_t * f = blk_flags + (size_t) qb * factx.n_kv_blocks;
+        uint32_t lo = factx.n_kv_blocks, hi = 0;
+        for (uint32_t kb = 0; kb < factx.n_kv_blocks; kb++) {
+            if (f[kb] & FA_BLK_VALID) {
+                lo = lo < kb ? lo : kb;
+                hi = kb + 1;
+            }
+        }
+        if (lo >= hi) {  // nothing unmasked: run all blocks, as without skipping
+            lo = 0;
+            hi = factx.n_kv_blocks;
+        }
+        kv_lo[qb] = (uint16_t) lo;
+        kv_hi[qb] = (uint16_t) hi;
+    }
+    #define FA_BLK_LO(qs) (blk_flags ? (uint32_t) kv_lo[(qs) / Br] : 0u)
+    #define FA_BLK_HI(qs) (blk_flags ? (uint32_t) kv_hi[(qs) / Br] : factx.n_kv_blocks)
+    // a block whose mask is all zero runs the softmax without the mask (same result, less work)
+    #define FA_BLK_ZERO_MASK(qs, b) (blk_flags && (blk_flags[(size_t) ((qs) / Br) * factx.n_kv_blocks + (b)] & FA_BLK_ZERO))
 
     // Q/K/V/mask DMAs for a step are pushed at the end of the previous step, except for
     // the first step and the step after VTCM was given away.
@@ -2315,8 +2368,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.ib3                  = ib3;
                         sargs.first_block          = kv_blk == 0;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
-                        sargs.mask                 = mask;
-                        sargs.mask_vtcm            = current_mask_vtcm;
+                        sargs.mask                 = FA_BLK_ZERO_MASK(q_start, blk_lo + kv_blk) ? NULL : mask;
+                        sargs.mask_vtcm            = sargs.mask ? current_mask_vtcm : NULL;
                         sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                         sargs.slopes               = factx.vtcm_slopes;
 
@@ -2440,8 +2493,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.ib3                  = ib3;
                         sargs.first_block          = kv_blk == 0;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
-                        sargs.mask                 = mask;
-                        sargs.mask_vtcm            = current_mask_vtcm;
+                        sargs.mask                 = FA_BLK_ZERO_MASK(q_start, blk_lo + kv_blk) ? NULL : mask;
+                        sargs.mask_vtcm            = sargs.mask ? current_mask_vtcm : NULL;
                         sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                         sargs.slopes               = factx.vtcm_slopes;
                         fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
@@ -2573,6 +2626,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
     #undef FA_BLK_LO
     #undef FA_BLK_HI
+    #undef FA_BLK_ZERO_MASK
 
     return HTP_STATUS_OK;
 }

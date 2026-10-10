@@ -590,6 +590,10 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     ctx->ddr_spad_size = 512 * 1024; // 512 KB
     ctx->ddr_spad_base = memalign(128, ctx->ddr_spad_size);
 
+    ctx->fa_mask_flags_size = 64 * 1024;
+    ctx->fa_mask_flags      = memalign(128, ctx->fa_mask_flags_size);
+    ctx->fa_mask_n          = 0;
+
     void * wq_ptr = (void *) ((uintptr_t) block + offset_wq);
     ctx->work_queue = work_queue_init(wq_ptr, n_hvx, WORK_QUEUE_CAPACITY, WORK_QUEUE_STACK_SIZE);
 
@@ -656,6 +660,10 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
 
     vtcm_free(ctx);
 
+    if (ctx->fa_mask_flags) {
+        free(ctx->fa_mask_flags);
+        ctx->fa_mask_flags = NULL;
+    }
     if (ctx->ddr_spad_base) {
         free(ctx->ddr_spad_base);
         ctx->ddr_spad_base = NULL;
@@ -1165,6 +1173,20 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
 
     htp_tensor_dirty_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
 
+    // an op writing over a mask whose flash-attention flags are cached invalidates them
+    struct htp_context * ctx = octx->ctx;
+    for (uint32_t i = 0; i < HTP_OP_MAX_OUTPUTS && ctx->fa_mask_n > 0; i++) {
+        const struct htp_tensor * d = octx->dsts[i];
+        if (!d) continue;
+        for (uint32_t e = 0; e < ctx->fa_mask_n; e++) {
+            const uint32_t m0 = ctx->fa_mask[e].mask, m1 = m0 + ctx->fa_mask[e].nb1 * ctx->fa_mask[e].neq1;
+            if ((uint32_t) d->data < m1 && m0 < (uint32_t) d->data + d->size) {
+                ctx->fa_mask_n = 0;
+                break;
+            }
+        }
+    }
+
     htp_mdev_group_barrier(octx);
 
     int status = execute_op(octx);
@@ -1252,6 +1274,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
     hex_l2fetch_block(ctx, ctx->footprint);
     memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
+    ctx->fa_mask_n = 0;  // the host rewrites the masks between batches
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);

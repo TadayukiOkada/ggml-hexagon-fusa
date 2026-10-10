@@ -82,6 +82,8 @@ struct htp_ops_context {
 };
 
 // Main context for htp DSP backend
+#define HTP_FA_MASK_CACHE 8
+
 struct htp_context {
     dspqueue_t             dsp_queue;
 
@@ -113,6 +115,15 @@ struct htp_context {
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
     void *                 ddr_spad_base;
     size_t                 ddr_spad_size;
+
+    // Flash attention: per (Q block, KV block) mask flags of the masks seen in the current batch
+    // (the layers of a graph share a few masks). Cleared at the start of each batch.
+    uint8_t *              fa_mask_flags;
+    size_t                 fa_mask_flags_size;
+    uint32_t               fa_mask_n;
+    struct {
+        uint32_t mask, nb1, neq1, nek1, Br, Bc, off;
+    } fa_mask[HTP_FA_MASK_CACHE];
 
     struct htp_mdev_group  mdev;
     struct htp_ops_context octx;
