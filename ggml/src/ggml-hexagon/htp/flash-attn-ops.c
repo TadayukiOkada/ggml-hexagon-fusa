@@ -1993,6 +1993,450 @@ static void fa_vtcm_setup(struct hmx_fa_context *            factx,
     }
 }
 
+// ============================================================================
+// Decode on HMX: all KV heads per KV block
+// ============================================================================
+//
+// With one Q block (decode), the step loop below runs a KV head at a time, and each KV block costs
+// three work dispatches and two HMX jobs per head, which is most of the time for a few query rows.
+// Here every phase of a KV block runs for all KV heads at once: one dispatch converts the K and V
+// tiles of every head, one HMX job does QK for every head, one dispatch runs the softmax of the
+// heads (a head per thread), one HMX job updates O for every head; and the K/V rows of all heads of
+// a key come in one DMA. The per-head phase functions are the same as in the step loop, each head
+// with its own context and VTCM slot.
+
+#define FA_MH_MAX_HEADS  32
+#define FA_MH_MAX_ROWS   4     // query rows (decode); prefill keeps the pipelined step loop
+#define FA_MH_MAX_BLOCKS 1024
+// The op cannot give VTCM away in the middle (the state of every head is there), so longer ones keep
+// the step loop, which can: n_kv * n_kv_heads * (DK + DV) up to this is about 8 ms on v73
+#define FA_MH_MAX_WORK   (100u * 1000 * 1000)
+
+struct fa_mh_layout {
+    size_t q_tiles, q_dma, o_tiles[2], d_tiles, d_inv_l, k_tiles, v_tiles, s_tiles, p_tiles;
+    size_t m_vec, l_vec, s_rowmax, p_rowsum, slopes;
+    size_t slot;                // bytes per head
+    size_t row_bufs, scales_id, scales_qk, sinks, mask[2], k[2], v[2], heads;  // shared, after the slots
+    size_t q_tile_bytes, o_tile_bytes, d_tile_bytes, col_vec_bytes, m_line_bytes, row_buf_stride;
+    size_t total;
+};
+
+static void fa_mh_layout_build(struct fa_mh_layout * L, size_t g_br, size_t DK, size_t DV, size_t Bc, size_t n_h,
+                               size_t n_rows_q, bool is_q_fp32, bool has_sinks, size_t n_heads, size_t n_threads,
+                               size_t head_bytes) {
+    const size_t T = HTP_FA_HMX_TILE_SIZE;
+    L->q_tile_bytes   = hex_align_up(g_br * DK * sizeof(__fp16), T);
+    L->o_tile_bytes   = hex_align_up(g_br * DV * sizeof(__fp16), T);
+    const size_t d    = (g_br / HMX_FP16_TILE_N_ROWS) * T;
+    L->col_vec_bytes  = hex_align_up(g_br * sizeof(float), 256);
+    L->m_line_bytes   = hex_align_up(Bc * sizeof(__fp16), 128);
+    L->row_buf_stride = hex_align_up(Bc * sizeof(__fp16), 256) / 128;
+
+    size_t off = 0;
+    L->q_tiles    = off; off += L->q_tile_bytes;
+    L->o_tiles[0] = off; off += L->o_tile_bytes;
+    L->o_tiles[1] = off; off += L->o_tile_bytes;
+    L->d_tiles    = off; off += d;
+    L->d_inv_l    = off; off += d;            // right after d_tiles: q_load zeroes both in one run
+    L->d_tile_bytes = 2 * d;
+    L->k_tiles    = off; off += hex_align_up(Bc * DK * sizeof(__fp16), T);
+    L->v_tiles    = off; off += hex_align_up(Bc * DV * sizeof(__fp16), T);
+    L->s_tiles    = off; off += hex_align_up(g_br * Bc * sizeof(__fp16), T);
+    L->p_tiles    = off; off += hex_align_up(g_br * Bc * sizeof(__fp16), T);
+    L->q_dma      = off; off += hex_align_up(g_br * DK * (is_q_fp32 ? sizeof(float) : sizeof(__fp16)), 128);
+    L->m_vec      = off; off += L->col_vec_bytes;
+    L->l_vec      = off; off += L->col_vec_bytes;
+    L->s_rowmax   = off; off += L->col_vec_bytes;
+    L->p_rowsum   = off; off += L->col_vec_bytes;
+    L->slopes     = off; off += hex_align_up(g_br * sizeof(__fp16), 128);
+    L->slot       = hex_align_up(off, T);
+
+    off = n_h * L->slot;
+    L->row_bufs  = off; off += L->row_buf_stride * 128 * 2 * n_threads;
+    L->scales_id = off; off += 256;
+    L->scales_qk = off; off += 256;
+    L->sinks     = off; off += has_sinks ? hex_round_up(n_heads * sizeof(float), 128) : 0;
+    L->heads     = off; off += hex_round_up(n_h * head_bytes, 128);
+    for (int b = 0; b < 2; b++) {
+        L->mask[b] = off; off += n_rows_q * L->m_line_bytes;
+        L->k[b]    = off; off += Bc * n_h * DK * sizeof(__fp16);
+        L->v[b]    = off; off += Bc * n_h * DV * sizeof(__fp16);
+    }
+    L->total = off;
+}
+
+// A head's context and the arguments of its phases (in VTCM: too large for the stack with many heads)
+typedef struct {
+    struct hmx_fa_context f;
+    fa_k_int_args_t       k;
+    fa_v_int_args_t       v;
+    fa_softmax_args_t     s;
+    fa_o_store_args_t     o;
+    hmx_fa_qk_job_t       qk;
+    hmx_fa_o_update_job_t ou;
+    hmx_fa_o_norm_job_t   on;
+} fa_mh_head_t;
+
+typedef struct {
+    fa_mh_head_t *     hd;
+    fa_q_load_args_t * q;   // on the stack: it holds an atomic barrier
+    worker_callback_t  softmax_fn;
+    worker_callback_t  store_fn;
+    uint32_t           n_h;
+} fa_mh_args_t;
+
+static void fa_mh_q_thread(unsigned int n, unsigned int i, void * data) {
+    const fa_mh_args_t * a = (const fa_mh_args_t *) data;
+    for (uint32_t h = 0; h < a->n_h; h++) {
+        fa_q_load_thread(n, i, &a->q[h]);
+    }
+}
+
+static void fa_mh_kv_thread(unsigned int n, unsigned int i, void * data) {
+    const fa_mh_args_t * a = (const fa_mh_args_t *) data;
+    for (uint32_t h = 0; h < a->n_h; h++) {
+        fa_k_interleave_thread(n, i, &a->hd[h].k);
+        fa_v_interleave_thread(n, i, &a->hd[h].v);
+    }
+}
+
+// a head per thread: the softmax runs as one thread (n = 1) on thread i's row buffers
+static void fa_mh_softmax_thread(unsigned int n, unsigned int i, void * data) {
+    const fa_mh_args_t * a = (const fa_mh_args_t *) data;
+    for (uint32_t h = i; h < a->n_h; h += n) {
+        a->softmax_fn(1, i, &a->hd[h].s);
+    }
+}
+
+static void fa_mh_store_thread(unsigned int n, unsigned int i, void * data) {
+    const fa_mh_args_t * a = (const fa_mh_args_t *) data;
+    for (uint32_t h = 0; h < a->n_h; h++) {
+        a->store_fn(n, i, &a->hd[h].o);
+    }
+}
+
+static void fa_mh_qk_worker(void * data) {
+    const fa_mh_args_t * a = (const fa_mh_args_t *) data;
+    for (uint32_t h = 0; h < a->n_h; h++) {
+        hmx_fa_qk_dot_worker(&a->hd[h].qk);
+    }
+}
+
+static void fa_mh_ou_worker(void * data) {
+    const fa_mh_args_t * a = (const fa_mh_args_t *) data;
+    for (uint32_t h = 0; h < a->n_h; h++) {
+        hmx_fa_o_update_worker(&a->hd[h].ou);
+    }
+}
+
+static void fa_mh_on_worker(void * data) {
+    const fa_mh_args_t * a = (const fa_mh_args_t *) data;
+    for (uint32_t h = 0; h < a->n_h; h++) {
+        hmx_fa_o_norm_worker(&a->hd[h].on);
+    }
+}
+
+// K/V rows of the keys [j, j + n) for every head of the op, and the mask rows of the block
+static void fa_mh_push_block(const struct hmx_fa_context * f, dma_queue * dq, const struct htp_tensor * mask,
+                             uint32_t q_start, uint32_t n_rows_q, uint32_t kvh0, uint32_t n_h, uint32_t j, uint32_t n,
+                             uint8_t * kb, uint8_t * vb, uint8_t * mb, size_t m_line) {
+    const struct htp_tensor * k = f->k;
+    const struct htp_tensor * v = f->v;
+    const size_t kd = f->DK * sizeof(__fp16), vd = f->DV * sizeof(__fp16);
+    const size_t k_row = n_h * kd, v_row = n_h * vd;
+
+    if (k->nb[2] == kd) {
+        dma_queue_push(dq, dma_make_data(kb, k->data + j * k->nb[1] + kvh0 * k->nb[2]), k_row, k->nb[1], k_row, n);
+    } else {
+        for (uint32_t h = 0; h < n_h; h++) {
+            dma_queue_push(dq, dma_make_data(kb + h * kd, k->data + j * k->nb[1] + (kvh0 + h) * k->nb[2]), k_row, k->nb[1], kd, n);
+        }
+    }
+    if (v->nb[2] == vd) {
+        dma_queue_push(dq, dma_make_data(vb, v->data + j * v->nb[1] + kvh0 * v->nb[2]), v_row, v->nb[1], v_row, n);
+    } else {
+        for (uint32_t h = 0; h < n_h; h++) {
+            dma_queue_push(dq, dma_make_data(vb + h * vd, v->data + j * v->nb[1] + (kvh0 + h) * v->nb[2]), v_row, v->nb[1], vd, n);
+        }
+    }
+    if (mask) {
+        dma_queue_push(dq, dma_make_data(mb, mask->data + q_start * mask->nb[1] + j * sizeof(__fp16)), m_line, mask->nb[1],
+                       n * sizeof(__fp16), n_rows_q);
+    }
+}
+
+// HTP_STATUS_NO_SUPPORT before any work when the step loop has to run the op instead
+static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context * proto, uint32_t q_start, uint32_t n_rows_q,
+                     uint32_t kvh0, uint32_t kvh1) {
+    struct htp_context *      ctx  = octx->ctx;
+    const struct htp_tensor * q    = octx->src[0];
+    const struct htp_tensor * k    = octx->src[1];
+    const struct htp_tensor * v    = octx->src[2];
+    const struct htp_tensor * mask = (octx->src[3] && octx->src[3]->data) ? octx->src[3] : NULL;
+    const struct htp_tensor * dst  = octx->dst;
+
+    const uint32_t n_h      = kvh1 - kvh0;
+    const uint32_t G        = proto->G;
+    const uint32_t DK       = proto->DK, DV = proto->DV;
+    const uint32_t g_br     = proto->g_br;
+    const uint32_t nek1     = proto->n_kv;
+    const uint32_t n_thr    = ctx->n_threads;  // the step loop may run on one thread; every phase here uses all
+    const size_t   n_rows_g = (size_t) n_rows_q * G;
+
+    // largest KV block (multiple of 64, at most 1024) whose buffers fit
+    struct fa_mh_layout L;
+    uint32_t Bc = 1024;
+    while (Bc > 64 && Bc / 2 >= nek1) {
+        Bc /= 2;
+    }
+    for (;; Bc /= 2) {
+        fa_mh_layout_build(&L, g_br, DK, DV, Bc, n_h, n_rows_q, proto->is_q_fp32, proto->sinks != NULL, proto->n_heads, n_thr,
+                           sizeof(fa_mh_head_t));
+        if (L.total <= ctx->vtcm_size) {
+            break;
+        }
+        if (Bc == 64) {
+            return HTP_STATUS_NO_SUPPORT;  // the step loop takes it
+        }
+    }
+    const uint32_t n_kv_blocks = (nek1 + Bc - 1) / Bc;
+    if (n_kv_blocks > FA_MH_MAX_BLOCKS) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    uint8_t * const base = ctx->vtcm_base;
+    dma_queue * const dq = ctx->dma[0];
+
+    // per-head contexts
+    fa_mh_head_t * hd = (fa_mh_head_t *) (base + L.heads);
+    for (uint32_t h = 0; h < n_h; h++) {
+        struct hmx_fa_context * f = &hd[h].f;
+        uint8_t * s = base + h * L.slot;
+        *f = *proto;
+        f->Bc                 = Bc;
+        f->n_kv_blocks        = (nek1 + Bc - 1) / Bc;
+        f->pipeline           = false;
+        f->vtcm_q_dma         = (__fp16 *) (s + L.q_dma);
+        f->vtcm_q_tiles       = (__fp16 *) (s + L.q_tiles);
+        f->vtcm_o_tiles[0]    = (__fp16 *) (s + L.o_tiles[0]);
+        f->vtcm_o_tiles[1]    = (__fp16 *) (s + L.o_tiles[1]);
+        f->vtcm_k_fp16[0]     = f->vtcm_k_fp16[1] = NULL;
+        f->vtcm_v_fp16[0]     = f->vtcm_v_fp16[1] = NULL;
+        f->vtcm_k_tiles[0]    = (__fp16 *) (s + L.k_tiles);
+        f->vtcm_k_tiles[1]    = NULL;
+        f->vtcm_v_tiles[0]    = (__fp16 *) (s + L.v_tiles);
+        f->vtcm_v_tiles[1]    = NULL;
+        f->vtcm_s_tiles[0]    = (__fp16 *) (s + L.s_tiles);
+        f->vtcm_s_tiles[1]    = NULL;
+        f->vtcm_p_tiles[0]    = (__fp16 *) (s + L.p_tiles);
+        f->vtcm_p_tiles[1]    = NULL;
+        f->vtcm_d_tiles[0]    = (__fp16 *) (s + L.d_tiles);
+        f->vtcm_d_tiles[1]    = NULL;
+        f->vtcm_d_inv_l       = (__fp16 *) (s + L.d_inv_l);
+        f->vtcm_m_vec         = (HVX_Vector *) (s + L.m_vec);
+        f->vtcm_l_vec         = (HVX_Vector *) (s + L.l_vec);
+        f->vtcm_s_rowmax      = (HVX_Vector *) (s + L.s_rowmax);
+        f->vtcm_p_rowsum      = (HVX_Vector *) (s + L.p_rowsum);
+        f->vtcm_slopes        = (__fp16 *) (s + L.slopes);
+        f->vtcm_row_bufs      = (HVX_Vector *) (base + L.row_bufs);
+        f->row_buf_stride     = L.row_buf_stride;
+        f->vtcm_hmx_scales_id = base + L.scales_id;
+        f->vtcm_hmx_scales_qk = base + L.scales_qk;
+        f->vtcm_sinks         = proto->sinks ? (float *) (base + L.sinks) : NULL;
+        f->vtcm_mask_buf      = NULL;
+        f->mask_buf_row_stride = L.m_line_bytes / sizeof(__fp16);
+        f->q_tile_bytes       = L.q_tile_bytes;
+        f->o_tile_bytes       = L.o_tile_bytes;
+        f->col_vec_bytes      = L.col_vec_bytes;
+        f->d_tile_bytes       = L.d_tile_bytes;
+    }
+
+    hmx_init_column_scales(base + L.scales_id, Q6_V_vsplat_R(0x3c00));  // 1.0
+    hmx_init_column_scales(base + L.scales_qk, hvx_vec_splat_f16(proto->scale));
+    if (proto->sinks) {
+        dma_queue_push(dq, dma_make_data(base + L.sinks, proto->sinks->data), hex_round_up(proto->n_heads * sizeof(float), 128), 0,
+                       proto->sinks->size, 1);
+        dma_queue_pop(dq);
+    }
+
+    // the KV blocks with an unmasked value, and which of them have an all-zero mask (the flags are
+    // shared by the layers of the batch, as in the step loop)
+    const uint8_t * flags = NULL;
+    if (mask) {
+        const fa_kv_range_args_t ra = {
+            .mask = (const uint8_t *) (uintptr_t) (mask->data + q_start * mask->nb[1]), .mask_nb1 = mask->nb[1],
+            .Br = n_rows_q, .Bc = Bc, .neq1 = n_rows_q, .nek1 = nek1, .n_q_blocks = 1, .n_kv_blocks = n_kv_blocks, .flags = NULL,
+        };
+        flags = fa_mask_flags_get(ctx, &ra);
+    }
+    uint16_t blks[FA_MH_MAX_BLOCKS];
+    uint32_t n_blk = 0;
+    for (uint32_t kb = 0; kb < n_kv_blocks && flags; kb++) {
+        if (flags[kb] & FA_BLK_VALID) {
+            blks[n_blk++] = (uint16_t) kb;
+        }
+    }
+    if (n_blk == 0) {  // no flags, or nothing unmasked: run all blocks, as the step loop does
+        flags = NULL;
+        for (uint32_t kb = 0; kb < n_kv_blocks; kb++) {
+            blks[n_blk++] = (uint16_t) kb;
+        }
+    }
+
+    // Q of every head
+    const bool   q_transposed = q->nb[1] < q->nb[2];
+    const size_t q_esize      = proto->is_q_fp32 ? sizeof(float) : sizeof(__fp16);
+    const size_t q_row_bytes  = q_transposed ? n_rows_q * DK * q_esize : G * DK * q_esize;
+    const size_t q_src_stride = q_transposed ? q->nb[2] : q->nb[1];
+    for (uint32_t h = 0; h < n_h; h++) {
+        const dma_addr_t q_ptr = q->data + q_start * q->nb[1] + ((kvh0 + h) * G) * q->nb[2];
+        dma_queue_push(dq, dma_make_data(hd[h].f.vtcm_q_dma, q_ptr), q_row_bytes, hex_smax(q_src_stride, q_row_bytes), q_row_bytes,
+                       q_transposed ? G : n_rows_q);
+    }
+    for (uint32_t h = 0; h < n_h; h++) {
+        dma_queue_pop(dq);
+    }
+
+    fa_q_load_args_t qa[FA_MH_MAX_HEADS];
+    fa_mh_args_t     a = { hd, qa, NULL, NULL, n_h };
+
+    for (uint32_t h = 0; h < n_h; h++) {
+        fa_q_load_args_t * x = &qa[h];
+        x->factx        = &hd[h].f;
+        x->q            = q;
+        x->q_start      = q_start;
+        x->kv_head      = kvh0 + h;
+        x->ib3          = 0;
+        x->n_rows_g     = n_rows_g;
+        x->rows_per_t   = hex_align_up(hmx_ceil_div(g_br, n_thr), 2);
+        x->n_rows_q     = n_rows_q;
+        x->q_transposed = q_transposed;
+        atomic_init(&x->barrier, n_thr);
+    }
+    work_queue_run(ctx->work_queue, fa_mh_q_thread, &a, n_thr);
+
+    const size_t n_row_tiles      = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS) / HMX_FP16_TILE_N_ROWS;
+    const size_t n_row_tiles_g_br = g_br / HMX_FP16_TILE_N_ROWS;
+    const size_t n_tiles_per_bc   = Bc / HMX_FP16_TILE_N_COLS;
+    const size_t k_src_stride     = n_h * DK;  // elements
+    const size_t v_src_stride     = n_h * DV;
+
+    // softmax without the mask (no mask, or a block whose mask is all zero) and with it
+    const worker_callback_t softmax_nomask = proto->has_softcap ? fa_softmax_thread : fa_softmax_thread_nomask;
+    const worker_callback_t softmax_mask   = proto->has_softcap ? fa_softmax_thread :
+                                             G == 1 ? fa_softmax_thread_mask_broadcast_g1 : fa_softmax_thread_mask_broadcast_gn;
+
+    hmx_queue_t hmx_q = ctx->hmx_queue;
+    uint32_t    o_cur = 1;  // o_tiles[o_cur] receives the next update; o_tiles[1 - o_cur] holds O
+
+    for (uint32_t b = 0; b < 2 && b < n_blk; b++) {
+        const uint32_t kv0 = blks[b] * Bc;
+        fa_mh_push_block(&hd[0].f, dq, mask, q_start, n_rows_q, kvh0, n_h, kv0, MIN(Bc, nek1 - kv0), base + L.k[b], base + L.v[b],
+                         base + L.mask[b], L.m_line_bytes);
+    }
+    const uint32_t n_desc = (k->nb[2] == DK * sizeof(__fp16) ? 1 : n_h) + (v->nb[2] == DV * sizeof(__fp16) ? 1 : n_h) + (mask ? 1 : 0);
+
+    for (uint32_t ib = 0, b = 0; ib < n_blk; ib++, b ^= 1) {
+        const uint32_t blk         = blks[ib];
+        const uint32_t kv_start    = blk * Bc;
+        const uint32_t kv_rows     = MIN(Bc, nek1 - kv_start);
+        const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
+        for (uint32_t d = 0; d < n_desc; d++) {
+            dma_queue_pop(dq);
+        }
+
+        // K and V tiles of every head. V rows up to the end of the last tile are zero: P is zero there,
+        // and the products must not see what an earlier op left in VTCM.
+        const uint32_t v_rows = hex_align_up(kv_rows, HMX_FP16_TILE_N_COLS);
+        if (v_rows > kv_rows) {
+            const size_t v_row_bytes = (size_t) n_h * DV * sizeof(__fp16);
+            hvx_splat_u8_a((char *) (base + L.v[b] + kv_rows * v_row_bytes), 0, (v_rows - kv_rows) * v_row_bytes);
+        }
+        const uint32_t rows_per_t = hex_align_up(hmx_ceil_div(kv_rows, n_thr), 2);
+        for (uint32_t h = 0; h < n_h; h++) {
+            hd[h].k = (fa_k_int_args_t) { &hd[h].f, kv_rows, k_src_stride, base + L.k[b] + h * DK * sizeof(__fp16), kv_start, rows_per_t, 0 };
+            hd[h].v = (fa_v_int_args_t) { &hd[h].f, v_rows, v_src_stride, base + L.v[b] + h * DV * sizeof(__fp16), hd[h].f.vtcm_v_tiles[0],
+                                        n_tiles_per_bc, kv_start, hex_align_up(hmx_ceil_div(v_rows, n_thr), 2) };
+        }
+        work_queue_run(ctx->work_queue, fa_mh_kv_thread, &a, n_thr);
+
+        // S = Q K^T
+        for (uint32_t h = 0; h < n_h; h++) {
+            hd[h].qk = (hmx_fa_qk_job_t) { hd[h].f.vtcm_q_tiles, hd[h].f.vtcm_k_tiles[0], hd[h].f.vtcm_s_tiles[0], n_row_tiles,
+                                           n_col_tiles, DK / 32, n_tiles_per_bc, hd[h].f.vtcm_hmx_scales_qk };
+        }
+        hmx_queue_push(hmx_q, hmx_queue_make_desc(fa_mh_qk_worker, &a));
+        hmx_queue_pop(hmx_q);
+
+        // softmax, P and the rescale D
+        const bool zero_mask = mask == NULL || (flags && (flags[blk] & FA_BLK_ZERO));
+        a.softmax_fn = zero_mask ? softmax_nomask : softmax_mask;
+        for (uint32_t h = 0; h < n_h; h++) {
+            fa_softmax_args_t * s = &hd[h].s;
+            memset(s, 0, sizeof(*s));
+            s->factx                = &hd[h].f;
+            s->buf_idx              = 0;
+            s->kv_rows              = kv_rows;
+            s->n_rows_g             = n_rows_g;
+            s->n_col_tiles          = n_col_tiles;
+            s->n_tiles_per_bc       = n_tiles_per_bc;
+            s->n_row_tiles          = n_row_tiles;
+            s->n_row_tiles_g_br     = n_row_tiles_g_br;
+            s->Bc                   = Bc;
+            s->G                    = G;
+            s->kv_head              = kvh0 + h;
+            s->kv_start             = kv_start;
+            s->q_start              = q_start;
+            s->ib3                  = 0;
+            s->first_block          = ib == 0;
+            s->has_alibi            = false;
+            s->mask                 = zero_mask ? NULL : mask;
+            s->mask_vtcm            = mask ? (const __fp16 *) (base + L.mask[b]) : NULL;
+            s->mask_vtcm_row_stride = L.m_line_bytes / sizeof(__fp16);
+            s->slopes               = hd[h].f.vtcm_slopes;
+        }
+        work_queue_run(ctx->work_queue, fa_mh_softmax_thread, &a, MIN(n_thr, n_h));
+
+        // the block after the next into this block's staging buffers: K/V went into tiles, the
+        // softmax has read the mask
+        if (ib + 2 < n_blk) {
+            const uint32_t kv2 = blks[ib + 2] * Bc;
+            fa_mh_push_block(&hd[0].f, dq, mask, q_start, n_rows_q, kvh0, n_h, kv2, MIN(Bc, nek1 - kv2), base + L.k[b], base + L.v[b],
+                             base + L.mask[b], L.m_line_bytes);
+        }
+
+        // O = D O + P V
+        for (uint32_t h = 0; h < n_h; h++) {
+            const struct hmx_fa_context * f = &hd[h].f;
+            hd[h].ou = (hmx_fa_o_update_job_t) { f->vtcm_o_tiles[o_cur], f->vtcm_o_tiles[1 - o_cur], f->vtcm_p_tiles[0], f->vtcm_v_tiles[0],
+                                                 f->vtcm_d_tiles[0], f->vtcm_hmx_scales_id, n_row_tiles, n_col_tiles, n_row_tiles_g_br,
+                                                 n_tiles_per_bc, DV };
+        }
+        hmx_queue_push(hmx_q, hmx_queue_make_desc(fa_mh_ou_worker, &a));
+        hmx_queue_pop(hmx_q);
+        o_cur = 1 - o_cur;
+    }
+
+    // O / l and the store
+    for (uint32_t h = 0; h < n_h; h++) {
+        struct hmx_fa_context * f = &hd[h].f;
+        fa_build_d_diag_inv_l(f, n_row_tiles, n_row_tiles_g_br);
+        hd[h].on = (hmx_fa_o_norm_job_t) { f->vtcm_o_tiles[o_cur], f->vtcm_o_tiles[1 - o_cur], f->vtcm_d_inv_l, f->vtcm_hmx_scales_id,
+                                           n_row_tiles, n_row_tiles_g_br, DV };
+    }
+    hmx_queue_push(hmx_q, hmx_queue_make_desc(fa_mh_on_worker, &a));
+    hmx_queue_pop(hmx_q);
+
+    for (uint32_t h = 0; h < n_h; h++) {
+        hd[h].o = (fa_o_store_args_t) { &hd[h].f, dst, hd[h].f.vtcm_o_tiles[o_cur], q_start, kvh0 + h, 0, n_rows_g,
+                                        hmx_ceil_div(n_rows_g, n_thr) };
+    }
+    a.store_fn = proto->is_dst_fp32 ? fa_o_store_thread_f32 : fa_o_store_thread_f16;
+    work_queue_run(ctx->work_queue, fa_mh_store_thread, &a, n_thr);
+
+    return HTP_STATUS_OK;
+}
+
 int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     struct htp_thread_trace * tr_hvx = &octx->ctx->trace[0];
     struct htp_thread_trace * tr_hmx = &octx->ctx->trace[HTP_MAX_NTHREADS];
@@ -2112,6 +2556,20 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
             q_start_min = block_start * Br;
             q_start_max = MIN(block_end * Br, neq1);
+        }
+    }
+
+    // Decode with several KV heads: all of them per KV block (fa_mh_run). One head keeps the step
+    // loop, which pipelines the blocks.
+    if (!(kparams->flags & HTP_FA_FLAG_NO_MH) && n_q_blocks == 1 && neq3 == 1 && kparams->max_bias == 0.0f && DK == DK_pad &&
+        DV == DV_pad && k->type == HTP_TYPE_F16 && v->type == HTP_TYPE_F16 && k->ne[3] == 1 && v->ne[3] == 1 &&
+        (!mask || (factx.mask_broadcast && mask->ne[3] == 1)) && kv_head_max - kv_head_min >= 2 &&
+        kv_head_max - kv_head_min <= FA_MH_MAX_HEADS &&
+        q_start_min < q_start_max && q_start_max - q_start_min <= FA_MH_MAX_ROWS &&
+        (uint64_t) nek1 * (kv_head_max - kv_head_min) * (DK + DV) <= FA_MH_MAX_WORK) {
+        const int st = fa_mh_run(octx, &factx, q_start_min, q_start_max - q_start_min, kv_head_min, kv_head_max);
+        if (st != HTP_STATUS_NO_SUPPORT) {
+            return st;
         }
     }
 

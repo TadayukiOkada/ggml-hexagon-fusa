@@ -32,10 +32,12 @@ enum htp_fa_kernel_type {
     HTP_FA_KERNEL_HMX
 };
 
+#define HTP_FA_FLAG_NO_MH 0x80  // HMX: keep the per-head step loop for one Q block
+
 struct htp_fa_kernel_params {
     uint8_t  kernel_type;        // enum htp_fa_kernel_type
     uint8_t  head_split;         // 1 = partition by KV heads in multicore, 0 = token partition
-    uint8_t  flags;              // reserved
+    uint8_t  flags;              // HTP_FA_FLAG_*
     uint8_t  n_threads;          // Number of threads to run
 
     // Common parameters

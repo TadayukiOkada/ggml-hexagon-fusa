@@ -122,6 +122,7 @@ static size_t opt_mbuf_total  = 0;                        // total buffer space 
 static int    opt_mm_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_head_split = 1; // 1 = partition flash_attn by KV heads in multicore (default on), 0 = token-based (original)
+static int    opt_fa_mh      = 1; // 1 = HMX decode runs all KV heads per KV block, 0 = a head at a time
 static int    opt_gdn_select = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
 static int    opt_ar_select  = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
 static int    opt_ar_scatter = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
@@ -5432,6 +5433,11 @@ static bool ggml_hexagon_flash_attn_is_hmx_eligible(
 
     const uint32_t n_head = q->ne[2];
     const uint32_t n_kv_heads = k->ne[2];
+
+    // Several KV heads of head dim 64 run together on HMX (fa_mh_run), ahead of HVX at any depth (v73)
+    if (opt_fa_mh && DK == 64 && v->ne[0] == 64 && n_kv_heads >= 2 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) {
+        return true;
+    }
     const uint32_t G = n_kv_heads > 0 ? n_head / n_kv_heads : 1;
     const uint32_t S = k->ne[1];
 
@@ -5523,6 +5529,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
         int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, sess->vtcm_size, sess->n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, causal);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
+            if (!opt_fa_mh) {
+                kparams->flags |= HTP_FA_FLAG_NO_MH;
+            }
             if (logit_softcap == 0.0f) {
                 kparams->scale = scale * (float) M_LOG2E;
                 kparams->logit_softcap = 0.0f;
@@ -9916,6 +9925,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_head_split = getenv("GGML_HEXAGON_FA_HEAD_SPLIT");
+    const char * str_fa_mh = getenv("GGML_HEXAGON_FA_MH");
     const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
     const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
@@ -9976,6 +9986,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_head_split = str_fa_head_split ? atoi(str_fa_head_split)       : opt_fa_head_split;
+    opt_fa_mh         = str_fa_mh         ? atoi(str_fa_mh)               : opt_fa_mh;
     opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
     opt_ar_select     = str_ar_select     ? atoi(str_ar_select)           : opt_ar_select;
     opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
