@@ -3905,6 +3905,9 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * src1 = last_node.src1();
 
         if (src2->type != GGML_TYPE_F32) return false;
+        // the fused kernels read src2 in rows of dst->ne[0] (broadcast along dims 1-3 only), so a
+        // residual broadcast along ne0, like the [1, C] bias of a conv output, stays a separate ADD
+        if (src2->ne[0] != node.dst()->ne[0]) return false;
 
         const struct htp_mm_kernel_params * orig_kparams = (const struct htp_mm_kernel_params *) last_node.kernel_params;
         struct htp_mm_kernel_params kparams;
