@@ -11,6 +11,8 @@ struct htp_unary_kernel_params {
     uint32_t  vtcm_row_per_thread;
     uint32_t  block;
     uint32_t  broadcast_weight;
+    uint32_t  add_src2;                   // RMS_NORM_MUL: dst = rms_norm(src0) * src1 + src2 (the residual)
+    uint32_t  vtcm_src2_size_per_thread;
 
     uint32_t  vtcm_src0_size_per_thread;
     uint32_t  vtcm_src1_size_per_thread;
@@ -79,6 +81,9 @@ struct htp_unary_vtcm_layout {
     size_t src0_bytes;
     size_t src1_bytes;
     size_t dst_bytes;
+
+    size_t off_src2;    // residual rows for RMS_NORM_MUL with add_src2 (shaped like dst)
+    size_t src2_bytes;
 };
 
 static inline void htp_unary_vtcm_layout_build(
@@ -92,7 +97,8 @@ static inline void htp_unary_vtcm_layout_build(
     size_t vtcm_size,
     size_t elem_size,
     uint32_t * out_col_tile,
-    uint32_t * out_vtcm_row_per_thread
+    uint32_t * out_vtcm_row_per_thread,
+    bool add_src2
 ) {
     const size_t src0_data_row_size = ne00 * elem_size;
     const size_t dst_data_row_size  = ne10 * elem_size;
@@ -124,6 +130,11 @@ static inline void htp_unary_vtcm_layout_build(
         } else {
             vtcm_size_per_row = 2 * (src0_row_size_aligned + dst_row_size_aligned + src1_row_size_aligned);
             vtcm_row_per_thread = vtcm_size / (n_threads * vtcm_size_per_row);
+        }
+        if (add_src2) {
+            const size_t avail = broadcast_weight ? (vtcm_size > n_threads * src1_row_size_aligned ? vtcm_size - n_threads * src1_row_size_aligned : 0) : vtcm_size;
+            vtcm_size_per_row  += 2 * dst_row_size_aligned;
+            vtcm_row_per_thread = avail / (n_threads * vtcm_size_per_row);
         }
     } else {
         vtcm_size_per_row   = 2 * (src0_row_size_aligned + dst_row_size_aligned);
@@ -172,7 +183,9 @@ static inline void htp_unary_vtcm_layout_build(
         L->off_dst  = L->off_src0 + L->src0_bytes * n_threads;
     }
 
-    L->total_bytes = L->off_dst + L->dst_bytes * n_threads;
+    L->src2_bytes  = (op == HTP_OP_RMS_NORM_MUL && add_src2) ? dst_row_size_aligned * vtcm_row_per_thread * 2 : 0;
+    L->off_src2    = L->off_dst + L->dst_bytes * n_threads;
+    L->total_bytes = L->off_src2 + L->src2_bytes * n_threads;
 
     *out_col_tile = col_tile;
     *out_vtcm_row_per_thread = vtcm_row_per_thread;

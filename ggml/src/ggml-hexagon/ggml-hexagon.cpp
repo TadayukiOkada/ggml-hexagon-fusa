@@ -146,6 +146,7 @@ enum ggml_hexagon_fusion_flags {
     GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
     GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
     GGML_HEXAGON_FUSE_MUL_MAT_GLU   = (1 << 7), // 128
+    GGML_HEXAGON_FUSE_RMS_NORM_ADD  = (1 << 8), // 256
 };
 
 static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
@@ -346,7 +347,8 @@ static void ggml_hexagon_precompute_unary_params(
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     const struct ggml_tensor * dst,
-    struct htp_unary_kernel_params * kparams
+    struct htp_unary_kernel_params * kparams,
+    bool add_src2 = false
 );
 
 static bool ggml_hexagon_precompute_binary_params(
@@ -3657,6 +3659,61 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
+    // ADD of an RMS_NORM+MUL output and a residual of the same shape (post-norms): the norm op adds the
+    // residual rows before its output goes to DDR.
+    bool try_fuse_rms_norm_mul_add(const htp_opnode & node) {
+        if (n_ops == 0) return false;
+        if (node.opcode != HTP_OP_ADD) return false;
+
+        htp_opnode & last_node = ops[n_ops - 1];
+        if (last_node.opcode != HTP_OP_RMS_NORM_MUL || last_node.inputs.size() != 2) return false;
+
+        const ggml_tensor * add  = node.dst();
+        const ggml_tensor * a    = node.src0();
+        const ggml_tensor * b    = node.src1();
+        const ggml_tensor * nout = last_node.dst();
+        if (!ggml_hexagon_tensor_is_fuseable(nout)) return false;
+
+        const ggml_tensor * res;
+        if (a == nout) {
+            res = b;
+        } else if (b == nout) {
+            res = a;
+        } else {
+            return false;
+        }
+
+        if (res->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) return false;
+        if (!ggml_are_same_shape(res, nout) || !ggml_are_same_shape(add, nout)) return false;
+        if (!ggml_is_contiguous(res) || !ggml_is_contiguous(add)) return false;
+
+        const ggml_tensor * src0   = last_node.inputs[0];
+        const ggml_tensor * weight = last_node.inputs[1];
+
+        struct htp_unary_kernel_params kparams;
+        ggml_hexagon_precompute_unary_params(sess, HTP_OP_RMS_NORM_MUL, src0, weight, add, &kparams, true);
+        if (kparams.col_tile || kparams.block == 0 || (size_t) kparams.vtcm_size > sess->vtcm_size) return false;
+
+        if (!try_fuse_common(res, add)) {
+            return false;
+        }
+
+        last_node.name = "RMS_NORM+MUL+ADD";
+        last_node.inputs.push_back(res);
+        last_node.outputs.clear();
+        last_node.outputs.push_back(add);
+        last_node.fused.push_back(node.node);
+        memcpy(last_node.kernel_params, &kparams, sizeof(kparams));
+
+        htp_op_desc & o = h_ops[n_ops - 1];
+        memcpy(o.kernel_params, &kparams, sizeof(kparams));
+        o.src[2] = add_tensor(res);
+        o.dst[0] = add_tensor(add);
+
+        HEX_VERBOSE("ggml-hex: %s fused RMS_NORM+MUL+ADD (#%u)\n", sess->c_name(), n_ops - 1);
+        return true;
+    }
+
     bool try_fuse_mul_mat_add(const htp_opnode & node) {
         if (n_ops == 0) return false;
         if (node.opcode != HTP_OP_ADD) return false;
@@ -4196,6 +4253,7 @@ struct ggml_hexagon_opbatch {
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_MUL)  && try_fuse_rms_norm_mul(node))  return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_ADD)  && try_fuse_rms_norm_mul_add(node)) return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_GLU)   && try_fuse_mul_mat_glu(node))   return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node)) return true;
@@ -6177,7 +6235,8 @@ static void ggml_hexagon_precompute_unary_params(
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     const struct ggml_tensor * dst,
-    struct htp_unary_kernel_params * kparams
+    struct htp_unary_kernel_params * kparams,
+    bool add_src2
 ) {
     memset(kparams, 0, sizeof(*kparams));
 
@@ -6218,7 +6277,7 @@ static void ggml_hexagon_precompute_unary_params(
     htp_unary_vtcm_layout_build(&L, op, src0->ne[0], dst->ne[0],
                                 op == HTP_OP_RMS_NORM_MUL ? src1->ne[0] : 0,
                                 broadcast_weight, n_threads, sess->vtcm_size, elem_size,
-                                &col_tile, &vtcm_row_per_thread);
+                                &col_tile, &vtcm_row_per_thread, add_src2);
 
     kparams->col_tile = col_tile;
     kparams->vtcm_row_per_thread = vtcm_row_per_thread;
@@ -6227,6 +6286,8 @@ static void ggml_hexagon_precompute_unary_params(
     kparams->vtcm_src0_size_per_thread = L.src0_bytes;
     kparams->vtcm_src1_size_per_thread = L.src1_bytes;
     kparams->vtcm_dst_size_per_thread  = L.dst_bytes;
+    kparams->add_src2                  = add_src2 ? 1 : 0;
+    kparams->vtcm_src2_size_per_thread = L.src2_bytes;
 
     kparams->vtcm_src0_size = L.src0_bytes * n_threads;
     kparams->vtcm_src1_size = L.src1_bytes * n_threads;
@@ -8296,6 +8357,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             } else if (graph->nodes[i]->op == GGML_OP_MUL_MAT || graph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 if ((i + 1 < graph->n_nodes && graph->nodes[i + 1]->op == GGML_OP_ADD && ggml_can_fuse(graph, i, { graph->nodes[i]->op, GGML_OP_ADD })) ||
                     ggml_node_has_n_uses(graph, i, 1)) {
+                    extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+                }
+            } else if (graph->nodes[i]->op == GGML_OP_MUL) {
+                // the MUL of an RMS_NORM+MUL feeding an ADD
+                if (ggml_node_has_n_uses(graph, i, 1)) {
                     extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
                 }
             }

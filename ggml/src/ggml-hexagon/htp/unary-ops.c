@@ -63,6 +63,7 @@ struct htp_unary_context {
 
     dma_addr_t                data_src0;
     dma_addr_t                data_src1;            // weight/scale tensor for RMS_NORM_MUL
+    dma_addr_t                data_src2;            // residual added by RMS_NORM_MUL (add_src2)
     dma_addr_t                data_dst;
 
     size_t                    src0_data_row_size;   // actual data bytes per row
@@ -88,6 +89,7 @@ struct htp_unary_context {
     uint8_t *                 vtcm_src0;
     uint8_t *                 vtcm_src1;
     uint8_t *                 vtcm_dst;
+    uint8_t *                 vtcm_src2;
 
     size_t                    vtcm_src0_size_per_thread;
     size_t                    vtcm_src1_size_per_thread;
@@ -238,6 +240,15 @@ static void rms_norm_mul_f32(const void * restrict src,
         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
 
         hvx_fast_rms_norm_mul_f32(src_local, w_local, dst_local, ne0, epsilon);
+    }
+}
+
+// dst += residual, as the ADD op computes it
+static void rms_norm_mul_add_residual_f32(void * restrict dst, const void * restrict res, const uint32_t num_rows,
+                                          const struct htp_unary_context * uctx) {
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        uint8_t * d = (uint8_t *) dst + ir * uctx->dst_row_size_aligned;
+        hvx_add_f32_aaa(d, d, (const uint8_t *) res + ir * uctx->dst_row_size_aligned, uctx->nc);
     }
 }
 
@@ -1110,6 +1121,10 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
     const dma_addr_t data_src  = uctx->data_src0;
     const dma_addr_t data_src1 = uctx->data_src1;
     const dma_addr_t data_dst  = uctx->data_dst;
+    const dma_addr_t data_src2 = uctx->data_src2;
+    const bool       add_src2  = uctx->kparams->add_src2 != 0;
+    uint8_t *        src2_vtcm_data = add_src2 ? uctx->vtcm_src2 + ith * uctx->kparams->vtcm_src2_size_per_thread : NULL;
+    const size_t     src2_vtcm_half_size = uctx->kparams->vtcm_src2_size_per_thread / 2;
 
     const struct htp_tensor * src1 = octx->src[1];
     const uint32_t nb11 = src1->nb[1];
@@ -1180,6 +1195,12 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
                 uctx->src1_row_size_aligned, nb11, uctx->src1_data_row_size, block_size);
         }
 
+        if (add_src2) {  // residual rows, laid out like dst
+            dma_queue_push(dma_q,
+                dma_make_data(src2_vtcm_data + (vtcm_idx * src2_vtcm_half_size), data_src2 + ir * nb1),
+                dst_row_size_aligned, nb1, dst_data_row_size, block_size);
+        }
+
         ir += block_size;
     }
 
@@ -1195,10 +1216,17 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
         if (!uctx->broadcast_weight) {
             src1_vtcm = (void *) (uintptr_t) dma_queue_pop(dma_q).dst;
         }
+        void * src2_vtcm = NULL;
+        if (add_src2) {
+            src2_vtcm = (void *) (uintptr_t) dma_queue_pop(dma_q).dst;
+        }
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir);
         const void * w = uctx->broadcast_weight ? (const void *) src1_vtcm_data : src1_vtcm;
         compute(src0_vtcm, w, dst_vtcm, block_size, uctx);
+        if (add_src2) {
+            rms_norm_mul_add_residual_f32(dst_vtcm, src2_vtcm, block_size, uctx);
+        }
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir);
 
         const size_t dst_off = dst_contig ? (ir * nb1) :
@@ -1228,6 +1256,11 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
                     dma_queue_push(dma_q,
                         dma_make_data(src1_vtcm, data_src1 + src1_pref_off),
                         uctx->src1_row_size_aligned, nb11, uctx->src1_data_row_size, pref_block_size);
+                }
+                if (add_src2) {
+                    dma_queue_push(dma_q,
+                        dma_make_data(src2_vtcm, data_src2 + pref_ir * nb1),
+                        dst_row_size_aligned, nb1, dst_data_row_size, pref_block_size);
                 }
             }
         }
@@ -1719,6 +1752,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
         .data_src0             = src0->data,
         .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? src1->data : 0,
+        .data_src2             = kparams->add_src2 ? octx->src[2]->data : 0,
         .data_dst              = dst->data,
 
         .src0_data_row_size    = src0_data_row_size,
@@ -1741,6 +1775,8 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         .vtcm_src0             = VTCM_LAYOUT_PTR(uint8_t, base, 0),
         .vtcm_src1             = VTCM_LAYOUT_PTR_OPTIONAL(uint8_t, base, kparams->vtcm_src0_size, kparams->vtcm_src1_size > 0),
         .vtcm_dst              = VTCM_LAYOUT_PTR(uint8_t, base, kparams->vtcm_src0_size + kparams->vtcm_src1_size),
+        .vtcm_src2             = VTCM_LAYOUT_PTR_OPTIONAL(uint8_t, base, kparams->vtcm_src0_size + kparams->vtcm_src1_size + kparams->vtcm_dst_size,
+                                                          kparams->add_src2),
 
         .vtcm_src0_size_per_thread = kparams->vtcm_src0_size_per_thread,
         .vtcm_src1_size_per_thread = kparams->vtcm_src1_size_per_thread,
