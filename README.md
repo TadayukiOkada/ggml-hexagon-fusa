@@ -33,6 +33,13 @@ The presets read the SDK locations from the environment:
 | `arm64-linux-release` | upstream defaults, clang cross build (the `arm64-linux` toolchain container) | `HEXAGON_SDK_ROOT`, `HEXAGON_TOOLS_ROOT` |
 | `arm64-android-release` | upstream defaults on Android (the `arm64-android` toolchain container) | `ANDROID_NDK_ROOT`, `HEXAGON_SDK_ROOT`, `HEXAGON_TOOLS_ROOT` |
 
+For the FuSa skel, use the Hexagon tools bundled with SDK 5.5.x (8.7.06;
+`HEXAGON_HTP_TOOLS_ROOT=$HEXAGON_HTP_SDK_ROOT/tools/HEXAGON_Tools/8.7.06`,
+`HEXAGON_HTP_TOOLV=toolv87`). Tools 8.6.05 build a skel that loads and runs
+but drifts in single-token gemma decoding (KL divergence against the CPU
+about 8x higher). 8.7.10 emits the same code as 8.7.06; 19.0.x also works
+but changes all numerics slightly.
+
 ```sh
 cmake --preset arm64-oe-linux-v73-fusa -B build
 cmake --build build -j
