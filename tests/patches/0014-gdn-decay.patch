@@ -1,0 +1,55 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4868,6 +4868,36 @@
+     }
+ };
+ 
++// The HMX chunk decay exp(gamma_t - gamma_s) must keep f32 precision for weak and
++// strong gates. Fixed inputs make both and the 64-token boundary reproducible.
++struct test_gdn_decay : public test_gated_delta_net {
++    const float g_lo;
++    test_gdn_decay(int64_t d, int64_t tokens, int64_t seqs, int repeat, float g_lo)
++        : test_gated_delta_net(GGML_TYPE_F32, 4, d, tokens, seqs, repeat), g_lo(g_lo) {}
++    std::string vars() override { return test_gated_delta_net::vars() + "," + VAR_TO_STR(g_lo); }
++    std::string op_desc(ggml_tensor *) override { return "GDN_DECAY"; }
++    // HMX still rounds matrix operands to f16. The old decay error is orders of
++    // magnitude larger than this bound; existing upstream cases keep their bound.
++    double max_nmse_err() override { return 5e-7; }
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op)) { continue; }
++            float lo = -1.0f, hi = 1.0f;
++            if (!strcmp(t->name, "g")) { lo = g_lo; hi = -1e-4f; }
++            if (!strcmp(t->name, "beta")) { lo = 0.0f; hi = 1.0f; }
++            if (!strcmp(t->name, "v")) { lo = -0.3f; hi = 5.0f; }
++            uint32_t seed = 2166136261u;
++            for (const char * p = t->name; *p; ++p) { seed = (seed ^ uint8_t(*p)) * 16777619u; }
++            for (int i = 0; i < GGML_MAX_DIMS; ++i) { seed = (seed ^ uint32_t(t->ne[i])) * 16777619u; }
++            std::mt19937 rng(seed);
++            std::uniform_real_distribution<float> dist(lo, hi);
++            std::vector<float> data(ggml_nelements(t));
++            for (float & v : data) { v = dist(rng); }
++            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
++        }
++    }
++};
++
+ // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
+ struct test_gated_delta_net_cache_fusion : public test_case {
+     const ggml_type type;
+@@ -11732,6 +11762,14 @@
+     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
+     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+ 
++    for (float g_lo : {-20.0f, -2.0f, -0.05f}) {
++        for (int64_t d : {64, 128}) {
++            for (int64_t tokens : {63, 64, 65, 127, 256}) {
++                test_cases.emplace_back(new test_gdn_decay(d, tokens, 1, 1, g_lo));
++            }
++        }
++        test_cases.emplace_back(new test_gdn_decay(64, 127, 2, 2, g_lo));
++    }
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
