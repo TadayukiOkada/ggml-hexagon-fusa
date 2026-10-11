@@ -889,6 +889,11 @@ static int op_fence(struct htp_ops_context * octx) {
             status = HTP_STATUS_INTERNAL_ERR;
             break;
         }
+#ifdef HTP_YIELD_BETWEEN_OPS
+        // A peer can take longer than the FuSa self-test period. Fence waits
+        // have no live VTCM scratch; honor release requests while waiting too.
+        htp_vtcm_yield(ctx);
+#endif
         hex_pause();
     }
 
