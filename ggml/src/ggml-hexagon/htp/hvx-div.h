@@ -22,33 +22,86 @@
 #define HVX_OP_MUL_F16(a, b) Q6_Vhf_vmpy_VhfVhf(a, b)
 #endif
 
-// Compute div by scaler in f32. Requires first by expanding fp32 to fp16 and converting the result back to fp32.
-static inline HVX_Vector hvx_div_mul_f16_const_using_f32(HVX_Vector vec1_hf, HVX_Vector vec2_sf_const, HVX_Vector vec_hf_one_1_0) {
-#if __HVX_ARCH__ < 79
-    HVX_VectorPair src_to_f32 = Q6_Wqf32_vmpy_VhfVhf(vec1_hf, vec_hf_one_1_0);
-    HVX_Vector src_to_f32_0 = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(src_to_f32));
-    HVX_Vector src_to_f32_1 = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(src_to_f32));
-#else
-    HVX_VectorPair src_to_f32 = Q6_Wsf_vmpy_VhfVhf(vec1_hf, vec_hf_one_1_0);
-    HVX_Vector src_to_f32_0 = Q6_V_lo_W(src_to_f32);
-    HVX_Vector src_to_f32_1 = Q6_V_hi_W(src_to_f32);
-#endif
-
-    HVX_Vector div_f32_0 = HVX_OP_MUL_F32(src_to_f32_0, vec2_sf_const);
-    HVX_Vector div_f32_1 = HVX_OP_MUL_F32(src_to_f32_1, vec2_sf_const);
-
-#if __HVX_ARCH__ < 79
-    HVX_Vector res = hvx_vec_f32_to_f16(div_f32_0, div_f32_1);
-#else
-    HVX_Vector res = Q6_Vhf_vcvt_VsfVsf(div_f32_0, div_f32_1);
-#endif
-    return res;
+// Restore IEEE half special values after the reciprocal and qf32 conversion,
+// which may otherwise flush infinities or lose signed zero.
+static inline HVX_Vector hvx_div_f16_special(HVX_Vector result, HVX_Vector a, HVX_Vector b) {
+    const HVX_Vector abs_mask = Q6_Vh_vsplat_R(0x7fff);
+    const HVX_Vector inf = Q6_Vh_vsplat_R(0x7c00);
+    const HVX_Vector zero = Q6_V_vzero();
+    const HVX_Vector aa = Q6_V_vand_VV(a, abs_mask);
+    const HVX_Vector ab = Q6_V_vand_VV(b, abs_mask);
+    const HVX_Vector sign = Q6_V_vand_VV(Q6_V_vxor_VV(a, b), Q6_Vh_vsplat_R(0x8000));
+    const HVX_VectorPred az = Q6_Q_vcmp_eq_VhVh(aa, zero);
+    const HVX_VectorPred bz = Q6_Q_vcmp_eq_VhVh(ab, zero);
+    const HVX_VectorPred ai = Q6_Q_vcmp_eq_VhVh(aa, inf);
+    const HVX_VectorPred bi = Q6_Q_vcmp_eq_VhVh(ab, inf);
+    HVX_VectorPred invalid = Q6_Q_or_QQ(Q6_Q_vcmp_gt_VuhVuh(aa, inf), Q6_Q_vcmp_gt_VuhVuh(ab, inf));
+    invalid = Q6_Q_or_QQ(invalid, Q6_Q_or_QQ(Q6_Q_and_QQ(az, bz), Q6_Q_and_QQ(ai, bi)));
+    HVX_Vector magnitude = Q6_V_vand_VV(result, abs_mask);
+    // qf32-to-half overflow can encode NaN rather than infinity.
+    magnitude = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VuhVuh(magnitude, Q6_Vh_vsplat_R(0x7bff)), inf, magnitude);
+    magnitude = Q6_V_vmux_QVV(Q6_Q_or_QQ(az, bi), zero, magnitude);
+    magnitude = Q6_V_vmux_QVV(Q6_Q_or_QQ(bz, ai), inf, magnitude);
+    result = Q6_V_vor_VV(magnitude, sign);
+    return Q6_V_vmux_QVV(invalid, Q6_Vh_vsplat_R(0x7e00), result);
 }
 
-// Variant for <v79: Use pre-computed f16 reciprocal constant
-static inline HVX_Vector hvx_div_mul_f16_const_using_f16(HVX_Vector vec1_hf, HVX_Vector const_inv_hf) {
-    // Multiply by pre-computed f16 reciprocal constant
-    return HVX_OP_MUL_F16(vec1_hf, const_inv_hf);
+// |a| / |b| for finite nonzero half magnitudes: widen to f32, divide with an f32 reciprocal and
+// round to half once. Special operands give garbage here; hvx_div_f16_special replaces those lanes,
+// so the reciprocal needs no inf/NaN guard.
+static inline HVX_Vector hvx_vec_div_f16_mag(HVX_Vector aa, HVX_Vector ab, HVX_Vector hf_one) {
+#if __HVX_ARCH__ < 79
+    const HVX_VectorPair a_qf = Q6_Wqf32_vmpy_VhfVhf(aa, hf_one);  // *1.0, exact
+    const HVX_VectorPair b_qf = Q6_Wqf32_vmpy_VhfVhf(ab, hf_one);
+    const HVX_Vector     r0   = hvx_vec_inverse_f32(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(b_qf)));
+    const HVX_Vector     r1   = hvx_vec_inverse_f32(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(b_qf)));
+    const HVX_Vector     q0   = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(a_qf)), r0);
+    const HVX_Vector     q1   = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(a_qf)), r1);
+    return Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q1, q0));
+#else
+    const HVX_VectorPair a_sf = Q6_Wsf_vmpy_VhfVhf(aa, hf_one);  // *1.0
+    const HVX_VectorPair b_sf = Q6_Wsf_vmpy_VhfVhf(ab, hf_one);
+    const HVX_Vector     q0   = HVX_OP_MUL_F32(Q6_V_lo_W(a_sf), hvx_vec_inverse_f32(Q6_V_lo_W(b_sf)));
+    const HVX_Vector     q1   = HVX_OP_MUL_F32(Q6_V_hi_W(a_sf), hvx_vec_inverse_f32(Q6_V_hi_W(b_sf)));
+    return Q6_Vhf_vcvt_VsfVsf(q0, q1);
+#endif
+}
+
+static inline HVX_Vector hvx_vec_div_f16(HVX_Vector a, HVX_Vector b, HVX_Vector hf_one) {
+    const HVX_Vector abs_mask = Q6_Vh_vsplat_R(0x7fff);
+    HVX_Vector result = hvx_vec_div_f16_mag(Q6_V_vand_VV(a, abs_mask), Q6_V_vand_VV(b, abs_mask), hf_one);
+    return hvx_div_f16_special(result, a, b);
+}
+
+// 1/|b| for hvx_div_f16_by_const, in the form its multiply takes (qf32 below v79).
+static inline HVX_Vector hvx_div_f16_const_recip(float b) {
+#if __HVX_ARCH__ < 79
+    return Q6_Vqf32_vadd_VsfVsf(hvx_vec_splat_f32(1.0f / fabsf(b)), Q6_V_vzero());
+#else
+    return hvx_vec_splat_f32(1.0f / fabsf(b));
+#endif
+}
+
+// a / b for a finite nonzero constant b. a is widened exactly, multiplied by the f32 reciprocal of
+// |b| and rounded to half once. With such a b only an infinite or NaN a (passed through) and an
+// overflow (to infinity) are special; the sign is the xor of the operand signs.
+static inline HVX_Vector hvx_div_f16_by_const(HVX_Vector a, HVX_Vector recip, HVX_Vector b, HVX_Vector hf_one) {
+    const HVX_Vector abs_mask = Q6_Vh_vsplat_R(0x7fff);
+    const HVX_Vector max_hf   = Q6_Vh_vsplat_R(0x7bff);
+    const HVX_Vector aa       = Q6_V_vand_VV(a, abs_mask);
+#if __HVX_ARCH__ < 79
+    const HVX_VectorPair a_qf = Q6_Wqf32_vmpy_VhfVhf(aa, hf_one);  // *1.0, exact
+    HVX_Vector q = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(Q6_Vqf32_vmpy_Vqf32Vqf32(Q6_V_hi_W(a_qf), recip),
+                                                        Q6_Vqf32_vmpy_Vqf32Vqf32(Q6_V_lo_W(a_qf), recip)));
+#else
+    const HVX_VectorPair a_sf = Q6_Wsf_vmpy_VhfVhf(aa, hf_one);  // *1.0
+    HVX_Vector q = Q6_Vhf_vcvt_VsfVsf(HVX_OP_MUL_F32(Q6_V_lo_W(a_sf), recip), HVX_OP_MUL_F32(Q6_V_hi_W(a_sf), recip));
+#endif
+    q = Q6_V_vand_VV(q, abs_mask);
+    // qf32-to-half overflow can encode NaN rather than infinity.
+    q = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VuhVuh(q, max_hf), Q6_Vh_vsplat_R(0x7c00), q);
+    q = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VuhVuh(aa, max_hf), aa, q);
+    return Q6_V_vor_VV(q, Q6_V_vand_VV(Q6_V_vxor_VV(a, b), Q6_Vh_vsplat_R(0x8000)));
 }
 
 #define hvx_div_scaler_f16_loop_body(dst_type, src_type, vec_store)                                    \
@@ -56,110 +109,49 @@ static inline HVX_Vector hvx_div_mul_f16_const_using_f16(HVX_Vector vec1_hf, HVX
         dst_type * restrict vdst = (dst_type *) dst;                                                   \
         src_type * restrict vsrc = (src_type *) src;                                                   \
                                                                                                        \
-        HVX_Vector hf_one = Q6_Vh_vsplat_R(0x3C00);                                                    \
+        const HVX_Vector hf_one = Q6_Vh_vsplat_R(0x3C00);                                              \
+        const HVX_Vector vb     = hvx_vec_splat_f16(val);                                              \
+        const float      bf     = (float) val;                                                         \
                                                                                                        \
         const uint32_t nvec = n / VLEN_FP16;                                                           \
         const uint32_t nloe = n % VLEN_FP16;                                                           \
                                                                                                        \
         uint32_t i = 0;                                                                                \
                                                                                                        \
-        _Pragma("unroll(4)")                                                                           \
-        for (; i < nvec; i++) {                                                                        \
-            HVX_Vector res;                                                                            \
-            if (__HVX_ARCH__ < 79) {                                                                   \
-                res = hvx_div_mul_f16_const_using_f16(vsrc[i], val_vec_f16);                           \
-            } else {                                                                                   \
-                res = hvx_div_mul_f16_const_using_f32(vsrc[i], val_vec_f32, hf_one);                   \
+        if (bf != 0.0f && isfinite(bf)) {                                                              \
+            const HVX_Vector recip = hvx_div_f16_const_recip(bf);                                      \
+            _Pragma("unroll(4)")                                                                       \
+            for (; i < nvec; i++) {                                                                    \
+                vdst[i] = hvx_div_f16_by_const(vsrc[i], recip, vb, hf_one);                            \
             }                                                                                          \
-            vdst[i] = res;                                                                             \
-        }                                                                                              \
-        if (nloe) {                                                                                    \
-            HVX_Vector res;                                                                            \
-            if (__HVX_ARCH__ < 79) {                                                                   \
-                res = hvx_div_mul_f16_const_using_f16(vsrc[i], val_vec_f16);                           \
-            } else {                                                                                   \
-                res = hvx_div_mul_f16_const_using_f32(vsrc[i], val_vec_f32, hf_one);                   \
+            if (nloe) {                                                                                \
+                vec_store((void *) &vdst[i], nloe * SIZEOF_FP16, hvx_div_f16_by_const(vsrc[i], recip, vb, hf_one)); \
             }                                                                                          \
-            vec_store((void *) &vdst[i], nloe * SIZEOF_FP16, res);                                     \
+        } else {                                                                                       \
+            for (; i < nvec; i++) {                                                                    \
+                vdst[i] = hvx_vec_div_f16(vsrc[i], vb, hf_one);                                        \
+            }                                                                                          \
+            if (nloe) {                                                                                \
+                vec_store((void *) &vdst[i], nloe * SIZEOF_FP16, hvx_vec_div_f16(vsrc[i], vb, hf_one)); \
+            }                                                                                          \
         }                                                                                              \
     } while(0)
 
 static inline void hvx_div_scalar_f16_aa(uint8_t * restrict dst, const uint8_t * restrict src, const _Float16 val, uint32_t n) {
-    const HVX_Vector val_vec_f32 = hvx_vec_splat_f32(1.0f/((float)val));
-    const HVX_Vector val_vec_f16 = hvx_vec_splat_f16(1.0f / val);
     assert((uintptr_t) dst % 128 == 0);
     assert((uintptr_t) src % 128 == 0);
     hvx_div_scaler_f16_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
 }
 static inline void hvx_div_scalar_f16_au(uint8_t * restrict dst, const uint8_t * restrict src, const _Float16 val, uint32_t n) {
-    const HVX_Vector val_vec_f32 = hvx_vec_splat_f32(1.0f/((float)val));
-    const HVX_Vector val_vec_f16 = hvx_vec_splat_f16(1.0f / val);
     assert((uintptr_t) dst % 128 == 0);
     hvx_div_scaler_f16_loop_body(HVX_Vector, HVX_UVector, hvx_vec_store_a);
 }
 static inline void hvx_div_scalar_f16_ua(uint8_t * restrict dst, const uint8_t * restrict src, const _Float16 val, uint32_t n) {
-    const HVX_Vector val_vec_f32 = hvx_vec_splat_f32(1.0f/((float)val));
-    const HVX_Vector val_vec_f16 = hvx_vec_splat_f16(1.0f / val);
     assert((uintptr_t) src % 128 == 0);
     hvx_div_scaler_f16_loop_body(HVX_UVector, HVX_Vector, hvx_vec_store_u);
 }
 static inline void hvx_div_scalar_f16_uu(uint8_t * restrict dst, const uint8_t * restrict src, const _Float16 val, uint32_t n) {
-    const HVX_Vector val_vec_f32 = hvx_vec_splat_f32(1.0f/((float)val));
-    const HVX_Vector val_vec_f16 = hvx_vec_splat_f16(1.0f / val);
     hvx_div_scaler_f16_loop_body(HVX_UVector, HVX_UVector, hvx_vec_store_u);
-}
-
-// Compute div by using hvx_vec_inverse_f32_guard. Requires first by exapnding fp32 to fp16 and convert the result back to fp32.
-static inline HVX_Vector hvx_vec_div_f16_using_f32(HVX_Vector vec1, HVX_Vector vec2, HVX_Vector f32_nan_inf_mask, HVX_Vector vec_hf_one_1_0) {
-#if __HVX_ARCH__ < 79
-    // Convert first input to fp32
-    HVX_VectorPair vec1_to_f32   = Q6_Wqf32_vmpy_VhfVhf(vec1, vec_hf_one_1_0);  // *1.0
-    HVX_Vector     vec1_to_f32_0 = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vec1_to_f32));
-    HVX_Vector     vec1_to_f32_1 = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vec1_to_f32));
-
-    // Convert second input to fp32
-    HVX_VectorPair vec2_to_f32   = Q6_Wqf32_vmpy_VhfVhf(vec2, vec_hf_one_1_0);  // *1.0
-    HVX_Vector     vec2_to_f32_0 = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vec2_to_f32));
-    HVX_Vector     vec2_to_f32_1 = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vec2_to_f32));
-#else
-    // Convert first input to fp32
-    HVX_VectorPair vec1_to_f32   = Q6_Wsf_vmpy_VhfVhf(vec1, vec_hf_one_1_0);  // *1.0
-    HVX_Vector     vec1_to_f32_0 = Q6_V_lo_W(vec1_to_f32);
-    HVX_Vector     vec1_to_f32_1 = Q6_V_hi_W(vec1_to_f32);
-
-    // Convert second input to fp32
-    HVX_VectorPair vec2_to_f32   = Q6_Wsf_vmpy_VhfVhf(vec2, vec_hf_one_1_0);  // *1.0
-    HVX_Vector     vec2_to_f32_0 = Q6_V_lo_W(vec2_to_f32);
-    HVX_Vector     vec2_to_f32_1 = Q6_V_hi_W(vec2_to_f32);
-#endif
-
-    // Inverse second input in fp32
-    HVX_Vector     vec2_inv_f32_0 = hvx_vec_inverse_f32_guard(vec2_to_f32_0, f32_nan_inf_mask);
-    HVX_Vector     vec2_inv_f32_1 = hvx_vec_inverse_f32_guard(vec2_to_f32_1, f32_nan_inf_mask);
-
-    // Multiply first input by inverse of second, in fp32
-    HVX_Vector     div_f32_0 = HVX_OP_MUL_F32(vec1_to_f32_0, vec2_inv_f32_0);
-    HVX_Vector     div_f32_1 = HVX_OP_MUL_F32(vec1_to_f32_1, vec2_inv_f32_1);
-
-    // Convert back to fp16
-#if __HVX_ARCH__ < 79
-    HVX_Vector     recip = hvx_vec_f32_to_f16(div_f32_0, div_f32_1);
-#else
-    HVX_Vector     recip = Q6_Vhf_vcvt_VsfVsf(div_f32_0, div_f32_1);
-#endif
-
-    return recip;
-}
-
-// Hybrid approach: f16 reciprocal for <v79, f32 precision for >=v79
-static inline HVX_Vector hvx_vec_hybrid_div_f16(HVX_Vector vec1, HVX_Vector vec2, HVX_Vector f32_nan_inf_mask, HVX_Vector f16_nan_inf_mask, HVX_Vector vec_hf_one_1_0) {
-#if __HVX_ARCH__ < 79
-    // For older architectures, use f16 reciprocal to avoid NaN/-inf issues
-    HVX_Vector vec2_inv = hvx_vec_inverse_f16_guard(vec2, f16_nan_inf_mask);
-    return HVX_OP_MUL_F16(vec1, vec2_inv);
-#else
-    return hvx_vec_div_f16_using_f32(vec1, vec2, f32_nan_inf_mask, vec_hf_one_1_0);
-#endif
 }
 
 #define hvx_div_f16_loop_body(dst_type, src0_type, src1_type, vec_store)                  \
@@ -168,8 +160,6 @@ static inline HVX_Vector hvx_vec_hybrid_div_f16(HVX_Vector vec1, HVX_Vector vec2
         src0_type * restrict vsrc0 = (src0_type *) src0;                                  \
         src1_type * restrict vsrc1 = (src1_type *) src1;                                  \
                                                                                           \
-        const HVX_Vector f32_nan_inf_mask = Q6_V_vsplat_R(0x7f800000);                    \
-        const HVX_Vector f16_nan_inf_mask = Q6_Vh_vsplat_R(0x7c00);                       \
         const HVX_Vector hf_one = Q6_Vh_vsplat_R(0x3C00);                                 \
                                                                                           \
         const uint32_t nvec = n / VLEN_FP16;                                              \
@@ -179,15 +169,10 @@ static inline HVX_Vector hvx_vec_hybrid_div_f16(HVX_Vector vec1, HVX_Vector vec2
                                                                                           \
         _Pragma("unroll(4)")                                                              \
         for (; i < nvec; i++) {                                                           \
-            HVX_Vector res = hvx_vec_hybrid_div_f16(vsrc0[i], vsrc1[i],                   \
-                                                    f32_nan_inf_mask, f16_nan_inf_mask,   \
-                                                    hf_one);                              \
-            vdst[i] = res;                                                                \
+            vdst[i] = hvx_vec_div_f16(vsrc0[i], vsrc1[i], hf_one);                        \
         }                                                                                 \
         if (nloe) {                                                                       \
-            HVX_Vector res = hvx_vec_hybrid_div_f16(vsrc0[i], vsrc1[i],                   \
-                                                    f32_nan_inf_mask, f16_nan_inf_mask,   \
-                                                    hf_one);                              \
+            HVX_Vector res = hvx_vec_div_f16(vsrc0[i], vsrc1[i], hf_one);                 \
             vec_store((void *) &vdst[i], nloe * SIZEOF_FP16, res);                        \
         }                                                                                 \
     } while(0)
