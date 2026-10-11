@@ -1,0 +1,75 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3308,6 +3308,42 @@
+ // GGML_OP_SUB
+ // GGML_OP_MUL
+ // GGML_OP_DIV
++// Exercise half division across vector boundaries, scalar/row broadcasts,
++// and halfword-offset views. IEEE exceptional values are tested by the ISA harness.
++struct test_f16_div_precision : public test_case {
++    const int64_t n;
++    const int mode;
++    const int offset;
++    test_f16_div_precision(int64_t n, int mode, int offset) : n(n), mode(mode), offset(offset) {}
++    std::string op_desc(ggml_tensor *) override { return "F16_DIV_PRECISION"; }
++    std::string vars() override { return VARS_TO_STR3(n, mode, offset); }
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        auto input = [&](const char * name, int64_t x, int64_t y, int64_t z) {
++            ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, x*y*z + 64);
++            ggml_set_name(storage, name);
++            return ggml_view_3d(ctx, storage, x, y, z, x*2, x*y*2, offset*2);
++        };
++        ggml_tensor * a = input("div_a", n, 3, 2);
++        ggml_tensor * b = input("div_b", mode == 1 ? 1 : n, mode == 2 ? 1 : 3, mode == 2 ? 1 : 2);
++        return ggml_div(ctx, a, b);
++    }
++    void initialize_tensors(ggml_context * ctx) override {
++        static const uint16_t numerators[] = {0x0001, 0x03ff, 0x0400, 0x3555, 0x3c00, 0x3c01, 0x7400, 0xbc01};
++        static const uint16_t denominators[] = {0x3c01, 0x3d55, 0x4000, 0x4200, 0xbc01, 0xc001};
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op)) { continue; }
++            if (!strcmp(t->name, "div_a") || !strcmp(t->name, "div_b")) {
++                const bool a = !strcmp(t->name, "div_a");
++                std::vector<uint16_t> data(ggml_nelements(t));
++                for (size_t i = 0; i < data.size(); ++i) {
++                    data[i] = a ? numerators[i % 8] : denominators[i % 6];
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(uint16_t));
++            } else { init_tensor_uniform(t, 1.0f, 1.0f); }
++        }
++    }
++};
++
+ struct test_bin_bcast : public test_case {
+     using op_t = ggml_tensor * (*) (ggml_context *, ggml_tensor *, ggml_tensor *);
+     op_t op;
+@@ -12170,6 +12206,13 @@
+             }
+         }
+     }
++    for (int64_t n : {63, 64, 65, 129}) {
++        for (int mode : {0, 1, 2}) {
++            for (int offset : {0, 1}) {
++                test_cases.emplace_back(new test_f16_div_precision(n, mode, offset));
++            }
++        }
++    }
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
+@@ -12426,6 +12469,14 @@
+     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1,   1, 1, 1}));
+     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1, 512, 1, 1}));
+ 
++    // Vector, row broadcast, and scalar-per-row half division.
++    for (int rows : {1, 64}) {
++        test_cases.emplace_back(new test_bin_bcast(ggml_div, GGML_TYPE_F16, {4096, rows, 1, 1}, {1, 1, 1, 1}));
++        test_cases.emplace_back(new test_bin_bcast(ggml_div, GGML_TYPE_F16, {4096, 1, 1, 1}, {1, rows, 1, 1}));
++        test_cases.emplace_back(new test_bin_bcast(ggml_div, GGML_TYPE_F16, {1, rows, 1, 1}, {4096, 1, 1, 1}));
++    }
++
++
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F16,  {512, 3072, 1, 1}));
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F32,  {8192, 512, 2, 1}, {-1,-1,-1,-1}, {0, 2, 1, 3}));
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F32,  {3072, 512, 2, 1}, {-1,-1,-1,-1}, {0, 2, 1, 3}));
