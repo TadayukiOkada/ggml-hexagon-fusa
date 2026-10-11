@@ -574,7 +574,14 @@ int op_im2col(struct htp_ops_context * octx) {
     // Clean non-overlapping patch-embed -> DMA kernel (if it fits VTCM);
     // everything else (padding/dilation/stride edges) -> blocked-staging DMA
     // kernel; if neither fits VTCM -> pure-DDR kernel.
-    if (nrows > 0) {
+    // Row kernels cannot yield inside one output row. Long 1D audio convolutions
+    // can have just one multi-MiB row; use patch rounds below for those shapes.
+#ifdef HTP_YIELD_IN_OPS
+    const bool row_fits_yield_budget = dst->nb[2] <= (2u << 20);
+#else
+    const bool row_fits_yield_budget = true;
+#endif
+    if (nrows > 0 && row_fits_yield_budget) {
         const uint32_t pth = MIN(octx->n_threads, nrows);
         if (pth > 0) {
             ictx.pe_row_base = row_base;
