@@ -758,40 +758,14 @@ static void fa_q_load_thread(unsigned int n, unsigned int i, void * data) {
         const size_t m_start       = i * m_bytes_per_t;
         const size_t m_end         = hex_smin(m_start + m_bytes_per_t, col_vec_bytes);
 
-        if (factx->sinks) {
-            const float * sinks_data = factx->vtcm_sinks;
-            float *       m_vec      = (float *) factx->vtcm_m_vec;
-            const size_t  r_start    = l_start / sizeof(float);
-            const size_t  r_end      = l_end / sizeof(float);
-            const float   scale_factor = EXP_LOG2E_F;
-
-            const HVX_Vector v_scale = hvx_vec_splat_f32(scale_factor);
-
-            for (size_t r = r_start; r < r_end; r += 32) {
-                HVX_VectorAlias local_m;
-                for (size_t j = 0; j < 32; ++j) {
-                    size_t curr_r = r + j;
-                    if (curr_r < n_rows_g) {
-                        const size_t h_idx = fastmodulo(curr_r, G, &factx->div_G);
-                        const size_t head  = args->kv_head * G + h_idx;
-                        local_m.fp32[j] = sinks_data[head];
-                    } else {
-                        local_m.fp32[j] = HTP_FA_M_INITIAL_VAL;
-                    }
-                }
-                HVX_Vector v_scaled = HVX_OP_MUL_F32(local_m.v, v_scale);
-                *(HVX_Vector *) (m_vec + r) = v_scaled;
-            }
-            if (l_start < col_vec_bytes) {
-                hvx_splat_u8_a((char *) factx->vtcm_l_vec + l_start, 0, l_end - l_start);
-            }
-        } else {
-            if (l_start < col_vec_bytes) {
-                hvx_splat_u8_a((char *) factx->vtcm_l_vec + l_start, 0, l_end - l_start);
-            }
-            if (m_start < col_vec_bytes) {
-                hvx_splat_f32_a((char *) factx->vtcm_m_vec + m_start, HTP_FA_M_INITIAL_VAL, (m_end - m_start) / sizeof(float));
-            }
+        // Accumulate only real KV rows here. Sinks are added in f32 at the
+        // final normalization; seeding m with a f32 sink would round it to f16
+        // inside the block softmax while keeping an unrounded row maximum.
+        if (l_start < col_vec_bytes) {
+            hvx_splat_u8_a((char *) factx->vtcm_l_vec + l_start, 0, l_end - l_start);
+        }
+        if (m_start < col_vec_bytes) {
+            hvx_splat_f32_a((char *) factx->vtcm_m_vec + m_start, HTP_FA_M_INITIAL_VAL, (m_end - m_start) / sizeof(float));
         }
 
         // Zero the whole rescale region: vtcm_d_tiles[0], the optional vtcm_d_tiles[1]
@@ -1085,7 +1059,6 @@ typedef struct {
     uint32_t                  kv_start;
     uint32_t                  q_start;
     uint32_t                  ib3;
-    bool                      first_block;  // first KV block of this Q block (fully masked blocks are skipped)
     bool                      has_alibi;  // true when max_bias != 0 (need slope * mask + add)
     __fp16 *                  slopes;
     const struct htp_tensor * mask;
@@ -1480,6 +1453,13 @@ static inline void fa_softmax_impl(
 
         HVX_Vector v_m_diff_f16   = hvx_vec_f32_to_f16(v_m_diff0, v_m_diff1);
         HVX_Vector exp_m_diff_f16 = fa_exp2_f16(v_m_diff_f16);
+        if (factx->sinks != NULL) {
+            // fa_exp2_f16(0) is off by an ulp. Without a sink O and l absorb the same factor,
+            // but the sink term is added in f32 at the end: keep the rescale of a row whose
+            // maximum did not change exactly 1 so the error does not compound over the blocks.
+            const HVX_VectorPred q_same = Q6_Q_vcmp_eq_VhVh(Q6_V_vand_VV(v_m_diff_f16, Q6_Vh_vsplat_R(0x7fff)), Q6_V_vzero());
+            exp_m_diff_f16 = Q6_V_vmux_QVV(q_same, Q6_Vh_vsplat_R(0x3c00), exp_m_diff_f16);
+        }
 
         HVX_VectorPair exp_m_diff_pair = hvx_vec_f16_to_f32(exp_m_diff_f16);
         HVX_Vector exp_m_diff0 = Q6_V_lo_W(exp_m_diff_pair);
@@ -1489,21 +1469,10 @@ static inline void fa_softmax_impl(
         HVX_Vector     v_rowsum_acc_f32_0 = Q6_V_lo_W(rowsum_acc_pair);
         HVX_Vector     v_rowsum_acc_f32_1 = Q6_V_hi_W(rowsum_acc_pair);
 
-        HVX_Vector v_l_curr0;
-        HVX_Vector v_l_curr1;
-        if (args->first_block && factx->sinks != NULL) {
-            // First KV block with sinks: m_prev holds the seeded sink value (not -inf),
-            // so exp_m_diff = exp2(sink - m_curr) is the sink's contribution to the
-            // denominator. l_prev is 0 here, so add exp_m_diff directly instead of
-            // multiplying the (uninitialized) l_prev term.
-            v_l_curr0 = HVX_OP_ADD_F32(exp_m_diff0, v_rowsum_acc_f32_0);
-            v_l_curr1 = HVX_OP_ADD_F32(exp_m_diff1, v_rowsum_acc_f32_1);
-        } else {
-            HVX_Vector l_prev_v0 = factx->vtcm_l_vec[r_vec_idx * 2 + 0];
-            HVX_Vector l_prev_v1 = factx->vtcm_l_vec[r_vec_idx * 2 + 1];
-            v_l_curr0 = HVX_OP_ADD_F32(HVX_OP_MUL_F32(l_prev_v0, exp_m_diff0), v_rowsum_acc_f32_0);
-            v_l_curr1 = HVX_OP_ADD_F32(HVX_OP_MUL_F32(l_prev_v1, exp_m_diff1), v_rowsum_acc_f32_1);
-        }
+        HVX_Vector l_prev_v0 = factx->vtcm_l_vec[r_vec_idx * 2 + 0];
+        HVX_Vector l_prev_v1 = factx->vtcm_l_vec[r_vec_idx * 2 + 1];
+        HVX_Vector v_l_curr0 = HVX_OP_ADD_F32(HVX_OP_MUL_F32(l_prev_v0, exp_m_diff0), v_rowsum_acc_f32_0);
+        HVX_Vector v_l_curr1 = HVX_OP_ADD_F32(HVX_OP_MUL_F32(l_prev_v1, exp_m_diff1), v_rowsum_acc_f32_1);
 
         factx->vtcm_m_vec[r_vec_idx * 2 + 0] = v_m_curr0;
         factx->vtcm_m_vec[r_vec_idx * 2 + 1] = v_m_curr1;
@@ -1575,9 +1544,27 @@ static void fa_softmax_thread(unsigned int n, unsigned int i, void * data) {
     fa_softmax_impl(n, i, data, has_mask, mask_broadcast, is_g1, has_alibi, has_softcap);
 }
 
+// O is relative to the maximum of the real KV logits, in log2 units. With
+// sinks, normalize relative to max(m, sink) to avoid overflowing exp(sink - m).
+static HVX_Vector fa_inv_l_with_sink(const struct hmx_fa_context * factx, size_t vec_idx, size_t kv_head) {
+    HVX_VectorAlias sink;
+    for (size_t j = 0; j < 32; ++j) {
+        const size_t g = fastmodulo(vec_idx * 32 + j, factx->G, &factx->div_G);
+        sink.fp32[j] = factx->vtcm_sinks[kv_head * factx->G + g];
+    }
+    const HVX_Vector s = HVX_OP_MUL_F32(sink.v, hvx_vec_splat_f32(EXP_LOG2E_F));
+    const HVX_Vector m = factx->vtcm_m_vec[vec_idx];
+    const HVX_Vector mf = Q6_Vsf_vmax_VsfVsf(m, s);
+    const HVX_Vector ln2 = hvx_vec_splat_f32(0.6931471805599453f);
+    const HVX_Vector em = hvx_vec_exp_f32(HVX_OP_MUL_F32(HVX_OP_SUB_F32(m, mf), ln2));
+    const HVX_Vector es = hvx_vec_exp_f32(HVX_OP_MUL_F32(HVX_OP_SUB_F32(s, mf), ln2));
+    const HVX_Vector l = HVX_OP_ADD_F32(HVX_OP_MUL_F32(factx->vtcm_l_vec[vec_idx], em), es);
+    return HVX_OP_MUL_F32(em, hvx_vec_inverse_f32(l));
+}
+
 static __attribute__((noinline)) void fa_build_d_diag_inv_l(struct hmx_fa_context * factx,
                                                             size_t                  n_row_tiles,
-                                                            size_t                  n_row_tiles_g_br) {
+                                                            size_t                  kv_head) {
     const HVX_Vector     v_offsets = *(const HVX_Vector *) d_tile_scatter_offsets;
     const HVX_VectorPred q_32_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
     const HVX_Vector     one       = hvx_vec_splat_f32(1.0f);
@@ -1587,6 +1574,10 @@ static __attribute__((noinline)) void fa_build_d_diag_inv_l(struct hmx_fa_contex
         if ((i % 2) == 0) {
             HVX_Vector inv_lo = HVX_OP_MUL_F32(one, hvx_vec_inverse_f32(factx->vtcm_l_vec[i]));
             HVX_Vector inv_hi = (i + 1 < n_row_tiles) ? HVX_OP_MUL_F32(one, hvx_vec_inverse_f32(factx->vtcm_l_vec[i + 1])) : Q6_V_vzero();
+            if (factx->sinks) {
+                inv_lo = fa_inv_l_with_sink(factx, i, kv_head);
+                inv_hi = (i + 1 < n_row_tiles) ? fa_inv_l_with_sink(factx, i + 1, kv_head) : Q6_V_vzero();
+            }
             v_content = hvx_vec_f32_to_f16(inv_lo, inv_hi);
         } else {
             v_content = Q6_V_vror_VR(v_content, 64);
@@ -1985,7 +1976,11 @@ static void fa_vtcm_setup(struct hmx_fa_context *            factx,
 
     // HMX output scales
     hmx_init_column_scales(factx->vtcm_hmx_scales_id, Q6_V_vsplat_R(0x3c00)); // 1.0
-    hmx_init_column_scales(factx->vtcm_hmx_scales_qk, hvx_vec_splat_f16(factx->scale));
+    // Each word packs the fp16 scale in the low half and the fp16 bias in
+    // the high half. A halfword splat would add scale to every QK logit,
+    // changing its weight relative to a sink (also before softcap/ALiBi).
+    hmx_init_column_scales(factx->vtcm_hmx_scales_qk,
+                           Q6_V_vand_VV(hvx_vec_splat_f16(factx->scale), Q6_V_vsplat_R(0x0000ffff)));
 
     if (factx->sinks) {
         dma_queue_push(dma_q, dma_make_data(factx->vtcm_sinks, factx->sinks->data), L->sinks_bytes, 0, factx->sinks->size, 1);
@@ -2252,7 +2247,8 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     }
 
     hmx_init_column_scales(base + L.scales_id, Q6_V_vsplat_R(0x3c00));  // 1.0
-    hmx_init_column_scales(base + L.scales_qk, hvx_vec_splat_f16(proto->scale));
+    hmx_init_column_scales(base + L.scales_qk,
+                           Q6_V_vand_VV(hvx_vec_splat_f16(proto->scale), Q6_V_vsplat_R(0x0000ffff)));
     if (proto->sinks) {
         dma_queue_push(dq, dma_make_data(base + L.sinks, proto->sinks->data), hex_round_up(proto->n_heads * sizeof(float), 128), 0,
                        proto->sinks->size, 1);
@@ -2388,7 +2384,6 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
             s->kv_start             = kv_start;
             s->q_start              = q_start;
             s->ib3                  = 0;
-            s->first_block          = ib == 0;
             s->has_alibi            = false;
             s->mask                 = zero_mask ? NULL : mask;
             s->mask_vtcm            = mask ? (const __fp16 *) (base + L.mask[b]) : NULL;
@@ -2420,7 +2415,7 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     // O / l and the store
     for (uint32_t h = 0; h < n_h; h++) {
         struct hmx_fa_context * f = &hd[h].f;
-        fa_build_d_diag_inv_l(f, n_row_tiles, n_row_tiles_g_br);
+        fa_build_d_diag_inv_l(f, n_row_tiles, kvh0 + h);
         hd[h].on = (hmx_fa_o_norm_job_t) { f->vtcm_o_tiles[o_cur], f->vtcm_o_tiles[1 - o_cur], f->vtcm_d_inv_l, f->vtcm_hmx_scales_id,
                                            n_row_tiles, n_row_tiles_g_br, DV };
     }
@@ -2867,7 +2862,6 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.kv_start             = kv_start;
                         sargs.q_start              = q_start;
                         sargs.ib3                  = ib3;
-                        sargs.first_block          = kv_blk == 0;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
                         sargs.mask                 = FA_BLK_ZERO_MASK(q_start, blk_lo + kv_blk) ? NULL : mask;
                         sargs.mask_vtcm            = sargs.mask ? current_mask_vtcm : NULL;
@@ -2911,7 +2905,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                         htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
-                        fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
+                        fa_build_d_diag_inv_l(&factx, n_row_tiles, kv_head);
                         htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
                         hmx_queue_pop(hmx_q);
 
@@ -2992,7 +2986,6 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.kv_start             = kv_start;
                         sargs.q_start              = q_start;
                         sargs.ib3                  = ib3;
-                        sargs.first_block          = kv_blk == 0;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
                         sargs.mask                 = FA_BLK_ZERO_MASK(q_start, blk_lo + kv_blk) ? NULL : mask;
                         sargs.mask_vtcm            = sargs.mask ? current_mask_vtcm : NULL;
@@ -3017,7 +3010,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             if (kv_blk + 1 == n_blocks) {
                                 // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                                 htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
-                                fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
+                                fa_build_d_diag_inv_l(&factx, n_row_tiles, kv_head);
                                 htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
                             }
                             hmx_queue_pop(ctx->hmx_queue);

@@ -1,0 +1,58 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8658,6 +8658,38 @@
+     }
+ };
+ 
++// With Q/K = 0 and V = 1, attention has an analytic result. Choose sinks
++// near log(KV) so their contribution is large, and vary it across GQA heads.
++struct test_fa_sink_normalization : public test_flash_attn_ext {
++    ggml_tensor * out = nullptr;
++    test_fa_sink_normalization(int64_t kv, int64_t nb, int64_t g, bool mask)
++        : test_flash_attn_ext(256, 256, 4, {g, 1}, kv, nb, mask, true) {}
++    std::string op_desc(ggml_tensor *) override { return "FA_SINK_NORMALIZATION"; }
++    // Match the upstream FA bound, including the HVX f16 row-sum error.
++    double max_nmse_err() override { return 5e-4; }
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        out = test_flash_attn_ext::build_graph(ctx);
++        return out;
++    }
++    void initialize_tensors(ggml_context * ctx) override {
++        ggml_tensor * vbase = out->src[2];
++        while (vbase->view_src) { vbase = vbase->view_src; }
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op)) { continue; }
++            if (!strcmp(t->name, "s")) {
++                std::vector<float> data(ggml_nelements(t));
++                for (size_t h = 0; h < data.size(); ++h) {
++                    data[h] = logf(float(kv)) + 0.2137f + float(h % 4) * 0.5131f;
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
++            } else {
++                const float value = t == vbase ? 1.0f : 0.0f;
++                init_tensor_uniform(t, value, value);
++            }
++        }
++    }
++};
++
+ // GGML_OP_CROSS_ENTROPY_LOSS
+ struct test_cross_entropy_loss : public test_case {
+     const ggml_type type;
+@@ -12129,6 +12160,15 @@
+         }
+         test_cases.emplace_back(new test_gdn_decay(64, 127, 2, 2, g_lo));
+     }
++    for (int64_t kv : {256, 512, 513, 2048}) {
++        for (int64_t nb : {1, 3, 33}) {
++            for (int64_t g : {1, 4}) {
++                for (bool mask : {false, true}) {
++                    test_cases.emplace_back(new test_fa_sink_normalization(kv, nb, g, mask));
++                }
++            }
++        }
++    }
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
