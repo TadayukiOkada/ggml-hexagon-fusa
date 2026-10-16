@@ -477,7 +477,8 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
 
 struct ggml_hexagon_tensor_extra {
     std::vector<uint8_t> shadow_buf;
-    size_t               shadow_size { 0 };
+    std::vector<std::pair<size_t, size_t>> shadow_ranges;
+    bool                 repack_initialized { false };
     uint32_t             flags { 0 };
     uint32_t             n_mm_uses { 0 };  // RMS_NORM+MUL output used only as the activation of this many matmuls
 };
@@ -2487,6 +2488,50 @@ static void repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t 
     }
 }
 
+static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
+    const ggml_tensor * tensor, void * data, size_t offset, size_t size);
+
+// Initial multipart uploads track covered ranges rather than byte counts:
+// overlapping writes must not publish an incomplete tiled tensor. Later partial
+// writes reconstruct standard blocks so untouched rows survive re-tiling.
+static void update_repack_shadow(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+    const void * data, size_t offset, size_t size, size_t n_copies,
+    size_t stride_tensor, size_t stride_data) {
+    auto extra = (ggml_hexagon_tensor_extra *) tensor->extra;
+    const size_t total = ggml_nbytes(tensor);
+    if (size == 0 || n_copies == 0) return;
+    if (extra->shadow_buf.empty()) {
+        extra->shadow_buf.resize(total);
+        if (extra->repack_initialized)
+            ggml_backend_hexagon_buffer_get_tensor(buffer, tensor, extra->shadow_buf.data(), 0, total);
+    }
+    for (size_t i = 0; i < n_copies; ++i) {
+        const size_t begin = offset + i * stride_tensor;
+        GGML_ASSERT(begin <= total && size <= total - begin);
+        memcpy(extra->shadow_buf.data() + begin, (const uint8_t *) data + i * stride_data, size);
+        if (!extra->repack_initialized) extra->shadow_ranges.emplace_back(begin, begin + size);
+    }
+    bool complete = extra->repack_initialized;
+    if (!complete) {
+        std::sort(extra->shadow_ranges.begin(), extra->shadow_ranges.end());
+        std::vector<std::pair<size_t, size_t>> merged;
+        for (const auto & range : extra->shadow_ranges) {
+            if (!merged.empty() && range.first <= merged.back().second)
+                merged.back().second = std::max(merged.back().second, range.second);
+            else merged.push_back(range);
+        }
+        extra->shadow_ranges.swap(merged);
+        complete = extra->shadow_ranges.size() == 1 && extra->shadow_ranges[0].first == 0 &&
+            extra->shadow_ranges[0].second == total;
+    }
+    if (complete) {
+        repack_tensor_tiled(tensor, extra->shadow_buf.data(), total);
+        extra->repack_initialized = true;
+        std::vector<uint8_t>().swap(extra->shadow_buf);
+        std::vector<std::pair<size_t, size_t>>().swap(extra->shadow_ranges);
+    }
+}
+
 static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                    ggml_tensor *         tensor,
                                                    const void *          data,
@@ -2511,23 +2556,14 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         return;
     }
 
-    if (offset == 0 && size == ggml_nbytes(tensor) && extra->shadow_buf.empty()) {
+    if (offset == 0 && size == ggml_nbytes(tensor)) {
         repack_tensor_tiled(tensor, data, size);
+        extra->repack_initialized = true;
+        std::vector<uint8_t>().swap(extra->shadow_buf);
+        std::vector<std::pair<size_t, size_t>>().swap(extra->shadow_ranges);
         return;
     }
-
-    if (extra->shadow_buf.size() < ggml_nbytes(tensor)) {
-        extra->shadow_buf.resize(ggml_nbytes(tensor));
-    }
-    memcpy(extra->shadow_buf.data() + offset, data, size);
-    extra->shadow_size += size;
-
-    if (extra->shadow_size >= ggml_nbytes(tensor)) {
-        repack_tensor_tiled(tensor, extra->shadow_buf.data(), extra->shadow_buf.size());
-        extra->shadow_buf.clear();
-        extra->shadow_buf.shrink_to_fit();
-        extra->shadow_size = 0;
-    }
+    update_repack_shadow(buffer, tensor, data, offset, size, 1, 0, 0);
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -2654,20 +2690,7 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
         return;
     }
 
-    if (extra->shadow_buf.size() < ggml_nbytes(tensor)) {
-        extra->shadow_buf.resize(ggml_nbytes(tensor));
-    }
-    for (size_t i = 0; i < n_copies; i++) {
-        memcpy(extra->shadow_buf.data() + offset + i * stride_tensor, (const uint8_t *) data + i * stride_data, size);
-    }
-    extra->shadow_size += n_copies * size;
-
-    if (extra->shadow_size >= ggml_nbytes(tensor)) {
-        repack_tensor_tiled(tensor, extra->shadow_buf.data(), extra->shadow_buf.size());
-        extra->shadow_buf.clear();
-        extra->shadow_buf.shrink_to_fit();
-        extra->shadow_size = 0;
-    }
+    update_repack_shadow(buffer, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
@@ -4840,7 +4863,7 @@ void ggml_hexagon_session::enqueue_mdev_group() {
 
     uint8_t * fence_slot = this->mdev_fence_slot;
 
-    static ggml_hexagon_tensor_extra fence_extra { {}, 0, GGML_HEXAGON_TENSOR_FENCE };
+    static ggml_hexagon_tensor_extra fence_extra { {}, {}, false, GGML_HEXAGON_TENSOR_FENCE };
     ggml_tensor dummy_t {};
     dummy_t.buffer       = &this->fence_buf->backend_buffer;
     dummy_t.extra        = &fence_extra;
@@ -9028,7 +9051,7 @@ static bool ggml_hexagon_cpy_tensor_async_phys(ggml_backend_t backend_src, ggml_
                 sess_dst->name.c_str(), src->name, dst->name, ggml_nbytes(src), fence_seq);
 
     // dummy fence extra (must be static)
-    static ggml_hexagon_tensor_extra fence_extra { {}, 0, GGML_HEXAGON_TENSOR_FENCE };
+    static ggml_hexagon_tensor_extra fence_extra { {}, {}, false, GGML_HEXAGON_TENSOR_FENCE };
 
     ggml_tensor fence_tensor {};
     fence_tensor.buffer = &sess_dst->fence_buf->backend_buffer;
@@ -9084,6 +9107,9 @@ static bool ggml_backend_hexagon_cpy_tensor_async(ggml_backend_t backend_src, gg
     auto * dst_extra = static_cast<ggml_hexagon_tensor_extra *>(dst->extra);
     const auto * src_extra = static_cast<const ggml_hexagon_tensor_extra *>(src->extra);
     dst_extra->flags = src_extra->flags & ~GGML_HEXAGON_TENSOR_FUSEABLE;
+    dst_extra->repack_initialized = src_extra->repack_initialized;
+    dst_extra->shadow_buf.clear();
+    dst_extra->shadow_ranges.clear();
 
     auto sess_src = static_cast<ggml_hexagon_session *>(backend_src->context);
     auto sess_dst = static_cast<ggml_hexagon_session *>(backend_dst->context);
@@ -9109,7 +9135,7 @@ static ggml_backend_event_t ggml_backend_hexagon_device_event_new(ggml_backend_d
     hex_event->sess       = sess;
     hex_event->fence_slot = (volatile uint32_t *) sess->alloc_fence(1);
 
-    static ggml_hexagon_tensor_extra fence_extra { {}, 0, GGML_HEXAGON_TENSOR_FENCE };
+    static ggml_hexagon_tensor_extra fence_extra { {}, {}, false, GGML_HEXAGON_TENSOR_FENCE };
     hex_event->fence_tensor.buffer = &sess->fence_buf->backend_buffer;
     hex_event->fence_tensor.extra  = &fence_extra;
     hex_event->fence_tensor.data   = (void *) hex_event->fence_slot;
@@ -9763,7 +9789,7 @@ static void * ggml_backend_hexagon_comm_init(ggml_backend_t * backends, size_t n
     ctx->backends.assign(backends, backends + n_backends);
     ctx->n_backends = n_backends;
 
-    static ggml_hexagon_tensor_extra fence_extra { {}, 0, GGML_HEXAGON_TENSOR_FENCE };
+    static ggml_hexagon_tensor_extra fence_extra { {}, {}, false, GGML_HEXAGON_TENSOR_FENCE };
     for (size_t i = 0; i < n_backends; i++) {
         auto sess_i = static_cast<ggml_hexagon_session *>(backends[i]->context);
         ctx->fence_slots[i] = (volatile uint32_t *) sess_i->alloc_fence(1);
