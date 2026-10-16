@@ -8,16 +8,16 @@
 #
 # --split puts tools and backend modules in bin/ and the other libraries and
 # the skels in lib/, the layout of an upstream llama.cpp install (the QDC test
-# scripts in llama.cpp/scripts/snapdragon/qdc expect it). For a GGML_HEXAGON_ASR
-# build it also adds nemo-speech to bin/ and NeMo's own ggml libraries to
-# lib/nemo-speech/, with run-asr.sh: both use the same libggml-hexagon.so and
-# skels.
+# scripts in llama.cpp/scripts/snapdragon/qdc expect it).
 #
-# --asr packages only the speech recognition of a GGML_HEXAGON_ASR build, flat:
-# nemo-speech with its own ggml libraries, plus libggml-hexagon.so and the skels
-# of the same build. The flat llama.cpp package cannot hold it, since the ggml of
-# the llama.cpp tools loads its backends as modules and NeMo's has the CPU
-# backend linked in, under the same library names.
+# A GGML_HEXAGON_ASR build adds NeMo-Speech.cpp speech recognition and run-asr.sh:
+# nemo-speech with NeMo's own ggml libraries in nemo-speech/ (flat) or with the
+# tools in bin/ and the libraries in lib/nemo-speech/ (--split). The ggml of the
+# llama.cpp tools loads its backends as modules and NeMo's has the CPU backend
+# linked in, under the same library names, so they cannot share a directory.
+# Both use the same libggml-hexagon.so and skels.
+#
+# --asr packages only the speech recognition, flat.
 #
 # PACKAGE_FORBIDDEN (extended regex) adds patterns that must not appear in
 # any packaged file. The source dir, build dir and $HOME are always checked.
@@ -54,9 +54,6 @@ with_asr=0
 if [ $asr -eq 1 ] && [ $with_asr -eq 0 ]; then
     echo "package: no $nemo/nemo-speech (configure with GGML_HEXAGON_ASR=ON)" >&2; exit 2
 fi
-[ $split -eq 0 ] && [ $asr -eq 0 ] && [ $with_asr -eq 1 ] && \
-    echo "package: the flat package leaves out speech recognition; use --split or --asr for it" >&2
-[ $split -eq 0 ] && [ $asr -eq 0 ] && with_asr=0
 
 # NeMo: nemo-speech (and its storage test) with NeMo's own ggml libraries.
 copy_nemo() {  # <dir for executables> <dir for libraries>
@@ -108,7 +105,7 @@ case $tool in nemo-speech|test_backend_storage) lib=$d/lib/nemo-speech:$d/lib ;;
 ADSP_LIBRARY_PATH="$d/lib;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
 LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/bin/$tool" "$@"
 RUN
-    exe='$d/bin' libs='$d/lib/nemo-speech' skels='$d/lib'
+    exe='$d/bin' libs='$d/lib/nemo-speech' skels='$d/lib' hex='$d/bin'
 else
 cat > "$out/run.sh" <<'RUN'
 #!/bin/sh
@@ -116,12 +113,21 @@ cat > "$out/run.sh" <<'RUN'
 # The skels are loaded from this directory, ahead of ADSP_LIBRARY_PATH. When that is
 # unset, the usual firmware library directories follow; boards that keep them
 # elsewhere should export ADSP_LIBRARY_PATH (';' separated) first.
+# nemo-speech and test_backend_storage live in nemo-speech/ with NeMo's own ggml;
+# all tools share libggml-hexagon.so and the skels here.
 d=$(cd "$(dirname "$0")" && pwd)
 tool=$1; shift
+exe=$d lib=$d
+case $tool in nemo-speech|test_backend_storage) exe=$d/nemo-speech lib=$d/nemo-speech:$d ;; esac
 ADSP_LIBRARY_PATH="$d;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
-LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/$tool" "$@"
+LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$exe/$tool" "$@"
 RUN
-    exe='$d' libs='$d' skels='$d'
+    exe='$d' libs='$d' skels='$d' hex='$d'
+    if [ $with_asr -eq 1 ] && [ $asr -eq 0 ]; then
+        mkdir -p "$out/nemo-speech"
+        copy_nemo "$out/nemo-speech" "$out/nemo-speech"
+        exe='$d/nemo-speech' libs='$d/nemo-speech'
+    fi
 fi
 chmod +x "$out/run.sh"
 
@@ -140,12 +146,12 @@ d=$(cd "$(dirname "$0")" && pwd)
 model=$1 audio=$2; shift 2
 dev=${ASR_DEVICE:-HTP0}
 RUN
-        echo "exe=\"$exe\" libs=\"$libs\" skels=\"$skels\""
+        echo "exe=\"$exe\" libs=\"$libs\" skels=\"$skels\" hex=\"$hex\""
         cat <<'RUN'
 GGML_HEXAGON_DEVICES=${GGML_HEXAGON_DEVICES:-$dev} \
 ADSP_LIBRARY_PATH="$skels;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
 LD_LIBRARY_PATH="$libs:$skels${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$exe/nemo-speech" transcribe "$audio" --model "$model" \
-    --backend hexagon --backend-lib "$exe/libggml-hexagon.so" --device "$dev" --frontend cpu --stream --no-batching \
+    --backend hexagon --backend-lib "$hex/libggml-hexagon.so" --device "$dev" --frontend cpu --stream --no-batching \
     --no-warmup --asr.batching.state_arena_slots 1 --asr.backend.threads 4 --asr.backend.position_backend cpu \
     --asr.streaming.rnnt_right_context 3 "$@"
 RUN

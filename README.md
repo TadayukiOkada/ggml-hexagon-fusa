@@ -51,7 +51,7 @@ but changes all numerics slightly.
 cmake --preset arm64-oe-linux-v73-fusa -B build
 cmake --build build -j
 scripts/package.sh build pkg          # flat directory with run.sh and BUILD_INFO.txt
-scripts/package.sh --split build pkg  # bin/ + lib/, the layout of an upstream install (adds speech recognition, below)
+scripts/package.sh --split build pkg  # bin/ + lib/, the layout of an upstream install
 ```
 
 `libggml-hexagon.so` and `libggml-htp-v*.so` embed one build ID; the host
@@ -147,11 +147,12 @@ pkg/run-asr.sh nemotron-3.5-asr-streaming-0.6b.q8_0.gguf input.wav --language ja
 ASR_DEVICE=HTP1 pkg/run-asr.sh ...    # the encoder on the second CDSP
 ```
 
-`--split` puts `nemo-speech` in `bin/` next to the llama.cpp tools and NeMo's own
-ggml libraries in `lib/nemo-speech/`: the ggml of the llama.cpp tools loads its
-backends as modules, NeMo's has the CPU backend linked in, under the same
-library names. Both load the same `bin/libggml-hexagon.so` and skels in `lib/`.
-`--asr` makes a flat package with speech recognition only.
+NeMo's own ggml libraries go to `nemo-speech/` with `nemo-speech` (flat
+package), or to `lib/nemo-speech/` with `nemo-speech` in `bin/` (`--split`): the
+ggml of the llama.cpp tools loads its backends as modules, NeMo's has the CPU
+backend linked in, under the same library names. Both load the same
+`libggml-hexagon.so` and skels. `--asr` makes a flat package with speech
+recognition only.
 
 Separate processes can use the HTP at the same time, each with its own DSP
 session: for example a llama.cpp tool on `HTP0` and `ASR_DEVICE=HTP1`, or both on
