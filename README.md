@@ -71,6 +71,26 @@ with VTCM/HMX maxima since the session opened (not per batch).
 or peer sees; `hold-max-us` also counts holds nobody asked to end, so it can be
 as long as a whole batch.
 
+`GGML_HEXAGON_IO_TRACE=<new-file.jsonl>` enables startup-only host I/O
+diagnostics. The file is created exclusively, flushed after each record, and
+limited to 128 MiB; a `truncated` record means the capture is incomplete.
+If the file cannot be created or written, a warning is logged and tracing
+stops; inference continues. Disabled mode adds no file I/O or device
+synchronization. Recording changes host timing, so use separate
+uninstrumented runs for performance comparisons.
+
+Tensor records contain names, buffer usage, handler request lengths and known
+completed host `memcpy` calls. Repack internals are unmeasured (`null`), except
+for the explicitly identified output staging copy in the 2D get handler.
+CPU-only copies, buffer-clear `memset` and physical DMA/DRAM traffic are outside
+this capture. Initialization and lazy weight loads are included; buffer usage
+and application lifecycle markers are needed to separate them from inference.
+
+Queue records pair successful batch submissions with received DSP responses
+(`HTP_STATUS_OK=1`). `batch_submit.queued_ops` counts published descriptors;
+`graph_dispatch.queued_ops` counts enqueue attempts before queue fusion. These
+are neither individual FastRPC invocation counts nor DSP execution durations.
+
 ## Relation to upstream
 
 The backend sources start from upstream `ggml/src/ggml-hexagon/`. The
