@@ -683,10 +683,14 @@ struct ggml_hexagon_rpcmem_block {
     }
 };
 
+static std::atomic<uint64_t> ggml_hexagon_metadata_sequence { 1 };
+
 struct ggml_hexagon_shared_buffer {
     ggml_hexagon_session *                     sess;
     std::shared_ptr<ggml_hexagon_rpcmem_block> mem;
-    std::vector<ggml_hexagon_tensor_extra *>   tensor_extra;
+    std::vector<ggml_hexagon_tensor_extra *>   tensor_extra;      // pool, reused after reset
+    size_t   n_tensor_extra = 0;                                  // pool entries handed out since the last reset
+    uint64_t metadata_epoch = ggml_hexagon_metadata_sequence.fetch_add(1);
     bool     mapped;
     bool     pinned;
     bool     extended;
@@ -862,8 +866,15 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
     HEX_VERBOSE("ggml-hex: %s init-tensor %s : base %p data %p nbytes %zu\n", sess->c_name(),
                 tensor->name, (void *) sbuf->base(), tensor->data, ggml_nbytes(tensor));
 
-    auto extra = new ggml_hexagon_tensor_extra();
-    sbuf->tensor_extra.push_back(extra);
+    ggml_hexagon_tensor_extra * extra;
+    if (sbuf->n_tensor_extra < sbuf->tensor_extra.size()) {
+        extra  = sbuf->tensor_extra[sbuf->n_tensor_extra];
+        *extra = ggml_hexagon_tensor_extra();
+    } else {
+        extra = new ggml_hexagon_tensor_extra();
+        sbuf->tensor_extra.push_back(extra);
+    }
+    sbuf->n_tensor_extra++;
 
     tensor->extra = extra;
     if (ggml_hexagon_is_repack_type(tensor->type)) {
@@ -2785,6 +2796,38 @@ static void ggml_backend_hexagon_buffer_clear(ggml_backend_buffer_t buffer, uint
     memset(sbuf->base(), value, sbuf->size());
 }
 
+// Graph allocators reset their reusable pools before initializing the next
+// graph. Metadata belongs to that allocation epoch, not to the pool's entire
+// lifetime; retaining it on every reallocation grows without bound. Entries are
+// recycled rather than freed, so a stale alias bound outside the allocator never
+// dangles; the epoch tells such aliases to reinitialize.
+static void ggml_backend_hexagon_buffer_reset(ggml_backend_buffer_t buffer) {
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    HEX_VERBOSE("ggml-hex: %s reset-buffer tensor-extras %zu pool %zu\n",
+                sbuf->c_name(), sbuf->n_tensor_extra, sbuf->tensor_extra.size());
+    sbuf->n_tensor_extra = 0;
+    sbuf->metadata_epoch = ggml_hexagon_metadata_sequence.fetch_add(1);
+    sbuf->sess->cached_uid = 0;
+    sbuf->sess->cached_nodes.clear();
+}
+
+static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b);
+
+// Optional host-only lifetime diagnostic; not a DSP mapping inventory. Counts
+// allocated metadata (the pool), which stays bounded across resets.
+static size_t ggml_backend_hexagon_buffer_metadata_count(ggml_backend_buffer_t buffer) {
+    if (!buffer || !ggml_backend_buffer_is_hexagon(buffer))
+        return SIZE_MAX;
+    return static_cast<ggml_hexagon_shared_buffer *>(buffer->context)->tensor_extra.size();
+}
+
+// Changes on every reset. 0 means not a Hexagon buffer (no epoch tracking).
+static uint64_t ggml_backend_hexagon_buffer_metadata_epoch(ggml_backend_buffer_t buffer) {
+    if (!buffer || !ggml_backend_buffer_is_hexagon(buffer))
+        return 0;
+    return static_cast<ggml_hexagon_shared_buffer *>(buffer->context)->metadata_epoch;
+}
+
 static ggml_backend_buffer_i ggml_backend_hexagon_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_hexagon_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_hexagon_buffer_get_base,
@@ -2796,7 +2839,7 @@ static ggml_backend_buffer_i ggml_backend_hexagon_buffer_interface = {
     /* .get_tensor_2d   = */ ggml_backend_hexagon_buffer_get_tensor_2d,
     /* .cpy_tensor      = */ ggml_backend_hexagon_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_hexagon_buffer_clear,
-    /* .reset           = */ NULL,
+    /* .reset           = */ ggml_backend_hexagon_buffer_reset,
 };
 
 // ** backend buffer type
@@ -2830,7 +2873,7 @@ static ggml_backend_buffer_i ggml_backend_hexagon_host_buffer_interface = {
     /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_hexagon_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_hexagon_buffer_clear,
-    /* .reset           = */ NULL,
+    /* .reset           = */ ggml_backend_hexagon_buffer_reset,
 };
 
 // ** backend buffer type
@@ -9917,6 +9960,12 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
 
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_buffer_metadata_count") == 0) {
+        return (void *) ggml_backend_hexagon_buffer_metadata_count;
+    }
+    if (strcmp(name, "ggml_backend_buffer_metadata_epoch") == 0) {
+        return (void *) ggml_backend_hexagon_buffer_metadata_epoch;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }
