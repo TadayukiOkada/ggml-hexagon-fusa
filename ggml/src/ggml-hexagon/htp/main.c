@@ -289,7 +289,23 @@ AEEResult htp_iface_munmap(remote_handle64 handle, uint32 fd) {
 static void vtcm_acquire(struct htp_context * ctx) {
     if (!atomic_load(&ctx->vtcm_valid)) {
         if (ctx->profiler) atomic_store(&ctx->resource_request_us, 0);
-        int err = HAP_compute_res_acquire_cached(ctx->vtcm_rctx, 10000000u);
+        // The resource manager takes the caller's thread priority as the request priority. Ask at
+        // the lowered priority the resources are held with (below), so that two sessions on one
+        // CDSP do not take them from each other at every op boundary: a client above both (the
+        // NSP self-test on FuSa firmware) then kept losing the handover to the other session and
+        // waited up to 0.5 s. Sessions now hand over when the holder runs out of work or when a
+        // higher-priority client asks; waiting behind a whole batch is why the wait is retried.
+        qurt_thread_t self = qurt_thread_get_id();
+        const int prio = qurt_thread_get_priority(self);
+        const int low  = ctx->thread_prio + 10;
+        if (prio < low) qurt_thread_set_priority(self, low);
+        int err = 0;
+        for (int i = 0; i < 6; i++) {
+            err = HAP_compute_res_acquire_cached(ctx->vtcm_rctx, 10000000u);
+            if (err == 0) break;
+            FARF(ERROR, "ggml-hex: VTCM not acquired in 10 s (try %d): 0x%08x", i + 1, (unsigned)err);
+        }
+        if (prio < low) qurt_thread_set_priority(self, prio);
         if (err != 0) {
             FARF(ERROR, "ggml-hex: failed to acquire VTCM: 0x%08x", (unsigned)err);
             abort();
