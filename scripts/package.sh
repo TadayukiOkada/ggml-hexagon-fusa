@@ -152,7 +152,10 @@ fi
 
 # A path counts only where it starts: not inside a longer path such as a toolchain's own build path.
 re_quote() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|]/\\&/g'; }
-pattern="(^|[^A-Za-z0-9_./-])($(re_quote "$top")|$(re_quote "$build")|$(re_quote "${HOME%/}"))/"
+paths="$(re_quote "$top")|$(re_quote "$build")"
+home=${HOME%/}
+[ -n "$home" ] && paths="$paths|$(re_quote "$home")"  # not when HOME is / (a container without a user entry)
+pattern="(^|[^A-Za-z0-9_./-])($paths)/"
 [ -n "${PACKAGE_FORBIDDEN:-}" ] && pattern="$pattern|$PACKAGE_FORBIDDEN"
 bad=0
 for f in $(find "$out" -type f); do
