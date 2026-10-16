@@ -8,12 +8,16 @@
 #
 # --split puts tools and backend modules in bin/ and the other libraries and
 # the skels in lib/, the layout of an upstream llama.cpp install (the QDC test
-# scripts in llama.cpp/scripts/snapdragon/qdc expect it).
+# scripts in llama.cpp/scripts/snapdragon/qdc expect it). For a GGML_HEXAGON_ASR
+# build it also adds nemo-speech to bin/ and NeMo's own ggml libraries to
+# lib/nemo-speech/, with run-asr.sh: both use the same libggml-hexagon.so and
+# skels.
 #
-# --asr packages the speech recognition of a GGML_HEXAGON_ASR build instead:
+# --asr packages only the speech recognition of a GGML_HEXAGON_ASR build, flat:
 # nemo-speech with its own ggml libraries, plus libggml-hexagon.so and the skels
-# of the same build. It cannot share a directory with the llama.cpp tools, whose
-# ggml loads its backends as modules.
+# of the same build. The flat llama.cpp package cannot hold it, since the ggml of
+# the llama.cpp tools loads its backends as modules and NeMo's has the CPU
+# backend linked in, under the same library names.
 #
 # PACKAGE_FORBIDDEN (extended regex) adds patterns that must not appear in
 # any packaged file. The source dir, build dir and $HOME are always checked.
@@ -36,14 +40,34 @@ strip_debug() {
     done
     echo "package: no strip could read $1" >&2; return 1
 }
+strip_dir() {
+    for f in "$1"/*; do
+        case $(basename "$f") in libggml-htp-v*.so) continue ;; esac
+        [ -f "$f" ] && head -c 4 "$f" | grep -q $'\x7fELF' && { strip_debug "$f" || exit 1; }
+    done
+    return 0
+}
+
+nemo=$build/asr/nemo-build/bin
+with_asr=0
+[ -x "$nemo/nemo-speech" ] && with_asr=1
+if [ $asr -eq 1 ] && [ $with_asr -eq 0 ]; then
+    echo "package: no $nemo/nemo-speech (configure with GGML_HEXAGON_ASR=ON)" >&2; exit 2
+fi
+[ $split -eq 0 ] && [ $asr -eq 0 ] && [ $with_asr -eq 1 ] && \
+    echo "package: the flat package leaves out speech recognition; use --split or --asr for it" >&2
+[ $split -eq 0 ] && [ $asr -eq 0 ] && with_asr=0
+
+# NeMo: nemo-speech (and its storage test) with NeMo's own ggml libraries.
+copy_nemo() {  # <dir for executables> <dir for libraries>
+    for f in "$nemo"/nemo-speech "$nemo"/test_backend_storage; do [ -f "$f" ] && cp -L "$f" "$1/"; done
+    for f in "$nemo"/lib*.so*; do [ -f "$f" ] && cp -L "$f" "$2/"; done
+    strip_dir "$1"; strip_dir "$2"
+}
 
 rm -rf "$out"; mkdir -p "$out"
 if [ $asr -eq 1 ]; then
-    nemo=$build/asr/nemo-build/bin
-    [ -x "$nemo/nemo-speech" ] || { echo "package: no $nemo/nemo-speech (configure with GGML_HEXAGON_ASR=ON)" >&2; exit 2; }
-    for f in "$nemo"/nemo-speech "$nemo"/test_backend_storage "$nemo"/lib*.so*; do
-        [ -f "$f" ] && cp -L "$f" "$out/"
-    done
+    copy_nemo "$out" "$out"
     cp "$build"/bin/libggml-hexagon.so "$out/"
 else
     for f in "$build"/bin/*; do
@@ -56,11 +80,7 @@ else
     done
 fi
 cp "$build"/ggml/src/ggml-hexagon/libggml-htp-v*.so "$out/"
-
-for f in "$out"/*; do
-    case $(basename "$f") in libggml-htp-v*.so) continue ;; esac
-    if head -c 4 "$f" | grep -q $'\x7fELF'; then strip_debug "$f" || exit 1; fi
-done
+strip_dir "$out"
 
 if [ $split -eq 1 ]; then
     mkdir -p "$out/bin" "$out/lib"
@@ -72,14 +92,23 @@ if [ $split -eq 1 ]; then
             *) mv "$f" "$out/bin/" ;;
         esac
     done
+    if [ $with_asr -eq 1 ]; then
+        mkdir -p "$out/lib/nemo-speech"
+        copy_nemo "$out/bin" "$out/lib/nemo-speech"
+    fi
     cat > "$out/run.sh" <<'RUN'
 #!/bin/sh
 # usage: ./run.sh <tool> [args...]
+# nemo-speech and test_backend_storage use NeMo's own ggml in lib/nemo-speech;
+# all tools share bin/libggml-hexagon.so and the skels in lib/.
 d=$(cd "$(dirname "$0")" && pwd)
 tool=$1; shift
+lib=$d/lib
+case $tool in nemo-speech|test_backend_storage) lib=$d/lib/nemo-speech:$d/lib ;; esac
 ADSP_LIBRARY_PATH="$d/lib;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
-LD_LIBRARY_PATH="$d/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/bin/$tool" "$@"
+LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/bin/$tool" "$@"
 RUN
+    exe='$d/bin' libs='$d/lib/nemo-speech' skels='$d/lib'
 else
 cat > "$out/run.sh" <<'RUN'
 #!/bin/sh
@@ -92,37 +121,45 @@ tool=$1; shift
 ADSP_LIBRARY_PATH="$d;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
 LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/$tool" "$@"
 RUN
+    exe='$d' libs='$d' skels='$d'
 fi
 chmod +x "$out/run.sh"
 
-if [ $asr -eq 1 ]; then
-    cat > "$out/run-asr.sh" <<'RUN'
+if [ $with_asr -eq 1 ]; then
+    {
+        cat <<'RUN'
 #!/bin/sh
 # usage: ./run-asr.sh <model.gguf> <input.wav> [nemo-speech transcribe options]
 #   (e.g. ./run-asr.sh nemotron-asr.gguf input.wav --language ja-JP --json)
-# Streaming recognition with the encoder on HTP0 (GGML_HEXAGON_DEVICES) and the
-# audio front end and position encoding on the CPU. The skels are loaded from this
-# directory, ahead of ADSP_LIBRARY_PATH, as in run.sh.
+# Streaming recognition with the encoder on the HTP and the audio front end and
+# position encoding on the CPU. ASR_DEVICE picks the HTP (default HTP0 = the
+# first CDSP; HTP1 = the second). The skels are loaded ahead of ADSP_LIBRARY_PATH,
+# as in run.sh.
 d=$(cd "$(dirname "$0")" && pwd)
 [ $# -ge 2 ] || { echo "usage: $0 <model.gguf> <input.wav> [options]" >&2; exit 2; }
 model=$1 audio=$2; shift 2
-GGML_HEXAGON_DEVICES=${GGML_HEXAGON_DEVICES:-HTP0} \
-ADSP_LIBRARY_PATH="$d;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
-LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/nemo-speech" transcribe "$audio" --model "$model" \
-    --backend hexagon --backend-lib "$d/libggml-hexagon.so" --frontend cpu --stream --no-batching --no-warmup \
-    --asr.batching.state_arena_slots 1 --asr.backend.threads 4 --asr.backend.position_backend cpu \
+dev=${ASR_DEVICE:-HTP0}
+RUN
+        echo "exe=\"$exe\" libs=\"$libs\" skels=\"$skels\""
+        cat <<'RUN'
+GGML_HEXAGON_DEVICES=${GGML_HEXAGON_DEVICES:-$dev} \
+ADSP_LIBRARY_PATH="$skels;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
+LD_LIBRARY_PATH="$libs:$skels${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$exe/nemo-speech" transcribe "$audio" --model "$model" \
+    --backend hexagon --backend-lib "$exe/libggml-hexagon.so" --device "$dev" --frontend cpu --stream --no-batching \
+    --no-warmup --asr.batching.state_arena_slots 1 --asr.backend.threads 4 --asr.backend.position_backend cpu \
     --asr.streaming.rnnt_right_context 3 "$@"
 RUN
+    } > "$out/run-asr.sh"
     chmod +x "$out/run-asr.sh"
 fi
 
 # Licenses of what the package contains: this backend, llama.cpp/ggml and the
-# notices llama.cpp ships, and for --asr NeMo-Speech.cpp and SentencePiece.
+# notices llama.cpp ships, and with speech recognition NeMo-Speech.cpp and SentencePiece.
 lic=$out/licenses; mkdir -p "$lic"
 cp "$top/LICENSE" "$lic/LICENSE"
 cp "$top/llama.cpp/LICENSE" "$lic/llama.cpp-LICENSE"
 for f in "$top"/llama.cpp/licenses/*; do [ -f "$f" ] && cp "$f" "$lic/llama.cpp-$(basename "$f")"; done
-if [ $asr -eq 1 ]; then
+if [ $with_asr -eq 1 ]; then
     for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md; do cp "$top/NeMo-Speech.cpp/$f" "$lic/NeMo-Speech.cpp-$f"; done
     echo "NeMo-Speech.cpp is built with the changes in asr/patches of ggml-hexagon-fusa." > "$lic/NeMo-Speech.cpp-MODIFIED"
     spm=$build/asr/sentencepiece/src/sentencepiece
@@ -139,7 +176,7 @@ fi
 {
     echo "build-id:   $(cat "$build/hexagon-build-id.txt")"
     echo "llama.cpp:  $(git -C "$top/llama.cpp" rev-parse HEAD)"
-    if [ $asr -eq 1 ]; then
+    if [ $with_asr -eq 1 ]; then
         echo "NeMo-Speech.cpp: $(git -C "$top/NeMo-Speech.cpp" rev-parse HEAD) + asr/patches"
         (cd "$top" && sha256sum asr/patches/*.patch)
     fi
