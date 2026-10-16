@@ -107,6 +107,13 @@ struct htp_context {
     uint32_t               vtcm_rctx;
     atomic_bool            vtcm_valid;
     atomic_bool            vtcm_needs_release;
+    // Opt-in profiler diagnostics; timestamps only at resource boundaries.
+    uint64_t               resource_acquired_us;
+    atomic_uint            resource_request_us;
+    uint32_t               resource_hold_max_us;
+    uint32_t               resource_response_max_us;
+    uint32_t               resource_requests_served;
+    uint32_t               resource_releases;
 
     uint64_t               max_vmem;
     struct htp_dirty_range dirty_ranges[HTP_MAX_DIRTY_RANGES];

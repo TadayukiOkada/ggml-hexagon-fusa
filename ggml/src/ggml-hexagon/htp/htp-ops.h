@@ -275,6 +275,12 @@ struct htp_opbatch_rsp {
     uint32_t n_ops;          // Number of op profile descriptors
     uint32_t usecs;          // Number of usec
     uint32_t n_traces[HTP_MAX_NTHREADS + 1];
+    // VTCM/HMX profiler counters, cumulative since session open (profiler only)
+    uint32_t resource_hold_max_us;      // longest acquire -> release, requested or not
+    uint32_t resource_response_max_us;  // longest release request -> release
+    uint32_t resource_requests_served;
+    uint32_t resource_releases;
+    uint32_t resource_pending_us;       // age of a request still unserved at response time
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 

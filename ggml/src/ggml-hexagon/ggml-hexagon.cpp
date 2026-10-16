@@ -249,6 +249,11 @@ static void ggml_hexagon_dump_batch_prof(const char * sess_name, const htp_opbat
 
     GGML_LOG_DEBUG("ggml-hex: %s profile-op OPBATCH|----|n-ops %u|%s|----|----|usec %u cycles %llu start %llu mhz %.1f\n",
                    sess_name, rsp.n_ops, evt_str, rsp.usecs, (unsigned long long) batch_cycles, (unsigned long long) rsp.cycles_start, batch_mhz);
+    // Session maxima, not per batch. response (release request -> release) is what
+    // a waiting STL or peer sees; hold also counts holds nobody asked to end.
+    GGML_LOG_DEBUG("ggml-hex: %s profile-resource session response-max-us %u requests %u pending-us %u hold-max-us %u releases %u\n",
+                   sess_name, rsp.resource_response_max_us, rsp.resource_requests_served,
+                   rsp.resource_pending_us, rsp.resource_hold_max_us, rsp.resource_releases);
 }
 
 static void ggml_hexagon_dump_trace_events(const char * sess_name, const htp_opbatch_rsp & rsp,
