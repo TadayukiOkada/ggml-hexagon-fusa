@@ -65,6 +65,12 @@ logs it (`ggml-hex: HTP0 build ...`).
   firmware shell, for imports the shell does not export. FuSa builds run it.
 - CI builds the Android and Linux presets for all HTP generations.
 
+With `GGML_HEXAGON_PROFILE=1`, each batch also logs a `profile-resource` line
+with VTCM/HMX maxima since the session opened (not per batch).
+`response-max-us` (release request to release) is the delay a waiting self-test
+or peer sees; `hold-max-us` also counts holds nobody asked to end, so it can be
+as long as a whole batch.
+
 ## Relation to upstream
 
 The backend sources start from upstream `ggml/src/ggml-hexagon/`. The

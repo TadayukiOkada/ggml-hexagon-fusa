@@ -288,6 +288,7 @@ AEEResult htp_iface_munmap(remote_handle64 handle, uint32 fd) {
 
 static void vtcm_acquire(struct htp_context * ctx) {
     if (!ctx->vtcm_valid) {
+        if (ctx->profiler) atomic_store(&ctx->resource_request_us, 0);
         int err = HAP_compute_res_acquire_cached(ctx->vtcm_rctx, 10000000u);
         if (err != 0) {
             FARF(ERROR, "ggml-hex: failed to acquire VTCM: 0x%08x", (unsigned)err);
@@ -296,6 +297,9 @@ static void vtcm_acquire(struct htp_context * ctx) {
 
         ctx->vtcm_needs_release = false;
         ctx->vtcm_valid = true;
+        if (ctx->profiler) {
+            ctx->resource_acquired_us = HAP_perf_get_time_us();
+        }
 
         // Drop the priority to make sure we get the release callback from other GGML-HTP and QNN-HTP sessions
         HAP_compute_res_update_priority(ctx->vtcm_rctx, ctx->thread_prio + 10);
@@ -307,11 +311,33 @@ static void vtcm_release(struct htp_context * ctx) {
         ctx->vtcm_valid         = false;
         ctx->vtcm_needs_release = false;
         HAP_compute_res_release_cached(ctx->vtcm_rctx);
+        if (ctx->profiler && ctx->resource_acquired_us) {
+            const uint64_t now = HAP_perf_get_time_us();
+            const uint64_t span = now - ctx->resource_acquired_us;
+            const uint32_t bounded = span > UINT32_MAX ? UINT32_MAX : (uint32_t) span;
+            if (bounded > ctx->resource_hold_max_us) ctx->resource_hold_max_us = bounded;
+            const uint32_t request = atomic_exchange(&ctx->resource_request_us, 0);
+            if (request) {
+                // Low-word subtraction handles clock wrap for bounded request
+                // delays. The callback writes through a native 32-bit atomic.
+                const uint32_t delay = (uint32_t) now - request;
+                if (delay > ctx->resource_response_max_us) ctx->resource_response_max_us = delay;
+                ctx->resource_requests_served++;
+            }
+            ctx->resource_releases++;
+            ctx->resource_acquired_us = 0;
+        }
     }
 }
 
 static int vtcm_release_callback(unsigned int rctx, void * state) {
     struct htp_context * ctx = (struct htp_context *) state;
+    if (ctx->profiler && ctx->vtcm_valid) {
+        unsigned int expected = 0;
+        unsigned int now = (uint32_t) HAP_perf_get_time_us();
+        if (!now) now = 1;
+        atomic_compare_exchange_strong(&ctx->resource_request_us, &expected, now);
+    }
     ctx->vtcm_needs_release = true;
     return 0;
 }
@@ -1364,6 +1390,18 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.usecs        = batch_prof.usecs;
     rsp.cycles_start = batch_prof.cycles_start;
     rsp.cycles_stop  = batch_prof.cycles_stop;
+    if (ctx->profiler) {
+        const uint64_t now = HAP_perf_get_time_us();
+        uint64_t open_span = ctx->resource_acquired_us ? now - ctx->resource_acquired_us : 0;
+        if (open_span > UINT32_MAX) open_span = UINT32_MAX;
+        rsp.resource_hold_max_us = ctx->resource_hold_max_us > open_span ?
+            ctx->resource_hold_max_us : (uint32_t) open_span;
+        rsp.resource_response_max_us = ctx->resource_response_max_us;
+        rsp.resource_requests_served = ctx->resource_requests_served;
+        rsp.resource_releases = ctx->resource_releases;
+        const uint32_t request = atomic_load(&ctx->resource_request_us);
+        rsp.resource_pending_us = request ? (uint32_t) now - request : 0;
+    }
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
