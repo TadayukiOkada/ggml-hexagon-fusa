@@ -44,6 +44,14 @@
       }
     },
     {
+      "name": "arm64-oe-linux-v73-fusa-asr",
+      "displayName": "arm64-oe-linux-v73-fusa plus NeMo-Speech.cpp speech recognition",
+      "inherits": "arm64-oe-linux-v73-fusa",
+      "cacheVariables": {
+        "GGML_HEXAGON_ASR": "ON"
+      }
+    },
+    {
       "name": "arm64-android-release",
       "displayName": "ARM64 Android, upstream defaults (SDK 6.x, all HTP archs), for checking the other generations",
       "generator": "Ninja",

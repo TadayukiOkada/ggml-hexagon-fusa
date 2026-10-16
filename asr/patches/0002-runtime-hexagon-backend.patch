@@ -1,0 +1,1343 @@
+diff --git a/src/runtime/ggml/backend.cpp b/src/runtime/ggml/backend.cpp
+index c57fad9..024e2fe 100644
+--- a/src/runtime/ggml/backend.cpp
++++ b/src/runtime/ggml/backend.cpp
+@@ -7,6 +7,10 @@
+ #include <algorithm>
+ #include <cstdlib>
+ #include <mutex>
++#include <filesystem>
++#if defined(__linux__)
++#include <dlfcn.h>
++#endif
+ 
+ #include "model_logging.h"
+ #include "runtime.h"
+@@ -14,6 +18,31 @@
+ namespace ggml_runtime {
+ 
+ namespace {
++std::string
++packaged_hexagon_library() {
++#if defined(__linux__)
++    namespace fs = std::filesystem;
++    std::vector<fs::path> roots;
++    Dl_info owner{};
++    if (dladdr(reinterpret_cast<void*>(&packaged_hexagon_library), &owner) && owner.dli_fname) {
++        std::error_code ec;
++        const auto path = fs::canonical(owner.dli_fname, ec);
++        if (!ec) roots.push_back(path.parent_path());
++    }
++    std::error_code ec;
++    const auto executable = fs::read_symlink("/proc/self/exe", ec);
++    if (!ec) roots.push_back(executable.parent_path());
++    for (const auto& root : roots) {
++        for (const auto& dir : {root, root.parent_path() / "lib"}) {
++            const auto candidate = dir / "libggml-hexagon.so";
++            if (fs::is_regular_file(candidate, ec) && !ec) return candidate.string();
++            ec.clear();
++        }
++    }
++#endif
++    return {};
++}
++
+ void
+ set_environment_default(const char* name, const char* value) {
+     if (std::getenv(name) != nullptr) {
+@@ -67,11 +96,61 @@ BackendManager::init_backends() {
+         ggml_free(ctx);
+     }
+ 
++    if (!params.backend_kind.empty() && params.backend_kind != "cpu" && params.backend_kind != "hexagon")
++        throw std::runtime_error("unsupported explicit backend: " + params.backend_kind);
++    if (!params.frontend_policy.empty() && params.frontend_policy != "cpu" && params.frontend_policy != "backend")
++        throw std::runtime_error("unsupported frontend: " + params.frontend_policy);
++    if (!params.decoder_backend.empty() && params.decoder_backend != "cpu" && params.decoder_backend != "backend")
++        throw std::runtime_error("unsupported decoder backend: " + params.decoder_backend);
++    ggml_backend_dev_t selected_hexagon = nullptr;
++    if (params.backend_kind == "hexagon") {
++        namespace fs = std::filesystem;
++        auto library = params.backend_library;
++        if (library.empty()) {
++            if (const char* env = std::getenv("NEMO_SPEECH_HEXAGON_LIBRARY")) library = env;
++        }
++        if (library.empty()) library = packaged_hexagon_library();
++        if (library.empty())
++            throw std::runtime_error("hexagon module not found beside the ASR library/executable; provide --backend-lib or NEMO_SPEECH_HEXAGON_LIBRARY");
++        std::error_code ec;
++        const auto path = fs::canonical(library, ec);
++        if (ec) throw std::runtime_error("hexagon module path: " + library + ": " + ec.message());
++        static std::mutex module_mutex;
++        static std::string loaded_path;
++        static ggml_backend_reg_t loaded_reg = nullptr;
++        std::lock_guard<std::mutex> lock(module_mutex);
++        if (loaded_reg && loaded_path != path.string())
++            throw std::runtime_error("conflicting Hexagon module path in one process");
++        if (!loaded_reg) {
++            auto reg = ggml_backend_load(path.string().c_str());
++            if (!reg) throw std::runtime_error("hexagon module load/API failure: " + path.string());
++            if (std::string(ggml_backend_reg_name(reg)) != "HTP")
++                throw std::runtime_error(std::string("requested module is not the Hexagon HTP registry: ") + ggml_backend_reg_name(reg));
++            loaded_reg = reg;
++            loaded_path = path.string();
++        }
++        const auto name = params.backend_device.empty() ? "HTP0" : params.backend_device;
++        for (size_t i = 0; i < ggml_backend_reg_dev_count(loaded_reg); ++i) {
++            auto candidate = ggml_backend_reg_dev_get(loaded_reg, i);
++            if (name == ggml_backend_dev_name(candidate)) selected_hexagon = candidate;
++        }
++        if (!selected_hexagon) throw std::runtime_error("Hexagon device not found: " + name);
++        GGMLF_LOG_INFO("Explicit Hexagon registry: %s; module: %s; device: %s\n",
++                       ggml_backend_reg_name(loaded_reg), loaded_path.c_str(), name.c_str());
++    }
+     auto dev_count = ggml_backend_dev_count();
+     GGMLF_LOG_INFO("Found %zu devices.\n", dev_count);
+ 
+     ggml_backend_dev_t dev = nullptr;
+-    if (borrowed_gpu_backend_ != nullptr) {
++    if (selected_hexagon) {
++        auto backend = ggml_backend_dev_init(selected_hexagon, nullptr);
++        if (!backend) throw std::runtime_error("Hexagon device initialization failed");
++        gpu_backend = backend;
++        backends.emplace_back(backend);
++        buft_list.emplace_back(selected_hexagon, ggml_backend_dev_buffer_type(selected_hexagon));
++    } else if (borrowed_gpu_backend_ != nullptr) {
++        if (!params.backend_kind.empty())
++            throw std::runtime_error("explicit backend cannot borrow a legacy GPU");
+         dev = ggml_backend_get_device(borrowed_gpu_backend_);
+         const auto dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+         if (dev == nullptr || (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+@@ -84,7 +163,7 @@ BackendManager::init_backends() {
+         }
+         gpu_backend = borrowed_gpu_backend_;
+         GGMLF_LOG_INFO("Using borrowed GPU backend: %s\n", ggml_backend_name(gpu_backend));
+-    } else if (params.use_gpu) {
++    } else if (params.backend_kind.empty() && params.use_gpu) {
+         int idx = 0;
+         for (int i = 0; i < dev_count; i++) {
+             ggml_backend_dev_t dev_cur = ggml_backend_dev_get(i);
+@@ -124,7 +203,7 @@ BackendManager::init_backends() {
+ 
+     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
++        if (params.backend_kind.empty() && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+             GGMLF_LOG_INFO("Using %s backend\n", ggml_backend_dev_name(dev));
+             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+             if (!backend) {
+diff --git a/src/runtime/ggml/nn.cpp b/src/runtime/ggml/nn.cpp
+index c407b14..41e33c2 100644
+--- a/src/runtime/ggml/nn.cpp
++++ b/src/runtime/ggml/nn.cpp
+@@ -185,7 +185,7 @@ ReLU::build_graph(
+     Session* session, TensorBag input_tensors, TensorContainer* session_tensor_container) {
+     auto input_tensor = input_tensors.get_tensor(0);
+     ggml_bf_context bf_ctx = session_tensor_container->get_ctx_of_buffer_type(input_tensor.buft);
+-    ggml_tensor* relu_tensor = ggml_relu_inplace(bf_ctx.ctx, input_tensor.tensor);
++    ggml_tensor* relu_tensor = ggml_runtime::graph_relu(session->params, bf_ctx.ctx, input_tensor.tensor);
+     auto output_tensor_bag = TensorBag();
+     output_tensor_bag.add_tensor(ggml_bf_tensor(relu_tensor, bf_ctx.buft));
+     return output_tensor_bag;
+@@ -312,7 +312,7 @@ Linear::build_graph(
+                                     input_tensor.tensor->ne[2] * input_tensor.tensor->ne[3] > 1;
+         output_tensor = fuse_bf16_bias
+                             ? ggml_add(bf_ctx.ctx, matmul_ret, bias_tensor.tensor)
+-                            : ggml_add_inplace(bf_ctx.ctx, matmul_ret, bias_tensor.tensor);
++                            : ggml_runtime::graph_add(session->params, bf_ctx.ctx, matmul_ret, bias_tensor.tensor);
+     } else {
+         output_tensor = matmul_ret;
+     }
+@@ -405,9 +405,9 @@ BatchNorm1d::build_graph(
+     auto eps = session->model_tensor_container->get_tensor_by_name(eps_name);
+ 
+     auto p1 = ggml_sub(bf_ctx.ctx, input_tensor.tensor, running_mean.tensor);
+-    auto p2 = ggml_sqrt_inplace(bf_ctx.ctx, ggml_add(bf_ctx.ctx, running_var.tensor, eps.tensor));
+-    auto p3 = ggml_mul_inplace(bf_ctx.ctx, ggml_div(bf_ctx.ctx, p1, p2), weight.tensor);
+-    auto x = ggml_add_inplace(bf_ctx.ctx, p3, bias.tensor);
++    auto p2 = ggml_runtime::graph_sqrt(session->params, bf_ctx.ctx, ggml_add(bf_ctx.ctx, running_var.tensor, eps.tensor));
++    auto p3 = ggml_runtime::graph_mul(session->params, bf_ctx.ctx, ggml_div(bf_ctx.ctx, p1, p2), weight.tensor);
++    auto x = ggml_runtime::graph_add(session->params, bf_ctx.ctx, p3, bias.tensor);
+     auto output_tensors = TensorBag();
+     output_tensors.add_tensor(ggml_bf_tensor(x, bf_ctx.buft));
+     return output_tensors;
+diff --git a/src/runtime/ggml/runtime.h b/src/runtime/ggml/runtime.h
+index fe736c8..e564ed6 100644
+--- a/src/runtime/ggml/runtime.h
++++ b/src/runtime/ggml/runtime.h
+@@ -171,6 +171,7 @@ class TensorBag {
+ };
+ 
+ class Session;
++struct NodeReplay;
+ class TensorContainer;
+ 
+ class Module {
+@@ -200,12 +201,36 @@ void keep_cuda_graphs_resident();
+ void keep_skinny_q8_weights_separate();
+ 
+ struct Params {
++    std::string backend_kind;  // empty preserves legacy selection
++    std::string backend_device;
++    std::string backend_library;
++    std::string frontend_policy;
++    std::string decoder_backend; // empty/backend = same backend; cpu = RNNT group on CPU
++    std::string cpu_node_prefix; // Named graph nodes explicitly placed on linked CPU.
+     bool use_gpu = false;
+     int gpu_device_idx = 0;
+     char* pe_bin_path = nullptr;
+     int n_threads = 4;  // CPU backend threads
+ };
+ 
++// In-place arithmetic aliases storage and can pin a fallback node to an
++// incompatible device. Keep independent destinations for explicit Hexagon.
++inline ggml_tensor* graph_add(const Params& p, ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
++    return p.backend_kind == "hexagon" ? ggml_add(ctx, a, b) : ggml_add_inplace(ctx, a, b);
++}
++inline ggml_tensor* graph_mul(const Params& p, ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
++    return p.backend_kind == "hexagon" ? ggml_mul(ctx, a, b) : ggml_mul_inplace(ctx, a, b);
++}
++inline ggml_tensor* graph_scale(const Params& p, ggml_context* ctx, ggml_tensor* a, float scale) {
++    return p.backend_kind == "hexagon" ? ggml_scale(ctx, a, scale) : ggml_scale_inplace(ctx, a, scale);
++}
++inline ggml_tensor* graph_sqrt(const Params& p, ggml_context* ctx, ggml_tensor* a) {
++    return p.backend_kind == "hexagon" ? ggml_sqrt(ctx, a) : ggml_sqrt_inplace(ctx, a);
++}
++inline ggml_tensor* graph_relu(const Params& p, ggml_context* ctx, ggml_tensor* a) {
++    return p.backend_kind == "hexagon" ? ggml_relu(ctx, a) : ggml_relu_inplace(ctx, a);
++}
++
+ // Owns ggml backend handles shared by one or more Sessions.
+ class BackendManager {
+    public:
+@@ -245,6 +270,11 @@ class BackendManager {
+     std::mutex compute_mu_;
+ };
+ 
++// Portable bounded writes for backends without the optional memset callback.
++void tensor_memset(ggml_tensor* tensor, uint8_t value, size_t offset, size_t size);
++
++enum class TensorRole { Default, StaticWeight, MutableState, PreparedCompute, Activation };
++
+ class TensorContainer {
+    public:
+     // Arena sizes for metadata and buffer-type-specific graph contexts.
+@@ -254,6 +284,7 @@ class TensorContainer {
+         std::map<ggml_backend_buffer_type_t, size_t> per_buft;
+         // Leave unnamed intermediates to the scheduler's liveness allocator.
+         bool sched_managed = false;
++        TensorRole default_role = TensorRole::Activation;
+     };
+ 
+     TensorContainer(buft_list_t buft_list, ArenaSizes sizes);
+@@ -269,11 +300,14 @@ class TensorContainer {
+     size_t total_backend_buffer_bytes() const;
+ 
+     void dump_largest_tensors(size_t top_n) const;
++    void dump_buffer_metadata(uint64_t session, uint64_t run, const char* scope) const;
+ 
+     ggml_context* get_temp_ctx();
+-    ggml_bf_context get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft);
++    ggml_bf_context get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft, TensorRole role = TensorRole::Activation);
+     void allocate_tensors_on_backend_buffers();
+     void free_temp_ctx();
++    // Refresh backend-private metadata only when its owning epoch changes.
++    void bind_external_storage(ggml_tensor* tensor, ggml_backend_buffer_t buffer, void* data);
+     ggml_bf_tensor get_tensor_by_name(const std::string& name);
+     bool has_tensor_by_name(const std::string& name);
+     void cache_tensor(std::string name, ggml_bf_tensor tensor);
+@@ -283,13 +317,13 @@ class TensorContainer {
+     ggml_bf_tensor import_tensor(std::string name, ggml_tensor* tensor);
+ 
+     // Declares tensors on the primary device's main buffer type.
+-    ggml_bf_tensor create_tensor_1d(std::string name, ggml_type data_type, int64_t ne0);
++    ggml_bf_tensor create_tensor_1d(std::string name, ggml_type data_type, int64_t ne0, TensorRole role = TensorRole::Default);
+     ggml_bf_tensor create_tensor_2d(
+-        std::string name, ggml_type data_type, int64_t ne0, int64_t ne1);
++        std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, TensorRole role = TensorRole::Default);
+     ggml_bf_tensor create_tensor_3d(
+-        std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, int64_t ne2);
++        std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, int64_t ne2, TensorRole role = TensorRole::Default);
+     ggml_bf_tensor create_tensor_4d(
+-        std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3);
++        std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, TensorRole role = TensorRole::Default);
+ 
+    private:
+     ArenaSizes sizes_;
+@@ -300,11 +334,13 @@ class TensorContainer {
+     // built in get_ctx_of_buffer_type(). ctx_map below holds raw views
+     // (the ggml_bf_context.ctx field) into these contexts.
+     std::vector<ggml_context_ptr> owned_ctxs_;
+-    buft_ctx_map_t ctx_map;
++    std::map<std::pair<ggml_backend_buffer_type_t, TensorRole>, ggml_bf_context> ctx_map;
+     std::vector<ggml_backend_buffer_ptr> backend_buffers;
+     std::map<std::string, ggml_bf_tensor> tensor_lookup;
++    struct ExternalBinding { ggml_backend_buffer_t buffer = nullptr; uint64_t epoch = 0; };
++    std::unordered_map<ggml_tensor*, ExternalBinding> external_bindings_;
+ 
+-    ggml_bf_tensor m_create_tensor(ggml_tensor* meta, std::string& name);
++    ggml_bf_tensor m_create_tensor(ggml_tensor* meta, std::string& name, TensorRole role);
+ };
+ 
+ // Per-stream device storage for a Session's state tensors. The state must
+@@ -411,6 +447,8 @@ class Session {
+ 
+    private:
+     void init_schedule();
++    // Optional per-session diagnostic counter; replay requires a single stream.
++    std::unique_ptr<NodeReplay> node_replay_;
+ 
+     WeightLoadHook weight_load_hook_;
+ 
+@@ -433,8 +471,13 @@ class Session {
+         const std::function<TensorBag(Session*, TensorContainer*)>& define_input_tensors,
+         const std::function<bool(Session*, TensorContainer*)>& set_input_data,
+         const std::function<bool(Session*, TensorBag, TensorContainer*)>& return_output,
+-        SessionState* state);
++        SessionState* state, bool dynamic_device_inputs, bool observe_host_transfers = false);
+ 
++    uint64_t audit_session_id_ = 0;
++    uint64_t audit_run_id_ = 0;
++    uint64_t metadata_probe_run_id_ = 0;
++    size_t audit_upload_bytes_ = 0;
++    size_t audit_readback_bytes_ = 0;
+     BackendManager* backend_manager_;
+     Module* root_module;
+     buft_list_t buft_list;
+@@ -458,8 +501,15 @@ class Session {
+         std::vector<uint8_t> sched_meta;  // backing for gf
+         ggml_cgraph* gf;
+         std::vector<NodeAssignment> schedule;
++        std::string audit_snapshot;
++        uint64_t audit_snapshot_id = 0;
+         // Cleared before allocation so views bind to the current SessionState.
+         std::vector<ggml_tensor*> state_views;
++        // Initially unallocated graph tensors belong to the scheduler pool,
++        // unlike model weights, persistent state and native input buffers.
++        std::vector<ggml_tensor*> scheduler_tensors;
++        std::vector<ggml_tensor*> external_views;
++        std::vector<ggml_tensor*> cpu_nodes;
+         // Entries with stale scheduler-pool placements are rebuilt.
+         uint64_t pool_generation = 0;
+         // Single-backend graphs without state views can bypass the scheduler.
+diff --git a/src/runtime/ggml/schedule_trace.h b/src/runtime/ggml/schedule_trace.h
+new file mode 100644
+index 0000000..1d47cb5
+--- /dev/null
++++ b/src/runtime/ggml/schedule_trace.h
+@@ -0,0 +1,145 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <atomic>
++#include <fstream>
++#include <iomanip>
++#include <mutex>
++#include <sstream>
++
++namespace ggml_runtime {
++// Opt-in metadata diagnostics. No tensor readback or extra synchronization.
++// Buffer addresses are process-local identities, never physical addresses/FDs.
++inline void audit_string(std::ostream& out, const std::string& value) {
++    out << '"';
++    for (unsigned char c : value) {
++        switch (c) {
++            case '"': out << "\\\""; break;
++            case '\\': out << "\\\\"; break;
++            case '\n': out << "\\n"; break;
++            case '\r': out << "\\r"; break;
++            case '\t': out << "\\t"; break;
++            default:
++                if (c < 32) out << "\\u00" << std::hex << std::setw(2)
++                                << std::setfill('0') << unsigned(c) << std::dec;
++                else out << c;
++        }
++    }
++    out << '"';
++}
++inline std::string audit_identity(const void* ptr) {
++    std::ostringstream out;
++    out << ptr;
++    return out.str();
++}
++inline uint64_t audit_next_id() {
++    static std::atomic<uint64_t> id{0};
++    return ++id;
++}
++inline bool audit_enabled() {
++    const char* path = std::getenv("NEMO_SPEECH_SCHEDULE_TRACE");
++    return path && *path;
++}
++inline void audit_write(const std::string& record) {
++    const char* path = std::getenv("NEMO_SPEECH_SCHEDULE_TRACE");
++    if (!path || !*path) return;
++    static std::mutex mutex;
++    static size_t bytes = 0;
++    static bool exhausted = false;
++    std::lock_guard<std::mutex> lock(mutex);
++    if (exhausted) return;
++    std::ofstream out(path, std::ios::app);
++    if (!out) throw std::runtime_error("cannot open schedule trace");
++    constexpr size_t budget = 128 * 1024 * 1024;
++    if (record.size() + 1 > budget - bytes) {
++        out << "{\"event\":\"truncated\",\"budget_bytes\":134217728}\n";
++        exhausted = true;
++    } else {
++        out << record << '\n';
++        bytes += record.size() + 1;
++    }
++    if (!out) throw std::runtime_error("cannot write schedule trace");
++}
++inline bool audit_metadata(const ggml_tensor* t) {
++    return t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW ||
++        t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
++        t->op == GGML_OP_TRANSPOSE;
++}
++inline void audit_tensor(std::ostream& out, const ggml_tensor* t) {
++    out << "{\"name\":"; audit_string(out, t->name);
++    out << ",\"dtype\":"; audit_string(out, ggml_type_name(t->type));
++    out << ",\"ne\":[";
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) out << (d ? "," : "") << t->ne[d];
++    out << "],\"nb\":[";
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) out << (d ? "," : "") << t->nb[d];
++    out << "],\"contiguous\":" << (ggml_is_contiguous(t) ? "true" : "false")
++        << ",\"permuted\":" << (ggml_is_permuted(t) ? "true" : "false")
++        << ",\"logical_bytes\":" << ggml_nbytes(t) << ",\"buffer_id\":";
++    auto buffer = t->buffer ? t->buffer : (t->view_src ? t->view_src->buffer : nullptr);
++    if (buffer) audit_string(out, audit_identity(buffer)); else out << "null";
++    out << ",\"buffer_type\":";
++    if (buffer) audit_string(out, ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer)));
++    else out << "null";
++    out << ",\"usage\":";
++    if (buffer) out << int(ggml_backend_buffer_get_usage(buffer)); else out << "null";
++    out << ",\"view_source\":";
++    if (t->view_src) audit_string(out, t->view_src->name); else out << "null";
++    out << ",\"view_offset\":" << t->view_offs << '}';
++}
++// Called after scheduler allocation (source edges may refer to scheduler copies)
++// or with the known backend on a direct cache hit. These are support decisions,
++// not a claim that each logical node has its own DSP kernel or transfer.
++inline std::string audit_graph(ggml_cgraph* graph, ggml_backend_sched_t sched,
++    ggml_backend_t direct, const std::vector<ggml_backend_t>& backends,
++    const std::vector<ggml_tensor*>& cpu_nodes) {
++    std::ostringstream out;
++    out << '[';
++    const char* cpu_prefix = std::getenv("NEMO_SPEECH_CPU_WEIGHT_PREFIX");
++    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++        auto* node = ggml_graph_node(graph, i);
++        auto selected = direct ? direct : ggml_backend_sched_get_tensor_backend(sched, node);
++        bool policy = std::find(cpu_nodes.begin(), cpu_nodes.end(), node) != cpu_nodes.end();
++        if (cpu_prefix && *cpu_prefix && node->op == GGML_OP_MUL_MAT && node->src[0] &&
++            std::string(node->src[0]->name).find(cpu_prefix) != std::string::npos) policy = true;
++        out << (i ? "," : "") << "{\"index\":" << i << ",\"op\":";
++        audit_string(out, ggml_op_name(node->op));
++        out << ",\"metadata_only\":" << (audit_metadata(node) ? "true" : "false")
++            << ",\"compute_flag\":" << ((node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "true" : "false")
++            << ",\"selected_backend\":";
++        if (selected) audit_string(out, ggml_backend_name(selected)); else out << "null";
++        out << ",\"cpu_policy\":" << (policy ? "true" : "false") << ",\"output\":";
++        audit_tensor(out, node);
++        out << ",\"op_params\": [";
++        for (size_t p = 0; p < sizeof(node->op_params) / sizeof(node->op_params[0]); ++p)
++            out << (p ? "," : "") << node->op_params[p];
++        out << "],\"sources\":[";
++        bool comma = false;
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            if (!node->src[s]) continue;
++            auto* src = node->src[s];
++            auto sb = direct ? direct : ggml_backend_sched_get_tensor_backend(sched, src);
++            out << (comma ? "," : "") << "{\"slot\":" << s << ",\"backend\":";
++            if (sb) audit_string(out, ggml_backend_name(sb)); else out << "null";
++            out << ",\"tensor\":"; audit_tensor(out, src); out << '}';
++            comma = true;
++        }
++        out << "],\"eligibility\":[";
++        for (size_t b = 0; b < backends.size(); ++b) {
++            out << (b ? "," : "") << "{\"backend\":";
++            audit_string(out, ggml_backend_name(backends[b]));
++            const bool supported = ggml_backend_supports_op(backends[b], node);
++            out << ",\"supported\":" << (supported ? "true" : "false") << ",\"reason\":";
++            auto dev = ggml_backend_get_device(backends[b]);
++            auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++            using reason_fn = const char* (*)(ggml_backend_dev_t, const ggml_tensor*);
++            auto fn = reg ? reinterpret_cast<reason_fn>(ggml_backend_reg_get_proc_address(
++                reg, "ggml_backend_hexagon_support_reason")) : nullptr;
++            const char* reason = fn ? fn(dev, node) : (supported ? "supported" : "unknown");
++            audit_string(out, reason ? reason : "unknown");
++            out << '}';
++        }
++        out << "],\"kernel\":null,\"transferred_bytes\":null}";
++    }
++    out << ']';
++    return out.str();
++}
++} // namespace ggml_runtime
+diff --git a/src/runtime/ggml/session.cpp b/src/runtime/ggml/session.cpp
+index 5a33f48..18db572 100644
+--- a/src/runtime/ggml/session.cpp
++++ b/src/runtime/ggml/session.cpp
+@@ -8,14 +8,223 @@
+ #include <chrono>
+ #include <mutex>
+ #include <unordered_set>
++#include <fstream>
++#include <atomic>
++#include <regex>
++#include <cstdio>
++#include <cmath>
++#include <cstring>
++#include <map>
++#include <sstream>
+ 
+ #include "runtime.h"
++#include "schedule_trace.h"
++#include <array>
+ 
+ namespace ggml_runtime {
+ 
++// Diagnostic boundary replacement only. Payloads are validated before use,
++// and the scheduler synchronizes the producer before this callback writes it.
++// This does not replace hidden cache state or establish a production partition.
++struct NodeReplay {
++    struct Record {
++        std::string name, op;
++        std::array<int64_t, 4> ne;
++        std::array<size_t, 4> nb;
++        std::vector<char> data;
++    };
++    struct Config {
++        std::map<size_t, Record> records;
++        std::string name, directory;
++
++        explicit Config(const std::string& directory) : directory(directory) {
++            constexpr size_t budget = 64 * 1024 * 1024;
++            size_t bytes = 0, index;
++            std::ifstream manifest(directory + "/manifest.tsv");
++            if (!manifest) throw std::runtime_error("node replay: cannot read manifest");
++            std::string line;
++            while (std::getline(manifest, line)) {
++                std::istringstream row(line);
++                std::string trailing;
++                if (!(row >> index) || (row >> trailing))
++                    throw std::runtime_error("node replay: invalid manifest row");
++                if (index >= 4096 || records.size() >= 64 || records.count(index))
++                    throw std::runtime_error("node replay: invalid/duplicate occurrence or record limit");
++                const auto base = directory + "/" + std::to_string(index);
++                std::ifstream meta(base + ".tsv");
++                Record record;
++                std::string type, extra;
++                if (!(meta >> record.name >> record.op >> type) || type != "f32")
++                    throw std::runtime_error("node replay: expected f32 metadata");
++                for (auto& v : record.ne) if (!(meta >> v) || v <= 0)
++                    throw std::runtime_error("node replay: invalid dimensions");
++                for (auto& v : record.nb) if (!(meta >> v))
++                    throw std::runtime_error("node replay: invalid strides");
++                if (meta >> extra) throw std::runtime_error("node replay: extra metadata");
++                size_t size = sizeof(float);
++                for (size_t d = 0; d < 4; ++d) {
++                    if (record.nb[d] != size || (uint64_t)record.ne[d] > budget / size)
++                        throw std::runtime_error("node replay: expected bounded contiguous tensor");
++                    size *= (size_t)record.ne[d];
++                }
++                if (size > budget - bytes) throw std::runtime_error("node replay: payload limit");
++                std::ifstream binary(base + ".bin", std::ios::binary | std::ios::ate);
++                if (!binary || binary.tellg() != (std::streamoff)size)
++                    throw std::runtime_error("node replay: payload size mismatch");
++                record.data.resize(size);
++                binary.seekg(0);
++                if (!binary.read(record.data.data(), size))
++                    throw std::runtime_error("node replay: cannot read payload");
++                for (size_t i = 0; i < size; i += sizeof(float)) {
++                    float value;
++                    std::memcpy(&value, record.data.data() + i, sizeof(value));
++                    if (!std::isfinite(value)) throw std::runtime_error("node replay: nonfinite payload");
++                }
++                if (!name.empty() && name != record.name)
++                    throw std::runtime_error("node replay: multiple boundary names");
++                name = record.name;
++                bytes += size;
++                records.emplace(index, std::move(record));
++            }
++            if (!manifest.eof() || records.empty())
++                throw std::runtime_error("node replay: invalid/empty manifest");
++        }
++
++    };
++    std::shared_ptr<const Config> config;
++    size_t occurrence = 0;
++
++    explicit NodeReplay(const std::string& directory) {
++        // One immutable bounded payload per process; counters belong to each
++        // Session. Changing the diagnostic environment after startup is invalid.
++        static const auto shared = std::make_shared<const Config>(directory);
++        if (shared->directory != directory)
++            throw std::runtime_error("node replay: directory changed after startup");
++        config = shared;
++    }
++
++    bool wants(const ggml_tensor* tensor) const { return config->name == tensor->name; }
++
++    void apply(ggml_tensor* tensor) {
++        if (occurrence >= 4096) throw std::runtime_error("node replay: occurrence limit");
++        const auto current = occurrence++;
++        auto found = config->records.find(current);
++        if (found == config->records.end()) return;
++        const auto& record = found->second;
++        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
++            record.op != ggml_op_name(tensor->op) || record.data.size() != ggml_nbytes(tensor))
++            throw std::runtime_error("node replay: target type/op/size mismatch");
++        for (size_t d = 0; d < 4; ++d)
++            if (tensor->ne[d] != record.ne[d] || tensor->nb[d] != record.nb[d])
++                throw std::runtime_error("node replay: target shape/stride mismatch");
++        ggml_backend_tensor_set(tensor, record.data.data(), 0, record.data.size());
++        std::fprintf(stderr, "[node-replay] name=%s occurrence=%zu bytes=%zu\n",
++                     tensor->name, current, record.data.size());
++    }
++};
++
++// Observe scheduler nodes before their storage can be reused. Opt-in only:
++// asking for every node breaks fusion/batching and is never a timing mode.
++static bool
++trace_graph_node(ggml_tensor* t, bool ask, void*) {
++    const char* dir = std::getenv("NEMO_SPEECH_NODE_TRACE_DIR");
++    if (!dir || !*dir) return ask ? false : true;
++    static const auto filter = []() -> std::unique_ptr<const std::regex> {
++        const char* value = std::getenv("NEMO_SPEECH_NODE_TRACE_REGEX");
++        return value && *value ? std::make_unique<const std::regex>(value) : nullptr;
++    }();
++    if (filter && !std::regex_search(t->name, *filter)) return ask ? false : true;
++    static std::mutex mutex;
++    static size_t count = 0, bytes = 0;
++    static bool warned_limit = false;
++    constexpr size_t max_nodes = 4096, max_bytes = 128 * 1024 * 1024;
++    std::lock_guard<std::mutex> lock(mutex);
++    const size_t size = ggml_nbytes(t);
++    if (count >= max_nodes || size > max_bytes - bytes) {
++        if (!warned_limit) {
++            std::fprintf(stderr, "[node-trace] storage limit reached; capture is incomplete\n");
++            warned_limit = true;
++        }
++        return !ask;
++    }
++    if (ask) return true;
++    const std::string base = std::string(dir) + "/" + std::to_string(count++);
++    bytes += size;
++    std::vector<char> data(size);
++    ggml_backend_tensor_get(t, data.data(), 0, size);
++    std::ofstream binary(base + ".bin", std::ios::binary);
++    std::ofstream meta(base + ".tsv");
++    binary.write(data.data(), size);
++    meta << t->name << '\t' << ggml_op_name(t->op) << '\t' << ggml_type_name(t->type);
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) meta << '\t' << t->ne[d];
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) meta << '\t' << t->nb[d];
++    meta << '\n';
++    if (!binary || !meta) throw std::runtime_error("cannot write node trace: " + base);
++    return true;
++}
++
++static bool observe_graph_node(ggml_tensor* tensor, bool ask, void* data) {
++    auto* replay = static_cast<NodeReplay*>(data);
++    const bool replace = replay && replay->wants(tensor);
++    if (ask) return trace_graph_node(tensor, true, nullptr) || replace;
++    if (replace) replay->apply(tensor);
++    return trace_graph_node(tensor, false, nullptr);
++}
++
++// Startup-only selector. Validate before mutating any cached run; a malformed
++// expression fails consistently, and the disabled path performs no regex work.
++static const std::regex* diagnostic_cpu_node_pattern() {
++    static const auto pattern = []() -> std::unique_ptr<const std::regex> {
++        const char* value = std::getenv("NEMO_SPEECH_CPU_NODE_REGEX");
++        return value && *value ? std::make_unique<const std::regex>(value) : nullptr;
++    }();
++    return pattern.get();
++}
++
++// Opt-in differential diagnostics. Read while scheduler-owned outputs are
++// still alive; this intentionally synchronizes and is unsuitable for timing.
++static void
++trace_session_outputs(TensorBag outputs) {
++    const char* dir = std::getenv("NEMO_SPEECH_OUTPUT_TRACE_DIR");
++    if (!dir || !*dir) return;
++    static std::atomic<uint64_t> sequence{0};
++    static std::atomic<size_t> bytes{0};
++    // Bound diagnostic storage even when persistent cache outputs are exposed.
++    constexpr size_t budget = 64 * 1024 * 1024;
++    const auto run = sequence.fetch_add(1);
++    for (size_t i = 0; i < outputs.tensor_count(); ++i) {
++        ggml_tensor* t = outputs.get_tensor(i).tensor;
++        if (!t) continue;
++        const char* filter = std::getenv("NEMO_SPEECH_OUTPUT_TRACE_FILTER");
++        if (filter && *filter && std::string(t->name).find(filter) == std::string::npos) continue;
++        if ((!filter || !*filter) && std::string(t->name).find("encoder.cache.") == 0) continue;
++        if (!ggml_is_contiguous(t)) continue;
++        const auto size = ggml_nbytes(t);
++        auto used = bytes.load();
++        do {
++            if (size > budget - used) {
++                fprintf(stderr, "[output-trace] storage limit reached; skipping %s\n", t->name);
++                break;
++            }
++        } while (!bytes.compare_exchange_weak(used, used + size));
++        if (size > budget - used) continue;
++        std::vector<char> data(size);
++        ggml_backend_tensor_get(t, data.data(), 0, data.size());
++        const std::string base = std::string(dir) + "/" + std::to_string(run) + "-" + std::to_string(i);
++        std::ofstream binary(base + ".bin", std::ios::binary);
++        std::ofstream meta(base + ".tsv");
++        binary.write(data.data(), data.size());
++        meta << t->name << '\t' << ggml_type_name(t->type);
++        for (int d = 0; d < GGML_MAX_DIMS; ++d) meta << '\t' << t->ne[d];
++        meta << '\n';
++        if (!binary || !meta) throw std::runtime_error("cannot write output trace: " + base);
++    }
++}
++
+ Session::~Session() = default;
+ 
+ Session::Session(BackendManager& backend_manager, Module* module, GGUFLoader* gguf_loader) {
++    audit_session_id_ = audit_next_id();
+     this->backend_manager_ = &backend_manager;
+     this->params = backend_manager.get_params();
+     this->root_module = module;
+@@ -76,8 +285,13 @@ memstats_enabled() {
+ 
+ void
+ Session::init_schedule() {
++    const char* replay_directory = std::getenv("NEMO_SPEECH_NODE_REPLAY_DIR");
++    node_replay_ = replay_directory && *replay_directory
++        ? std::make_unique<NodeReplay>(replay_directory) : nullptr;
+     sched.reset(ggml_backend_sched_new(
+         backends.data(), nullptr, backends.size(), kSchedGraphSize, false, false));
++    if (std::getenv("NEMO_SPEECH_NODE_TRACE_DIR") || node_replay_)
++        ggml_backend_sched_set_eval_callback(sched.get(), observe_graph_node, node_replay_.get());
+     // A re-setup() replaces the scheduler and model tensors; cached runs
+     // reference the old ones, and the fresh sched's pools start at 0 so the
+     // size tracker would never flag a change.
+@@ -288,6 +502,8 @@ Session::dump_schedule(std::ostream& out, const std::string& session_label) cons
+ void
+ Session::load_weight(const std::string& gguf_key) {
+     ggml_bf_tensor t = model_tensor_container->get_tensor_by_name(gguf_key);
++    if (ggml_backend_buffer_get_usage(t.tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
++        throw std::runtime_error("GGUF weight uploaded into non-weight storage: " + gguf_key);
+     const ggml_type mem = t.tensor->type;
+     const ggml_type disk = gguf_loader->get_tensor_type(gguf_key);
+     const size_t mem_bytes = ggml_nbytes(t.tensor);
+@@ -337,8 +553,10 @@ Session::setup() {
+ 
+     // Weight declarations mutate modules, so this container cannot use the
+     // two-pass sizing used for activation graphs.
++    TensorContainer::ArenaSizes model_sizes;
++    model_sizes.default_role = gguf_loader ? TensorRole::StaticWeight : TensorRole::PreparedCompute;
+     model_tensor_container =
+-        std::make_unique<TensorContainer>(buft_list, TensorContainer::ArenaSizes{});
++        std::make_unique<TensorContainer>(buft_list, model_sizes);
+     // State tensors (declared via create_state_tensor_*) live in this sibling
+     // container, which is deliberately NEVER allocate_tensors_on_backend_buffers()'d:
+     // each per-stream SessionState supplies their device backing per run. The
+@@ -367,26 +585,8 @@ Session::setup() {
+ 
+ namespace {
+ 
+-ggml_bf_tensor
+-create_input_tensor(TensorContainer* tc, const Session::Input& in) {
+-    const auto& s = in.shape;
+-    ggml_bf_tensor result = [&]() {
+-        switch (s.size()) {
+-            case 1:
+-                return tc->create_tensor_1d(in.name, in.dtype, s[0]);
+-            case 2:
+-                return tc->create_tensor_2d(in.name, in.dtype, s[0], s[1]);
+-            case 3:
+-                return tc->create_tensor_3d(in.name, in.dtype, s[0], s[1], s[2]);
+-            case 4:
+-                return tc->create_tensor_4d(in.name, in.dtype, s[0], s[1], s[2], s[3]);
+-            default:
+-                throw std::runtime_error(format(
+-                    "Session::Input '%s': shape rank %zu unsupported (need 1..4)", in.name.c_str(),
+-                    s.size()));
+-        }
+-    }();
+-
++void
++bind_device_input(TensorContainer* tc, ggml_bf_tensor result, const Session::Input& in) {
+     if (in.device_tensor != nullptr) {
+         const DeviceTensor& source = *in.device_tensor;
+         if (in.persistent || in.upload) {
+@@ -411,9 +611,32 @@ create_input_tensor(TensorContainer* tc, const Session::Input& in) {
+                 "Session::Input '%s': device buffer type does not match session placement",
+                 in.name.c_str()));
+         }
+-        result.tensor->buffer = source.tensor->buffer;
+-        result.tensor->data = static_cast<char*>(source.tensor->data) + source.byte_offset;
++        tc->bind_external_storage(result.tensor, source.tensor->buffer,
++            static_cast<char*>(source.tensor->data) + source.byte_offset);
+     }
++}
++
++ggml_bf_tensor
++create_input_tensor(TensorContainer* tc, const Session::Input& in) {
++    const auto& s = in.shape;
++    ggml_bf_tensor result = [&]() {
++        switch (s.size()) {
++            case 1:
++                return tc->create_tensor_1d(in.name, in.dtype, s[0]);
++            case 2:
++                return tc->create_tensor_2d(in.name, in.dtype, s[0], s[1]);
++            case 3:
++                return tc->create_tensor_3d(in.name, in.dtype, s[0], s[1], s[2]);
++            case 4:
++                return tc->create_tensor_4d(in.name, in.dtype, s[0], s[1], s[2], s[3]);
++            default:
++                throw std::runtime_error(format(
++                    "Session::Input '%s': shape rank %zu unsupported (need 1..4)", in.name.c_str(),
++                    s.size()));
++        }
++    }();
++
++    bind_device_input(tc, result, in);
+     return result;
+ }
+ 
+@@ -477,6 +700,7 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
+             bool transferred_host_data = false;
+             for (const auto& in : inputs) {
+                 if (in.device_tensor != nullptr) {
++                    bind_device_input(tc, tc->get_tensor_by_name(in.name), in);
+                     continue;
+                 }
+                 if (!in.upload) {
+@@ -494,6 +718,7 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
+                         "Session::Input '%s': host size %zu != declared tensor size %zu",
+                         in.name.c_str(), have, want));
+                 }
++                if (audit_enabled()) s->audit_upload_bytes_ += have;
+                 ggml_backend_t backend = backend_for_tensor(s->backends, t.tensor);
+                 if (backend != nullptr && !in.synchronous_upload) {
+                     ggml_backend_tensor_set_async(backend, t.tensor, in.host_data, 0, have);
+@@ -530,6 +755,7 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
+                             "Session::Output buffer too small for tensor (have %zu, need %zu)",
+                             out.nbytes, want));
+                     }
++                    if (audit_enabled()) s->audit_readback_bytes_ += want;
+                     ggml_backend_t backend = backend_for_tensor(s->backends, t.tensor);
+                     if (backend != nullptr) {
+                         ggml_backend_tensor_get_async(backend, t.tensor, out.host_buffer, 0, want);
+@@ -545,7 +771,9 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
+             }
+             return transferred_host_data;
+         },
+-        state);
++        state, std::any_of(inputs.begin(), inputs.end(), [](const Input& in) {
++            return in.device_tensor != nullptr;
++        }), true);
+ }
+ 
+ ggml_bf_tensor
+@@ -589,7 +817,7 @@ Session::make_session_state() {
+     tc->allocate_tensors_on_backend_buffers();
+     for (const auto& s : state_specs_) {
+         ggml_tensor* t = tc->get_tensor_by_name(s.name).tensor;
+-        ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
++        ggml_runtime::tensor_memset(t, 0, 0, ggml_nbytes(t));
+     }
+     return SessionState(std::move(tc));
+ }
+@@ -602,7 +830,7 @@ Session::reset_session_state(SessionState& state) {
+     TensorContainer* tc = state.container();
+     for (const auto& s : state_specs_) {
+         ggml_tensor* t = tc->get_tensor_by_name(s.name).tensor;
+-        ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
++        ggml_runtime::tensor_memset(t, 0, 0, ggml_nbytes(t));
+     }
+ }
+ 
+@@ -663,10 +891,24 @@ Session::run_impl(
+     uint64_t key, const std::function<TensorBag(Session*, TensorContainer*)>& define_input_tensors,
+     const std::function<bool(Session*, TensorContainer*)>& set_input_data,
+     const std::function<bool(Session*, TensorBag, TensorContainer*)>& return_output,
+-    SessionState* state) {
++    SessionState* state, bool dynamic_device_inputs, bool observe_host_transfers) {
+     // Cache mutation, allocation, and compute share backend state.
+     std::lock_guard<std::mutex> compute_lock(backend_manager_->compute_mutex());
+ 
++    const auto* cpu_node_pattern = diagnostic_cpu_node_pattern();
++    if (std::getenv("NEMO_SPEECH_METADATA_STATS")) {
++        const auto run = ++metadata_probe_run_id_;
++        if (run == 1 || run % 128 == 0)
++            model_tensor_container->dump_buffer_metadata(audit_session_id_, run, "model");
++    }
++
++    // Differential debugging only: distinguish graph reuse from numerical or
++    // persistent-state errors without changing encoder/decoder semantics.
++    if (std::getenv("NEMO_SPEECH_DISABLE_RUN_CACHE")) {
++        run_cache_.clear();
++        run_cache_lru_.clear();
++    }
++
+     // Bind shared state-tensor objects to this stream for the duration of the run.
+     bind_state(state);
+ 
+@@ -738,6 +980,41 @@ Session::run_impl(
+         cr.gf = build_graph_into(
+             root_module, cr.input_tensors, cr.output_tensors, sched_meta, cr.sched_meta);
+         collect_state_views(cr.gf, cr.state_views);
++        // Startup-only differential diagnostic: select semantic graph nodes,
++        // including activation-by-activation matmuls, independently of weights.
++        if (!params.cpu_node_prefix.empty() || cpu_node_pattern) {
++            for (int i = 0; i < ggml_graph_n_nodes(cr.gf); ++i) {
++                auto* node = ggml_graph_node(cr.gf, i);
++                if ((!params.cpu_node_prefix.empty() &&
++                     std::string(node->name).find(params.cpu_node_prefix) == 0) ||
++                    (cpu_node_pattern && std::regex_search(node->name, *cpu_node_pattern)))
++                    cr.cpu_nodes.push_back(node);
++            }
++        }
++        {
++            std::unordered_set<ggml_tensor*> seen;
++            std::vector<ggml_tensor*> pending;
++            for (int i = 0; i < ggml_graph_n_nodes(cr.gf); ++i)
++                pending.push_back(ggml_graph_node(cr.gf, i));
++            while (!pending.empty()) {
++                auto* tensor = pending.back();
++                pending.pop_back();
++                if (!tensor || !seen.insert(tensor).second) continue;
++                // Named inputs are materialized after graph construction. Their
++                // views can still have null data here despite a persistent root.
++                // Keep those aliases out of the resettable scheduler pool: bind
++                // them once per owning epoch instead of allocating metadata on
++                // the named input buffer again for every scheduled execution.
++                if (tensor->view_src && tensor->view_src->data)
++                    cr.external_views.push_back(tensor);
++                else if (!tensor->data)
++                    cr.scheduler_tensors.push_back(tensor);
++                else if (tensor->view_src)
++                    cr.external_views.push_back(tensor);
++                for (auto* source : tensor->src) pending.push_back(source);
++                pending.push_back(tensor->view_src);
++            }
++        }
+ 
+         const int actual_nodes = ggml_graph_n_nodes(cr.gf);
+         if (actual_nodes > static_cast<int>(kSchedGraphErrorFrac * kSchedGraphSize)) {
+@@ -778,21 +1055,86 @@ Session::run_impl(
+     }
+ 
+     CachedRun& cr = it->second;
++    if (std::getenv("NEMO_SPEECH_METADATA_STATS") &&
++        (metadata_probe_run_id_ == 1 || metadata_probe_run_id_ % 128 == 0))
++        cr.container->dump_buffer_metadata(audit_session_id_, metadata_probe_run_id_, "inputs");
+ 
+     // Reset the scheduler on every exit path once alloc_graph has run: an
+     // un-reset sched trips GGML_ASSERT(!sched->is_alloc) on the next run and
+     // aborts the process.
+     struct SchedResetGuard {
+         ggml_backend_sched_t s = nullptr;
+-        ~SchedResetGuard() {
+-            if (s)
+-                ggml_backend_sched_reset(s);
++        struct Sources {
++            ggml_tensor* node;
++            std::array<ggml_tensor*, GGML_MAX_SRC> original;
++        };
++        std::vector<Sources> sources;
++        void capture(ggml_cgraph* graph) {
++            sources.reserve(ggml_graph_n_nodes(graph));
++            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++                auto* node = ggml_graph_node(graph, i);
++                Sources entry{node, {}};
++                std::copy(std::begin(node->src), std::end(node->src), entry.original.begin());
++                sources.push_back(entry);
++            }
++        }
++        void restore() {
++            // split_graph replaces cross-backend sources with scheduler-owned
++            // copy tensors. Cached graphs must retain their original edges,
++            // never pointers into the scheduler's temporary metadata context.
++            for (const auto& entry : sources)
++                std::copy(entry.original.begin(), entry.original.end(), std::begin(entry.node->src));
++            sources.clear();
++            if (s) ggml_backend_sched_reset(s);
++            s = nullptr;
+         }
++        ~SchedResetGuard() { restore(); }
+     } sched_guard;
+ 
+     static const bool t_log = std::getenv("NEMO_SPEECH_TIMING") != nullptr;
+     using _clk = std::chrono::high_resolution_clock;
+     auto _t0 = _clk::now();
++    const bool audit = audit_enabled();
++    audit_upload_bytes_ = 0;
++    audit_readback_bytes_ = 0;
++    const uint64_t audit_run = audit ? ++audit_run_id_ : 0;
++    auto audit_placement = [&](ggml_backend_t direct_backend) {
++        if (!audit) return;
++        auto snapshot = audit_graph(cr.gf, sched.get(), direct_backend, backends, cr.cpu_nodes);
++        if (snapshot != cr.audit_snapshot) {
++            cr.audit_snapshot_id = audit_next_id();
++            std::ostringstream record;
++            record << "{\"event\":\"graph\",\"session\":" << audit_session_id_
++                << ",\"graph_key\":\"" << key << "\",\"snapshot\":" << cr.audit_snapshot_id
++                << ",\"nodes\":" << snapshot << '}';
++            audit_write(record.str());
++            cr.audit_snapshot = std::move(snapshot);
++        }
++    };
++    auto audit_run_end = [&](bool direct, auto input_end, auto alloc_end, auto dispatch_end,
++                            auto output_end, bool synchronized) {
++        if (!audit) return;
++        auto ms = [](auto a, auto b) {
++            return std::chrono::duration<double, std::milli>(b - a).count();
++        };
++        std::ostringstream record;
++        record << "{\"event\":\"run\",\"session\":" << audit_session_id_
++            << ",\"run\":" << audit_run << ",\"snapshot\":" << cr.audit_snapshot_id
++            << ",\"cache_miss\":" << (fresh ? "true" : "false")
++            << ",\"direct\":" << (direct ? "true" : "false")
++            << ",\"synchronized\":" << (synchronized ? "true" : "false")
++            << ",\"input_ms\":" << ms(_t0, input_end)
++            << ",\"allocation_and_audit_ms\":" << ms(input_end, alloc_end)
++            << ",\"dispatch_ms\":" << ms(alloc_end, dispatch_end)
++            << ",\"output_and_wait_ms\":" << ms(dispatch_end, output_end)
++            << ",\"observed_ms\":" << ms(_t0, output_end)
++            << ",\"device_compute_ms\":null,\"application_upload_bytes\":";
++        if (observe_host_transfers) record << audit_upload_bytes_; else record << "null";
++        record << ",\"application_readback_bytes\":";
++        if (observe_host_transfers) record << audit_readback_bytes_; else record << "null";
++        record << '}';
++        audit_write(record.str());
++    };
+     // Transactional: an entry that has never completed a run is evicted on
+     // failure rather than retried as a cache hit; a deterministic failure
+     // (bad graph, undersized output) would otherwise never rebuild.
+@@ -801,20 +1143,39 @@ Session::run_impl(
+         auto _t1 = _clk::now();
+ 
+         // Valid single-backend placements can bypass scheduler allocation.
+-        const bool direct = !fresh && cr.direct_ok && state == nullptr && cr.state_views.empty();
++        // Imported device addresses can change on every frame/chunk. Refresh
++        // their views and let the scheduler validate the new buffer placement.
++        for (auto* view : cr.external_views) {
++            cr.container->bind_external_storage(view, view->view_src->buffer,
++                static_cast<char*>(view->view_src->data) + view->view_offs);
++        }
++        const bool direct = cr.cpu_nodes.empty() &&
++            !std::getenv("NEMO_SPEECH_CPU_WEIGHT_PREFIX") &&
++            !std::getenv("NEMO_SPEECH_NODE_TRACE_DIR") &&
++            !node_replay_ &&
++            !dynamic_device_inputs && !fresh && cr.direct_ok &&
++            state == nullptr && cr.state_views.empty();
+         if (direct) {
++            audit_placement(cr.direct_backend);
+             auto _t2d = _clk::now();
+             if (ggml_backend_graph_compute_async(cr.direct_backend, cr.gf) != GGML_STATUS_SUCCESS) {
+                 GGMLF_LOG_ERROR("Failed to compute graph (direct)\n");
+                 throw std::runtime_error("failed to compute graph");
+             }
+             auto _t3d = _clk::now();
++            if (std::getenv("NEMO_SPEECH_OUTPUT_TRACE_DIR")) {
++                ggml_backend_synchronize(cr.direct_backend);
++                trace_session_outputs(cr.output_tensors);
++            }
+             const bool host_output_pending =
+                 return_output(this, cr.output_tensors, cr.container.get());
+             if (host_input_pending || host_output_pending) {
+                 ggml_backend_synchronize(cr.direct_backend);
+             }
+             auto _t4d = _clk::now();
++            audit_run_end(true, _t1, _t2d, _t3d, _t4d,
++                host_input_pending || host_output_pending ||
++                std::getenv("NEMO_SPEECH_OUTPUT_TRACE_DIR"));
+             if (t_log) {
+                 auto ms = [](auto a, auto b) {
+                     return std::chrono::duration<double, std::milli>(b - a).count();
+@@ -842,6 +1203,69 @@ Session::run_impl(
+         }
+ 
+         sched_guard.s = sched.get();
++        // Scheduler reset discards its split copies and allocation plan, but
++        // leaves bindings on our cached graph. Reusing those bindings makes
++        // the next split treat old pool storage as external/preallocated and
++        // can overlap live values. Direct single-backend reuse above keeps its
++        // valid plan; all other runs must allocate the intermediates again.
++        for (auto* tensor : cr.scheduler_tensors) {
++            tensor->buffer = nullptr;
++            tensor->data = nullptr;
++            tensor->extra = nullptr;
++        }
++        sched_guard.capture(cr.gf);
++        // Allocation resets backend-owned tensor metadata in the shared pool.
++        // Other cached placements must reinitialize it before computing again.
++        for (auto& entry : run_cache_) entry.second.direct_ok = false;
++        if (!cr.cpu_nodes.empty()) {
++            ggml_backend_t cpu = nullptr;
++            for (auto backend : backends) {
++                auto dev = ggml_backend_get_device(backend);
++                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    cpu = backend;
++                    break;
++                }
++            }
++            if (!cpu) throw std::runtime_error("CPU placement requires linked CPU backend");
++            for (auto* node : cr.cpu_nodes)
++                ggml_backend_sched_set_tensor_backend(sched.get(), node, cpu);
++        }
++        // Differential diagnostic only: isolate a named weight family without
++        // changing decoder decisions or the default placement policy.
++        const char* cpu_prefix = std::getenv("NEMO_SPEECH_CPU_WEIGHT_PREFIX");
++        if (cpu_prefix && *cpu_prefix) {
++            ggml_backend_t cpu = nullptr;
++            for (auto backend : backends) {
++                auto dev = ggml_backend_get_device(backend);
++                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    cpu = backend;
++                    break;
++                }
++            }
++            if (!cpu) throw std::runtime_error("CPU weight diagnostic requires CPU backend");
++            for (int i = 0; i < ggml_graph_n_nodes(cr.gf); ++i) {
++                auto* node = ggml_graph_node(cr.gf, i);
++                if (node->op != GGML_OP_MUL_MAT) continue;
++                // Conv lowering can put the static kernel in operand 1,
++                // unlike Linear's operand-0 weight. Views may also replace
++                // its name, so inspect both operands and their view roots.
++                // A layer prefix must not pin its computed query/activation
++                // merely because an optional boundary label also matches it.
++                bool matches = false;
++                for (int operand = 0; operand < 2 && !matches; ++operand) {
++                    for (const auto* source = node->src[operand]; source; source = source->view_src) {
++                        if (source->buffer &&
++                            ggml_backend_buffer_get_usage(source->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++                            std::string(source->name).find(cpu_prefix) != std::string::npos) {
++                            matches = true;
++                            break;
++                        }
++                    }
++                }
++                if (matches)
++                    ggml_backend_sched_set_tensor_backend(sched.get(), node, cpu);
++            }
++        }
+         if (!ggml_backend_sched_alloc_graph(sched.get(), cr.gf)) {
+             GGMLF_LOG_ERROR("Failed to allocate graph\n");
+             throw std::runtime_error("failed to allocate graph");
+@@ -907,6 +1331,7 @@ Session::run_impl(
+             }
+         }
+ 
++        audit_placement(nullptr);
+         auto _t2 = _clk::now();
+         if (!ggml_graph_compute_helper_async(
+                 sched.get(), cr.gf, backend_manager_->get_params().n_threads)) {
+@@ -915,6 +1340,11 @@ Session::run_impl(
+         }
+         auto _t3 = _clk::now();
+ 
++        if (std::getenv("NEMO_SPEECH_OUTPUT_TRACE_DIR")) {
++            ggml_backend_sched_synchronize(sched.get());
++            trace_session_outputs(cr.output_tensors);
++        }
++
+         // Outputs are read before the guard resets the scheduler: in
+         // sched_managed mode non-named output tensors live in the scheduler's
+         // allocator.
+@@ -924,6 +1354,7 @@ Session::run_impl(
+         // direct path above.
+         ggml_backend_sched_synchronize(sched.get());
+         auto _t4 = _clk::now();
++        audit_run_end(false, _t1, _t2, _t3, _t4, true);
+         if (t_log) {
+             auto ms = [](auto a, auto b) {
+                 return std::chrono::duration<double, std::milli>(b - a).count();
+@@ -941,6 +1372,7 @@ Session::run_impl(
+         }
+     }
+     catch (...) {
++        sched_guard.restore(); // restore edges before destroying a failed cache entry
+         if (fresh) {
+             auto lru_it = std::find(run_cache_lru_.begin(), run_cache_lru_.end(), key);
+             if (lru_it != run_cache_lru_.end())
+diff --git a/src/runtime/ggml/tensor_container.cpp b/src/runtime/ggml/tensor_container.cpp
+index d6bb5ea..e5bf3bf 100644
+--- a/src/runtime/ggml/tensor_container.cpp
++++ b/src/runtime/ggml/tensor_container.cpp
+@@ -8,9 +8,66 @@
+ 
+ #include "ggml.h"
+ #include "runtime.h"
++#include <unordered_set>
+ 
+ namespace ggml_runtime {
+ 
++void TensorContainer::bind_external_storage(
++    ggml_tensor* tensor, ggml_backend_buffer_t buffer, void* data) {
++    auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
++    auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++    using EpochFn = uint64_t (*)(ggml_backend_buffer_t);
++    auto epoch_fn = reg ? reinterpret_cast<EpochFn>(ggml_backend_reg_get_proc_address(
++        reg, "ggml_backend_buffer_metadata_epoch")) : nullptr;
++    auto& binding = external_bindings_[tensor];
++    const uint64_t epoch = epoch_fn ? epoch_fn(buffer) : 0;
++    tensor->buffer = buffer;
++    tensor->data = data;
++    // Backends without an epoch extension (or epoch 0, untracked buffer)
++    // conservatively reinitialize aliases.
++    if (!epoch || binding.buffer != buffer || binding.epoch != epoch || !tensor->extra) {
++        tensor->extra = nullptr;
++        if (ggml_backend_buffer_init_tensor(buffer, tensor) != GGML_STATUS_SUCCESS)
++            throw std::runtime_error("cannot bind external tensor metadata");
++        binding = {buffer, epoch};
++    }
++}
++
++void TensorContainer::dump_buffer_metadata(uint64_t session, uint64_t run, const char* scope) const {
++    std::unordered_set<ggml_backend_buffer_t> seen;
++    for (const auto& owned : backend_buffers) {
++        auto buffer = owned.get();
++        if (!buffer || !seen.insert(buffer).second) continue;
++        auto type = ggml_backend_buffer_get_type(buffer);
++        auto dev = ggml_backend_buft_get_device(type);
++        auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        using CountFn = size_t (*)(ggml_backend_buffer_t);
++        auto fn = reg ? reinterpret_cast<CountFn>(ggml_backend_reg_get_proc_address(
++            reg, "ggml_backend_buffer_metadata_count")) : nullptr;
++        if (!fn) continue;
++        const auto count = fn(buffer);
++        if (count == SIZE_MAX) continue;
++        fprintf(stderr, "[metadata-count] session=%llu run=%llu scope=%s buffer=%p usage=%d count=%zu\n",
++            (unsigned long long)session, (unsigned long long)run, scope, (void*)buffer,
++            int(ggml_backend_buffer_get_usage(buffer)), count);
++    }
++}
++
++void tensor_memset(ggml_tensor* tensor, uint8_t value, size_t offset, size_t size) {
++    if (offset > ggml_nbytes(tensor) || size > ggml_nbytes(tensor) - offset)
++        throw std::out_of_range("tensor memset range");
++    // State tensors have ordinary compute storage, so partial writes preserve
++    // unclaimed slots. No model-sized temporary allocation or backend-private API.
++    std::vector<uint8_t> bytes(std::min(size, size_t(64 * 1024)), value);
++    while (size) {
++        const size_t count = std::min(size, bytes.size());
++        ggml_backend_tensor_set(tensor, bytes.data(), offset, count);
++        offset += count;
++        size -= count;
++    }
++}
++
++
+ // Persistent tensors use the first accelerator's main buffer, falling back to
+ // CPU. The scheduler inserts copies for operations assigned elsewhere.
+ static ggml_backend_buffer_type_t
+@@ -85,7 +142,7 @@ TensorContainer::measure() const {
+     Measurement m{};
+     m.temp_ctx_bytes = temp_ctx ? ggml_used_mem(temp_ctx.get()) : 0;
+     for (const auto& kv : ctx_map) {
+-        m.per_buft_bytes[kv.first] = ggml_used_mem(kv.second.ctx);
++        m.per_buft_bytes[kv.first.first] += ggml_used_mem(kv.second.ctx);
+     }
+     return m;
+ }
+@@ -104,7 +161,8 @@ TensorContainer::has_tensor_by_name(const std::string& name) {
+ }
+ 
+ ggml_bf_tensor
+-TensorContainer::m_create_tensor(ggml_tensor* meta, std::string& name) {
++TensorContainer::m_create_tensor(ggml_tensor* meta, std::string& name, TensorRole role) {
++    if (role == TensorRole::Default) role = sizes_.default_role;
+     ggml_backend_buffer_type_t buft = device_main_buft(buft_list);
+     // Optional placement diagnostic. NEMO_SPEECH_LOG_PLACEMENT=1 prints
+     // `name -> buft` for every tensor created here.
+@@ -119,7 +177,7 @@ TensorContainer::m_create_tensor(ggml_tensor* meta, std::string& name) {
+             buft_name ? buft_name : "<unknown>");
+     }
+ 
+-    ggml_bf_context bf_ctx = get_ctx_of_buffer_type(buft);
++    ggml_bf_context bf_ctx = get_ctx_of_buffer_type(buft, role);
+     ggml_tensor* tensor = ggml_dup_tensor(bf_ctx.ctx, meta);
+     ggml_set_name(tensor, name.c_str());
+     auto bf_tensor = ggml_bf_tensor(tensor, buft);
+@@ -160,34 +218,35 @@ TensorContainer::import_tensor(std::string name, ggml_tensor* tensor) {
+ }
+ 
+ ggml_bf_tensor
+-TensorContainer::create_tensor_1d(std::string name, ggml_type data_type, int64_t ne0) {
++TensorContainer::create_tensor_1d(std::string name, ggml_type data_type, int64_t ne0, TensorRole role) {
+     ggml_tensor* meta = ggml_new_tensor_1d(get_temp_ctx(), data_type, ne0);
+-    return m_create_tensor(meta, name);
++    return m_create_tensor(meta, name, role);
+ }
+ 
+ ggml_bf_tensor
+-TensorContainer::create_tensor_2d(std::string name, ggml_type data_type, int64_t ne0, int64_t ne1) {
++TensorContainer::create_tensor_2d(std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, TensorRole role) {
+     ggml_tensor* meta = ggml_new_tensor_2d(get_temp_ctx(), data_type, ne0, ne1);
+-    return m_create_tensor(meta, name);
++    return m_create_tensor(meta, name, role);
+ }
+ 
+ ggml_bf_tensor
+ TensorContainer::create_tensor_3d(
+-    std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, int64_t ne2) {
++    std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, int64_t ne2, TensorRole role) {
+     ggml_tensor* meta = ggml_new_tensor_3d(get_temp_ctx(), data_type, ne0, ne1, ne2);
+-    return m_create_tensor(meta, name);
++    return m_create_tensor(meta, name, role);
+ }
+ 
+ ggml_bf_tensor
+ TensorContainer::create_tensor_4d(
+-    std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
++    std::string name, ggml_type data_type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, TensorRole role) {
+     ggml_tensor* meta = ggml_new_tensor_4d(get_temp_ctx(), data_type, ne0, ne1, ne2, ne3);
+-    return m_create_tensor(meta, name);
++    return m_create_tensor(meta, name, role);
+ }
+ 
+ ggml_bf_context
+-TensorContainer::get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft) {
+-    auto it = ctx_map.find(buft);
++TensorContainer::get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft, TensorRole role) {
++    const auto key = std::make_pair(buft, role);
++    auto it = ctx_map.find(key);
+     if (it == ctx_map.end()) {
+         auto override_it = sizes_.per_buft.find(buft);
+         const size_t bytes =
+@@ -206,7 +265,7 @@ TensorContainer::get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft) {
+         // alive until this TensorContainer destructs.
+         ggml_bf_context bf_ctx(ctx_owned.get(), buft);
+         owned_ctxs_.push_back(std::move(ctx_owned));
+-        ctx_map.insert(std::make_pair(buft, bf_ctx));
++        ctx_map.insert(std::make_pair(key, bf_ctx));
+ 
+         return bf_ctx;
+     }
+@@ -258,7 +317,7 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
+         return;
+     }
+     for (auto& p : ctx_map) {
+-        ggml_backend_buffer_type_t buft = p.first;
++        ggml_backend_buffer_type_t buft = p.first.first;
+         ggml_bf_context bf_ctx = p.second;
+         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(bf_ctx.ctx, buft);
+         if (!buf) {
+@@ -267,6 +326,21 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
+                 std::string("failed to allocate backend buffer for buffer type ") +
+                 (buft_name ? buft_name : "<unknown>") + " (out of device memory?)");
+         }
++        ggml_backend_buffer_set_usage(buf, p.first.second == TensorRole::StaticWeight
++            ? GGML_BACKEND_BUFFER_USAGE_WEIGHTS : GGML_BACKEND_BUFFER_USAGE_COMPUTE);
++        GGMLF_LOG_INFO("Tensor storage: role=%d buffer=%s bytes=%zu\n",
++                       int(p.first.second), ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(buf));
++        if (const char* inventory = std::getenv("NEMO_SPEECH_TENSOR_INVENTORY")) {
++            if (inventory[0] == '1') {
++                for (auto* t = ggml_get_first_tensor(bf_ctx.ctx); t; t = ggml_get_next_tensor(bf_ctx.ctx, t)) {
++                    GGMLF_LOG_INFO("tensor-storage name=%s role=%d dtype=%s ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu usage=%d padded=%zu buffer=%p\n",
++                        t->name, int(p.first.second), ggml_type_name(t->type),
++                        (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
++                        t->nb[0], t->nb[1], t->nb[2], t->nb[3], int(ggml_backend_buffer_get_usage(t->buffer)),
++                        ggml_backend_buft_get_alloc_size(buft, t), (void*)t->buffer);
++                }
++            }
++        }
+         backend_buffers.emplace_back(buf);
+     }
+ }

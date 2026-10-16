@@ -19,16 +19,19 @@ libraries always have to come from the same build.
 - **Other generations (v75, v79, v81):** kept building and checked from
   time to time. If one breaks it gets fixed, but it is not tuned.
 - **Runtime:** plain llama.cpp tools (`llama-cli`, `llama-server`,
-  `llama-mtmd-cli`, `llama-bench`, ...).
+  `llama-mtmd-cli`, `llama-bench`, ...), and optionally NeMo-Speech.cpp
+  speech recognition (below).
 
 ## Building
 
-Clone with the submodule (`git clone --recursive`, or `git submodule update --init`).
+Clone with the submodules (`git submodule update --init`). `git clone --recursive`
+also works but fetches the submodules of NeMo-Speech.cpp, which this build does not use.
 The presets read the SDK locations from the environment:
 
 | Preset | For | Environment |
 |---|---|---|
 | `arm64-oe-linux-v73-fusa` | v73 on FuSa firmware: skel from an older SDK, both yield options, SWIV CRC, skel checks | `OE_TOOLCHAIN_ROOT`, `HEXAGON_SDK_ROOT`/`HEXAGON_TOOLS_ROOT` (host side, SDK 6.x), `HEXAGON_HTP_SDK_ROOT`/`HEXAGON_HTP_TOOLS_ROOT`/`HEXAGON_HTP_TOOLV` (skel), `SWIV_BUILD_UTILITY`, optionally `GGML_HEXAGON_FUSA_SHELL` |
+| `arm64-oe-linux-v73-fusa-asr` | the same, plus speech recognition (below) | as above |
 | `arm64-oe-linux-release` | upstream defaults on an OpenEmbedded image | `OE_TOOLCHAIN_ROOT`, `HEXAGON_SDK_ROOT`, `HEXAGON_TOOLS_ROOT` |
 | `arm64-linux-release` | upstream defaults, clang cross build (the `arm64-linux` toolchain container) | `HEXAGON_SDK_ROOT`, `HEXAGON_TOOLS_ROOT` |
 | `arm64-android-release` | upstream defaults on Android (the `arm64-android` toolchain container) | `ANDROID_NDK_ROOT`, `HEXAGON_SDK_ROOT`, `HEXAGON_TOOLS_ROOT` |
@@ -110,6 +113,41 @@ Support reasons: `supported`, `explicit_opfilter` (`GGML_HEXAGON_OPFILTER`),
 `unknown`. Reasons are recorded for MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, ROPE,
 SOFT_MAX, the binary and unary ops, GLU, GET_ROWS, SET_ROWS, CPY, CONT, ARGSORT
 and TOP_K; other ops report `unknown` when rejected.
+
+## Speech recognition
+
+`GGML_HEXAGON_ASR=ON` (the `arm64-oe-linux-v73-fusa-asr` preset) also builds
+[NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp) streaming speech
+recognition with its encoder on the HTP. NeMo-Speech.cpp is a pinned, unmodified
+submodule like llama.cpp: configure exports it into the build directory and
+applies `asr/patches/*.patch`.
+
+| Patch | Changes |
+|---|---|
+| `0001-hexagon-asr-build` | `NEMO_SPEECH_HEXAGON_ASR`: shared libraries, the pristine ggml of an external llama.cpp, no in-tree Hexagon backend |
+| `0002-runtime-hexagon-backend` | loads `libggml-hexagon.so` explicitly (`--backend hexagon`, `--backend-lib`), per-role tensor storage, explicit CPU placement of named nodes, tensors bound outside the graph allocator kept valid across buffer resets (`ggml_backend_buffer_metadata_epoch`), and an optional schedule trace (`NEMO_SPEECH_SCHEDULE_TRACE`) with each node's backend and `ggml_backend_hexagon_support_reason` |
+| `0003-asr-backend-placement` | CLI and C API options for the backend, front end, position encoding and decoder placement |
+| `0004-asr-backend-tests` | `test_backend_storage` (storage roles, partial quantized uploads, graph reuse, support reasons) and an RNNT stage replay test |
+
+NeMo is built as a separate CMake project with its own shared ggml (CPU backend
+linked in) from the same llama.cpp submodule, and SentencePiece is built from
+source at the commit NeMo pins, unless `GGML_HEXAGON_ASR_SENTENCEPIECE_LIB` and
+`GGML_HEXAGON_ASR_SENTENCEPIECE_INCLUDE_DIR` name a static library for the target
+(the build otherwise needs network access).
+
+```sh
+cmake --preset arm64-oe-linux-v73-fusa-asr -B build
+cmake --build build -j
+scripts/package.sh --asr build pkg-asr
+pkg-asr/run-asr.sh nemotron-3.5-asr-streaming-0.6b.q8_0.gguf input.wav --language ja-JP --json
+```
+
+The ASR package holds `nemo-speech`, NeMo's ggml libraries, and
+`libggml-hexagon.so` with the skels of the same build. It cannot share a
+directory with the llama.cpp tools, whose ggml loads its backends as modules.
+To move the NeMo pin, update the submodule and refresh the patches until
+configure applies them, then rerun `test_backend_storage` and recognition on
+the target.
 
 ## Relation to upstream
 

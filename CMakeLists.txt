@@ -77,6 +77,11 @@ if (LLAMA_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+option(GGML_HEXAGON_ASR "ggml-hexagon: build NeMo-Speech.cpp speech recognition (asr/) against this backend" OFF)
+if (GGML_HEXAGON_ASR)
+    add_subdirectory(asr)
+endif()
+
 if (GGML_HEXAGON_FUSA)
     # Check every skel after it is built: SWIV section, and imports against the firmware shell if given.
     foreach(V IN LISTS GGML_HEXAGON_HTP_ARCHS)

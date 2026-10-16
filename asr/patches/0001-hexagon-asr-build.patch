@@ -1,0 +1,31 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3a1397c..370f5b4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -194,6 +194,13 @@ option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (nativ
+ # and cmake/llama_cpp.cmake). OFF builds the pristine llama.cpp submodule; the code
+ # then uses only stock ggml operations, at some latency cost on CUDA.
+ option(NEMO_SPEECH_GGML_PATCHED "Apply patches/ to ggml and llama.cpp and use the patched operations" ON)
++option(NEMO_SPEECH_HEXAGON_ASR "ASR with externally loaded Hexagon and one shared pristine ggml" OFF)
++if(NEMO_SPEECH_HEXAGON_ASR)
++    if(NOT BUILD_SHARED_LIBS OR GGML_BACKEND_DL OR GGML_HEXAGON OR NEMO_SPEECH_GGML_PATCHED OR NOT NEMO_SPEECH_LLAMA_CPP_SOURCE_DIR)
++        message(FATAL_ERROR "Hexagon ASR requires shared libraries, external ggml, patches OFF, GGML_BACKEND_DL OFF and in-tree Hexagon OFF")
++    endif()
++endif()
++
+ if(NEMO_SPEECH_BUILD_S2S AND NOT NEMO_SPEECH_GGML_PATCHED AND NOT NEMO_SPEECH_LLAMA_CPP_SOURCE_DIR)
+     # EarTTS stores its Gemma 3 attention scale in GGUF metadata that stock
+     # llama.cpp ignores, which would silently change the model's output.
+diff --git a/src/runtime/ggml/CMakeLists.txt b/src/runtime/ggml/CMakeLists.txt
+index 9bcb4d7..5b91393 100644
+--- a/src/runtime/ggml/CMakeLists.txt
++++ b/src/runtime/ggml/CMakeLists.txt
+@@ -25,7 +25,7 @@ target_include_directories(nemo_speech_runtime_ggml PRIVATE
+     ${CMAKE_SOURCE_DIR}/src/common
+ )
+ 
+-target_link_libraries(nemo_speech_runtime_ggml PUBLIC ${GGML_DEPENDENCIES})
++target_link_libraries(nemo_speech_runtime_ggml PUBLIC ${GGML_DEPENDENCIES} ${CMAKE_DL_LIBS})
+ 
+ # Consumers use the patched operations only when patches/ was applied; runtime.h
+ # derives NEMO_SPEECH_CUDA_FAST_PATHS from this and GGML_USE_CUDA.

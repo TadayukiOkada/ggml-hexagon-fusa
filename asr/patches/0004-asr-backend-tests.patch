@@ -1,0 +1,440 @@
+diff --git a/tests/cpp/asr/CMakeLists.txt b/tests/cpp/asr/CMakeLists.txt
+index a922ed3..cda1b60 100644
+--- a/tests/cpp/asr/CMakeLists.txt
++++ b/tests/cpp/asr/CMakeLists.txt
+@@ -95,3 +95,10 @@ if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
+     add_test(NAME skinny_q8_dispatch COMMAND test_skinny_q8_dispatch)
+     set_tests_properties(skinny_q8_dispatch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+ endif()
++
++add_executable(test_backend_storage test_backend_storage.cpp)
++target_link_libraries(test_backend_storage PRIVATE nemo_speech_runtime_ggml nemo_speech_common)
++add_test(NAME asr_backend_storage COMMAND test_backend_storage)
++
++add_executable(test_rnnt_stage_replay test_rnnt_stage_replay.cpp)
++target_link_libraries(test_rnnt_stage_replay PRIVATE nemo_speech_asr)
+diff --git a/tests/cpp/asr/test_backend_storage.cpp b/tests/cpp/asr/test_backend_storage.cpp
+new file mode 100644
+index 0000000..5431fa3
+--- /dev/null
++++ b/tests/cpp/asr/test_backend_storage.cpp
+@@ -0,0 +1,308 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "runtime.h"
++#include <array>
++#include <iostream>
++#include <cmath>
++#include <sstream>
++
++static void require(bool condition, const char* message) {
++    if (!condition) throw std::runtime_error(message);
++}
++class SplitModule : public ggml_runtime::Module {
++public:
++    void define_tensors(ggml_runtime::Session*) override {}
++    void set_data(ggml_runtime::Session*) override {}
++    ggml_runtime::TensorBag build_graph(ggml_runtime::Session*, ggml_runtime::TensorBag input,
++                                        ggml_runtime::TensorContainer* storage) override {
++        auto x = input.get_tensor(0);
++        auto ctx = storage->get_ctx_of_buffer_type(x.buft).ctx;
++        auto scaled = ggml_scale(ctx, x.tensor, 2.0f);
++        ggml_set_name(scaled, "storage.test.cpu_scale");
++        auto sine = ggml_sin(ctx, scaled); // unsupported by HTP: CPU split
++        auto result = ggml_scale(ctx, sine, 3.0f);
++        ggml_runtime::TensorBag output;
++        output.add_tensor(ggml_runtime::ggml_bf_tensor(result, x.buft));
++        return output;
++    }
++};
++
++class StatefulSplitModule : public ggml_runtime::Module {
++public:
++    void define_tensors(ggml_runtime::Session* s) override {
++        s->model_tensor_container->create_tensor_1d(
++            "feedback", GGML_TYPE_F32, 64, ggml_runtime::TensorRole::MutableState);
++    }
++    void set_data(ggml_runtime::Session* s) override {
++        auto state = s->model_tensor_container->get_tensor_by_name("feedback").tensor;
++        ggml_runtime::tensor_memset(state, 0, 0, ggml_nbytes(state));
++    }
++    ggml_runtime::TensorBag build_graph(ggml_runtime::Session* s, ggml_runtime::TensorBag input,
++                                       ggml_runtime::TensorContainer* storage) override {
++        auto state = s->model_tensor_container->get_tensor_by_name("feedback");
++        auto ctx = storage->get_ctx_of_buffer_type(state.buft).ctx;
++        auto sum = ggml_add(ctx, state.tensor, input.get_tensor(0).tensor);
++        auto next = ggml_sin(ctx, sum); // CPU, followed by a persistent HTP write
++        auto copy = ggml_cpy(ctx, next, state.tensor);
++        ggml_runtime::TensorBag output;
++        output.add_tensor(ggml_runtime::ggml_bf_tensor(copy, state.buft));
++        return output;
++    }
++};
++
++class ViewSplitModule : public SplitModule {
++public:
++    ggml_tensor* last_input = nullptr;
++    ggml_runtime::TensorBag build_graph(ggml_runtime::Session*, ggml_runtime::TensorBag input,
++                                       ggml_runtime::TensorContainer* storage) override {
++        auto x = input.get_tensor(0);
++        auto ctx = storage->get_ctx_of_buffer_type(x.buft).ctx;
++        last_input = x.tensor;
++        auto view = ggml_view_1d(ctx, x.tensor, 64, 0);
++        auto result = ggml_scale(ctx, ggml_sin(ctx, ggml_scale(ctx, view, 2.0f)), 3.0f);
++        ggml_runtime::TensorBag output;
++        output.add_tensor(ggml_runtime::ggml_bf_tensor(result, x.buft));
++        return output;
++    }
++};
++
++class ScaleModule : public SplitModule {
++public:
++    ggml_runtime::TensorBag build_graph(ggml_runtime::Session*, ggml_runtime::TensorBag input,
++                                       ggml_runtime::TensorContainer* storage) override {
++        auto x = input.get_tensor(0);
++        auto ctx = storage->get_ctx_of_buffer_type(x.buft).ctx;
++        auto result = ggml_scale(ctx, ggml_scale(ctx, x.tensor, 2.0f), 2.0f);
++        ggml_runtime::TensorBag output;
++        output.add_tensor(ggml_runtime::ggml_bf_tensor(result, x.buft));
++        return output;
++    }
++};
++
++int main(int argc, char** argv) {
++    using namespace ggml_runtime;
++    try {
++        Params params;
++        params.backend_kind = argc > 1 ? "hexagon" : "cpu";
++        if (argc > 1) { params.backend_library = argv[1]; params.backend_device = "HTP0"; }
++        params.use_gpu = true; // explicit CPU must win over legacy selection
++        BackendManager manager(params);
++        if (argc > 1) {
++            auto backend = manager.gpu_backend_handle();
++            auto dev = ggml_backend_get_device(backend);
++            auto reg = ggml_backend_dev_backend_reg(dev);
++            using reason_fn = const char* (*)(ggml_backend_dev_t, const ggml_tensor*);
++            auto reason = reinterpret_cast<reason_fn>(ggml_backend_reg_get_proc_address(
++                reg, "ggml_backend_hexagon_support_reason"));
++            require(reason != nullptr, "missing Hexagon support-reason extension");
++            ggml_init_params init = {65536, nullptr, true};
++            auto ctx = ggml_init(init);
++            require(ctx != nullptr, "diagnostic context allocation failed");
++            struct ContextGuard { ggml_context* ctx; ~ContextGuard() { ggml_free(ctx); } } guard{ctx};
++            for (auto test : {std::pair<int, ggml_type>{60, GGML_TYPE_F32},
++                              {64, GGML_TYPE_F16}, {64, GGML_TYPE_F32}}) {
++                auto input = ggml_new_tensor_2d(ctx, test.second, test.first, 4);
++                auto output = ggml_soft_max(ctx, input);
++                const char* expected = test.second == GGML_TYPE_F16 ? "unsupported_dtype" :
++                    (test.first == 60 ? "unsupported_shape_alignment" : "supported");
++                require(std::string(reason(dev, output)) == expected, "wrong softmax support reason");
++                require(ggml_backend_supports_op(backend, output) == (std::string(expected) == "supported"),
++                        "support reason disagrees with supports_op");
++            }
++        }
++        if (argc == 1) require(manager.gpu_backend_handle() == nullptr, "explicit CPU initialized a GPU");
++        if (argc == 1) require(manager.get_backends().size() == 1, "explicit CPU attached another backend");
++        TensorContainer::ArenaSizes sizes;
++        sizes.default_role = TensorRole::StaticWeight;
++        TensorContainer storage(manager.get_buft_list(), sizes);
++        auto w = storage.create_tensor_1d("weight", GGML_TYPE_F32, 4).tensor;
++        auto state = storage.create_tensor_1d("state", GGML_TYPE_F32, 4, TensorRole::MutableState).tensor;
++        auto prepared = storage.create_tensor_1d("prepared", GGML_TYPE_F32, 4, TensorRole::PreparedCompute).tensor;
++        const std::array<std::pair<int64_t, int64_t>, 3> qkv_shapes = {{{64, 96}, {64, 81}, {640, 1920}}};
++        std::vector<ggml_tensor*> qkv_tensors;
++        for (size_t i = 0; i < qkv_shapes.size(); ++i)
++            qkv_tensors.push_back(storage.create_tensor_2d(
++                "fused_qkv_" + std::to_string(i), GGML_TYPE_Q8_0,
++                qkv_shapes[i].first, qkv_shapes[i].second).tensor);
++        storage.allocate_tensors_on_backend_buffers();
++        require(w->buffer != state->buffer && w->buffer != prepared->buffer && state->buffer != prepared->buffer,
++                "storage roles share a physical buffer");
++        require(ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
++                "weight usage missing before upload");
++        require(ggml_backend_buffer_get_usage(state->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE,
++                "mutable state marked as weights");
++        const std::array<float, 4> data = {1, 2, 3, 4};
++        ggml_backend_tensor_set(w, data.data(), 0, sizeof(data));
++        ggml_backend_tensor_set(state, data.data(), 0, sizeof(data));
++        ggml_runtime::tensor_memset(state, 0, 0, sizeof(data));
++        std::array<float, 4> got{};
++        ggml_backend_tensor_get(w, got.data(), 0, sizeof(got));
++        require(got == data, "state reset modified static weights");
++        ggml_backend_tensor_get(state, got.data(), 0, sizeof(got));
++        require(got == std::array<float, 4>{}, "state reset failed");
++        // Three partial standard-block uploads must produce one tiled weight
++        // on HTP and round-trip to the original GGUF block bytes.
++        for (auto* qkv : qkv_tensors) {
++            require(qkv->buffer != state->buffer, "QKV shares mutable-state storage");
++            std::vector<float> source(qkv->ne[0] * qkv->ne[1]);
++            for (size_t i = 0; i < source.size(); ++i) source[i] = std::sin(float(i) * 0.01f);
++            std::vector<uint8_t> quantized(ggml_nbytes(qkv)), readback(quantized.size());
++            require(ggml_quantize_chunk(GGML_TYPE_Q8_0, source.data(), quantized.data(), 0,
++                                       qkv->ne[1], qkv->ne[0], nullptr)
++                        == quantized.size(), "Q8 quantization size mismatch");
++            const size_t third = quantized.size() / 3;
++            // Repeating Q must not count toward coverage of K or V.
++            ggml_backend_tensor_set(qkv, quantized.data(), 0, third);
++            for (size_t part = 0; part < 3; ++part)
++                ggml_backend_tensor_set(qkv, quantized.data() + part * third, part * third, third);
++            ggml_backend_tensor_get(qkv, readback.data(), 0, readback.size());
++            require(readback == quantized, "partial QKV upload/readback mismatch");
++            // Replace only K, including an N dimension that is not tile-aligned.
++            // Q and V must survive the backend's partial tile repack unchanged.
++            for (size_t i = source.size() / 3; i < 2 * source.size() / 3; ++i)
++                source[i] = std::cos(float(i) * 0.02f);
++            ggml_quantize_chunk(GGML_TYPE_Q8_0, source.data(), quantized.data(), 0,
++                                qkv->ne[1], qkv->ne[0], nullptr);
++            ggml_backend_tensor_set(qkv, quantized.data() + third, third, third);
++            tensor_memset(state, 0, 0, sizeof(data));
++            ggml_backend_tensor_get(qkv, readback.data(), 0, readback.size());
++            require(readback == quantized, "K-only upload/reset corrupted QKV data");
++            const size_t row = ggml_row_size(GGML_TYPE_Q8_0, qkv->ne[0]);
++            const size_t rows = qkv->ne[1] / 3;
++            // Reuse the standard bytes of Q as the new V through the 2D API.
++            std::copy(quantized.begin(), quantized.begin() + third, quantized.begin() + 2 * third);
++            ggml_backend_tensor_set_2d(qkv, quantized.data(), 2 * third, row, rows, row, row);
++            ggml_backend_tensor_get(qkv, readback.data(), 0, readback.size());
++            require(readback == quantized, "strided partial QKV update corrupted untouched rows");
++        }
++        SplitModule module;
++        Session session(manager, &module, nullptr);
++        session.setup();
++        std::array<float, 64> input{}, output{};
++        std::vector<Session::Output> outputs = {{0, "", output.data(), sizeof(output)}};
++        for (int run = 0; run < 32; ++run) {
++            for (size_t i = 0; i < input.size(); ++i) input[i] = float(i + run) * 0.015f;
++            session.run({{"split_input", GGML_TYPE_F32, input.data(), {64}}}, outputs);
++            for (size_t i = 0; i < input.size(); ++i)
++                require(std::fabs(output[i] - 3.0f * std::sin(2.0f * input[i])) < 0.001f,
++                        "repeated split graph returned stale or incorrect data");
++        }
++        if (argc > 1 && std::getenv("NEMO_SPEECH_SCHEDULE_CAPTURE")) {
++            std::ostringstream schedule;
++            session.dump_schedule(schedule, "mixed graph reuse");
++            require(schedule.str().find("HTP0") != std::string::npos, "mixed graph did not run on HTP");
++            require(schedule.str().find("CPU") != std::string::npos, "mixed graph did not exercise CPU fallback");
++            std::cout << schedule.str();
++        }
++        Session preferred(manager, &module, nullptr);
++        preferred.params.cpu_node_prefix = "storage.test.cpu_";
++        preferred.setup();
++        for (int run = 0; run < 8; ++run) {
++            for (size_t i = 0; i < input.size(); ++i) input[i] = float(i + run) * 0.01f;
++            preferred.run({{"preferred_input", GGML_TYPE_F32, input.data(), {64}}}, outputs);
++            for (size_t i = 0; i < input.size(); ++i)
++                require(std::fabs(output[i] - 3.0f * std::sin(2.0f * input[i])) < 0.001f,
++                        "CPU preferred cached graph returned incorrect data");
++        }
++        if (std::getenv("NEMO_SPEECH_SCHEDULE_CAPTURE")) {
++            std::ostringstream schedule;
++            preferred.dump_schedule(schedule, "explicit CPU preference");
++            require(schedule.str().find("storage.test.cpu_scale  -> CPU") != std::string::npos,
++                    "explicit CPU node preference was lost on cached reuse");
++            std::cout << schedule.str();
++        }
++        StatefulSplitModule stateful;
++        Session recurrent(manager, &stateful, nullptr);
++        recurrent.setup();
++        std::array<float, 64> expected{};
++        for (int run = 0; run < 32; ++run) {
++            for (size_t i = 0; i < input.size(); ++i) {
++                input[i] = float(i + run) * 0.01f;
++                expected[i] = std::sin(expected[i] + input[i]);
++            }
++            recurrent.run({{"feedback_input", GGML_TYPE_F32, input.data(), {64}}}, outputs);
++            for (size_t i = 0; i < output.size(); ++i)
++                require(std::fabs(output[i] - expected[i]) < 0.001f,
++                        "cached mixed graph lost persistent feedback state");
++        }
++        // A named host input is allocated after graph construction. Its view
++        // initially has null data, but must retain metadata across scheduler
++        // resets on the persistent input buffer (SIN forces a CPU split).
++        ViewSplitModule named_view_module;
++        Session named_view_session(manager, &named_view_module, nullptr);
++        named_view_session.setup();
++        using MetadataCount = size_t (*)(ggml_backend_buffer_t);
++        MetadataCount metadata_count = nullptr;
++        if (argc > 1) {
++            auto reg = ggml_backend_dev_backend_reg(
++                ggml_backend_get_device(manager.gpu_backend_handle()));
++            metadata_count = reinterpret_cast<MetadataCount>(ggml_backend_reg_get_proc_address(
++                reg, "ggml_backend_buffer_metadata_count"));
++            require(metadata_count != nullptr, "missing metadata-count extension");
++        }
++        size_t initial_metadata_count = 0;
++        for (int run = 0; run < 32; ++run) {
++            for (size_t i = 0; i < input.size(); ++i) input[i] = float(i + run) * 0.01f;
++            named_view_session.run({{"named_view_input", GGML_TYPE_F32, input.data(), {64}}}, outputs);
++            for (size_t i = 0; i < output.size(); ++i)
++                require(std::fabs(output[i] - 3.0f * std::sin(2.0f * input[i])) < 0.001f,
++                        "named input view returned stale data");
++            if (metadata_count) {
++                const auto count = metadata_count(named_view_module.last_input->buffer);
++                require(count != SIZE_MAX, "named input metadata inventory unavailable");
++                if (run == 0) initial_metadata_count = count;
++                require(count == initial_metadata_count,
++                        "named input view metadata grew on scheduler reuse");
++            }
++        }
++        TensorContainer::ArenaSizes input_sizes;
++        input_sizes.default_role = TensorRole::Activation;
++        TensorContainer producer_a(manager.get_buft_list(), input_sizes);
++        TensorContainer producer_b(manager.get_buft_list(), input_sizes);
++        std::array<ggml_bf_tensor, 2> sources = {
++            producer_a.create_tensor_1d("producer_a", GGML_TYPE_F32, 128),
++            producer_b.create_tensor_1d("producer_b", GGML_TYPE_F32, 128)};
++        producer_a.allocate_tensors_on_backend_buffers();
++        producer_b.allocate_tensors_on_backend_buffers();
++        ViewSplitModule view_module;
++        Session consumer(manager, &view_module, nullptr);
++        consumer.setup();
++        std::array<float, 128> producer_data{};
++        for (int run = 0; run < 32; ++run) {
++            auto source = sources[run < 16 ? run % 2 : (run / 4) % 2];
++            // Simulate producer allocator reuse without changing its address.
++            // Consumer aliases must not retain metadata from the old epoch.
++            ggml_backend_buffer_reset(source.tensor->buffer);
++            source.tensor->extra = nullptr;
++            ggml_backend_buffer_init_tensor(source.tensor->buffer, source.tensor);
++            for (size_t i = 0; i < producer_data.size(); ++i)
++                producer_data[i] = float(i + 7 * run) * 0.01f;
++            ggml_backend_tensor_set(source.tensor, producer_data.data(), 0, sizeof(producer_data));
++            const size_t start = (run / 2) % 2 ? 64 : 0;
++            DeviceTensor device{source.tensor, source.buft, start * sizeof(float)};
++            Session::Input imported{"imported", GGML_TYPE_F32, nullptr, {64}};
++            imported.upload = false;
++            imported.device_tensor = &device;
++            consumer.run({imported}, outputs);
++            for (size_t i = 0; i < output.size(); ++i)
++                require(std::fabs(output[i] - 3.0f * std::sin(2.0f * producer_data[start + i])) < 0.001f,
++                        "cached device input/view retained an old buffer or offset");
++        }
++        ScaleModule scale_module;
++        Session alternating(manager, &scale_module, nullptr);
++        alternating.setup();
++        for (int run = 0; run < 32; ++run) {
++            for (size_t i = 0; i < input.size(); ++i) input[i] = float(i + run) * 0.01f;
++            // Each graph gets two consecutive runs (including direct reuse),
++            // then switches to another cached graph sharing the same pool.
++            const char* name = (run / 2) % 2 ? "scale_a" : "scale_b";
++            alternating.run({{name, GGML_TYPE_F32, input.data(), {64}}}, outputs);
++            for (size_t i = 0; i < input.size(); ++i)
++                require(std::fabs(output[i] - 4.0f * input[i]) < 0.001f,
++                        "alternating cached direct graphs retained reset metadata");
++        }
++        std::cout << "backend, role storage, partial Q8 upload and 32 graph reuses passed\n";
++    } catch (const std::exception& e) {
++        std::cerr << e.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/tests/cpp/asr/test_rnnt_stage_replay.cpp b/tests/cpp/asr/test_rnnt_stage_replay.cpp
+new file mode 100644
+index 0000000..4b622a9
+--- /dev/null
++++ b/tests/cpp/asr/test_rnnt_stage_replay.cpp
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: Apache-2.0
++// Diagnostic, not an accuracy acceptance test. Replay projected encoder
++// frames under the initial blank predictor state to separate encoder error
++// from predictor/joint error. Inputs are raw contiguous float32 [J,T].
++#include "model.h"
++#include "runtime.h"
++#include "schedule_trace.h"
++#include <fstream>
++#include <iostream>
++
++using namespace nemo_speech::asr;
++
++int main(int argc, char** argv) {
++    try {
++        if (argc < 5 || argc > 7)
++            throw std::runtime_error("usage: test_rnnt_stage_replay cpu|hexagon MODEL CPU_ENCODER.bin HTP_ENCODER.bin [MODULE] [--stream-replay]");
++        ggml_runtime::Params params;
++        params.backend_kind = argv[1];
++        params.frontend_policy = "cpu";
++        params.n_threads = 4;
++        bool stream_replay = false;
++        for (int i = 5; i < argc; ++i) {
++            if (std::string(argv[i]) == "--stream-replay") stream_replay = true;
++            else if (params.backend_library.empty()) params.backend_library = argv[i];
++            else throw std::runtime_error("unexpected replay argument");
++        }
++        ggml_runtime::BackendManager manager(params);
++        BatchingConfig batching;
++        batching.enabled = false;
++        batching.state_arena_slots = 1;
++        auto owner = AsrModel::load(manager, argv[2], batching);
++        auto* engine = dynamic_cast<RnntModel*>(owner.get());
++        if (!engine || engine->head_kind() != HeadKind::Rnnt)
++            throw std::runtime_error("RNNT model required");
++        const auto& cfg = engine->rnnt_config();
++        if (stream_replay) {
++            // Explicit manifests contain one raw float32 [J,T] file per line,
++            // in the original encoder chunk order. Preserve decoder state and
++            // chunk boundaries rather than testing only the initial blank state.
++            for (int index = 3; index <= 4; ++index) {
++                std::ifstream manifest(argv[index]);
++                if (!manifest) throw std::runtime_error("cannot open replay manifest");
++                RnntGreedyDecoder decoder(engine);
++                std::vector<int> emitted;
++                int64_t offset = 0;
++                std::string path;
++                while (std::getline(manifest, path)) {
++                    if (path.empty()) throw std::runtime_error("empty replay path");
++                    std::ifstream file(path, std::ios::binary | std::ios::ate);
++                    if (!file) throw std::runtime_error("cannot open projected encoder chunk");
++                    const auto bytes = file.tellg();
++                    if (bytes <= 0 || bytes > 64 * 1024 * 1024 ||
++                        bytes % (cfg.joint_dim * sizeof(float)) != 0)
++                        throw std::runtime_error("invalid projected encoder chunk size");
++                    std::vector<float> values(bytes / sizeof(float));
++                    file.seekg(0);
++                    file.read(reinterpret_cast<char*>(values.data()), bytes);
++                    if (!file) throw std::runtime_error("incomplete projected encoder chunk");
++                    const int frames = bytes / (cfg.joint_dim * sizeof(float));
++                    auto ids = decoder.step(values.data(), cfg.joint_dim, frames, offset);
++                    emitted.insert(emitted.end(), ids.begin(), ids.end());
++                    offset += frames;
++                }
++                if (!manifest.eof() || offset == 0)
++                    throw std::runtime_error("incomplete or empty replay manifest");
++                decoder.finalize();
++                std::cout << "{\"encoder\":\"" << (index == 3 ? "cpu" : "htp")
++                    << "\",\"frames\":" << offset << ",\"tokens\":[";
++                for (size_t i = 0; i < emitted.size(); ++i)
++                    std::cout << (i ? "," : "") << emitted[i];
++                std::cout << "],\"pieces\":[";
++                for (size_t i = 0; i < emitted.size(); ++i) {
++                    if (i) std::cout << ',';
++                    ggml_runtime::audit_string(std::cout, engine->vocab().at(emitted[i]));
++                }
++                std::cout << "]}\n";
++            }
++            return 0;
++        }
++        for (int index = 3; index <= 4; ++index) {
++            std::ifstream file(argv[index], std::ios::binary | std::ios::ate);
++            if (!file) throw std::runtime_error("cannot open encoder trace");
++            const auto bytes = file.tellg();
++            if (bytes <= 0 || bytes % (cfg.joint_dim * sizeof(float)) != 0)
++                throw std::runtime_error("encoder trace size does not match joint dimension");
++            const int frames = bytes / (cfg.joint_dim * sizeof(float));
++            std::vector<float> values(bytes / sizeof(float));
++            file.seekg(0);
++            file.read(reinterpret_cast<char*>(values.data()), bytes);
++            if (!file) throw std::runtime_error("incomplete encoder trace");
++            auto state = engine->make_rnnt_stream_state();
++            engine->begin_decode_step();
++            engine->predict_rnnt(*state, cfg.blank_id, 0);
++            std::vector<int32_t> tokens(frames);
++            engine->joint_argmax(*state, values.data(), cfg.joint_dim, frames, tokens.data());
++            engine->end_decode_step();
++            std::cout << "{\"encoder\":\"" << (index == 3 ? "cpu" : "htp") << "\",\"tokens\":[";
++            for (size_t i = 0; i < tokens.size(); ++i) std::cout << (i ? "," : "") << tokens[i];
++            std::cout << "]}\n";
++        }
++    } catch (const std::exception& e) {
++        std::cerr << e.what() << '\n';
++        return 1;
++    }
++}

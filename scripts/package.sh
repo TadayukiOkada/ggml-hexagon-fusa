@@ -4,20 +4,25 @@
 # toolchain's crt objects carry build-machine paths); skels are copied as
 # built, since stripping would invalidate an embedded SWIV CRC.
 #
-# usage: scripts/package.sh [--split] <build dir> <output dir>
+# usage: scripts/package.sh [--split | --asr] <build dir> <output dir>
 #
 # --split puts tools and backend modules in bin/ and the other libraries and
 # the skels in lib/, the layout of an upstream llama.cpp install (the QDC test
 # scripts in llama.cpp/scripts/snapdragon/qdc expect it).
 #
+# --asr packages the speech recognition of a GGML_HEXAGON_ASR build instead:
+# nemo-speech with its own ggml libraries, plus libggml-hexagon.so and the skels
+# of the same build. It cannot share a directory with the llama.cpp tools, whose
+# ggml loads its backends as modules.
+#
 # PACKAGE_FORBIDDEN (extended regex) adds patterns that must not appear in
 # any packaged file. The source dir, build dir and $HOME are always checked.
 set -euo pipefail
 
-split=0
-if [ "${1:-}" = --split ]; then split=1; shift; fi
-build=$(cd "${1:?usage: $0 [--split] <build dir> <output dir>}" && pwd)
-out=${2:?usage: $0 [--split] <build dir> <output dir>}
+split=0 asr=0
+if [ "${1:-}" = --split ]; then split=1; shift; elif [ "${1:-}" = --asr ]; then asr=1; shift; fi
+build=$(cd "${1:?usage: $0 [--split | --asr] <build dir> <output dir>}" && pwd)
+out=${2:?usage: $0 [--split | --asr] <build dir> <output dir>}
 top=$(cd "$(dirname "$0")/.." && pwd)
 
 cache=$build/CMakeCache.txt
@@ -33,14 +38,23 @@ strip_debug() {
 }
 
 rm -rf "$out"; mkdir -p "$out"
-for f in "$build"/bin/*; do
-    name=$(basename "$f")
-    case $name in
-        test-*) [[ $name == test-backend-ops || $name == test-backend-ops-hex ]] || continue ;;
-    esac
-    [ -f "$f" ] || continue
-    cp -L "$f" "$out/$name"
-done
+if [ $asr -eq 1 ]; then
+    nemo=$build/asr/nemo-build/bin
+    [ -x "$nemo/nemo-speech" ] || { echo "package: no $nemo/nemo-speech (configure with GGML_HEXAGON_ASR=ON)" >&2; exit 2; }
+    for f in "$nemo"/nemo-speech "$nemo"/test_backend_storage "$nemo"/lib*.so*; do
+        [ -f "$f" ] && cp -L "$f" "$out/"
+    done
+    cp "$build"/bin/libggml-hexagon.so "$out/"
+else
+    for f in "$build"/bin/*; do
+        name=$(basename "$f")
+        case $name in
+            test-*) [[ $name == test-backend-ops || $name == test-backend-ops-hex ]] || continue ;;
+        esac
+        [ -f "$f" ] || continue
+        cp -L "$f" "$out/$name"
+    done
+fi
 cp "$build"/ggml/src/ggml-hexagon/libggml-htp-v*.so "$out/"
 
 for f in "$out"/*; do
@@ -81,9 +95,34 @@ RUN
 fi
 chmod +x "$out/run.sh"
 
+if [ $asr -eq 1 ]; then
+    cat > "$out/run-asr.sh" <<'RUN'
+#!/bin/sh
+# usage: ./run-asr.sh <model.gguf> <input.wav> [nemo-speech transcribe options]
+#   (e.g. ./run-asr.sh nemotron-asr.gguf input.wav --language ja-JP --json)
+# Streaming recognition with the encoder on HTP0 (GGML_HEXAGON_DEVICES) and the
+# audio front end and position encoding on the CPU. The skels are loaded from this
+# directory, ahead of ADSP_LIBRARY_PATH, as in run.sh.
+d=$(cd "$(dirname "$0")" && pwd)
+[ $# -ge 2 ] || { echo "usage: $0 <model.gguf> <input.wav> [options]" >&2; exit 2; }
+model=$1 audio=$2; shift 2
+GGML_HEXAGON_DEVICES=${GGML_HEXAGON_DEVICES:-HTP0} \
+ADSP_LIBRARY_PATH="$d;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
+LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/nemo-speech" transcribe "$audio" --model "$model" \
+    --backend hexagon --backend-lib "$d/libggml-hexagon.so" --frontend cpu --stream --no-batching --no-warmup \
+    --asr.batching.state_arena_slots 1 --asr.backend.threads 4 --asr.backend.position_backend cpu \
+    --asr.streaming.rnnt_right_context 3 "$@"
+RUN
+    chmod +x "$out/run-asr.sh"
+fi
+
 {
     echo "build-id:   $(cat "$build/hexagon-build-id.txt")"
     echo "llama.cpp:  $(git -C "$top/llama.cpp" rev-parse HEAD)"
+    if [ $asr -eq 1 ]; then
+        echo "NeMo-Speech.cpp: $(git -C "$top/NeMo-Speech.cpp" rev-parse HEAD) + asr/patches"
+        (cd "$top" && sha256sum asr/patches/*.patch)
+    fi
     for v in GGML_HEXAGON_FUSA GGML_HEXAGON_HTP_ARCHS GGML_HEXAGON_TOOLV GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY GGML_HEXAGON_HTP_YIELD_IN_OPS; do
         printf '%-36s %s\n' "$v" "$(sed -n "s/^$v:[A-Z]*=//p" "$cache")"
     done

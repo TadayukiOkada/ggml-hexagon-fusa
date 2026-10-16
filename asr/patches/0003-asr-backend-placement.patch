@@ -1,0 +1,698 @@
+diff --git a/app/transcribe.cpp b/app/transcribe.cpp
+index 8ba4f1f..007a3f6 100644
+--- a/app/transcribe.cpp
++++ b/app/transcribe.cpp
+@@ -144,7 +144,16 @@ parse_options(int argc, char** argv) {
+             o.model = required_value(i, argc, argv, arg);
+         else if (arg == "--language" || arg == "-l")
+             o.language = required_value(i, argc, argv, arg);
+-        else if (arg == "--device" || arg == "--backend") {
++        else if (arg == "--backend-lib")
++            o.engine.backend.library_path = required_value(i, argc, argv, arg);
++        else if (arg == "--frontend")
++            o.engine.backend.frontend = required_value(i, argc, argv, arg);
++        else if (arg == "--backend" && (i + 1 < argc) &&
++                 (std::string(argv[i + 1]) == "hexagon" || std::string(argv[i + 1]) == "cpu")) {
++            o.engine.backend.name = required_value(i, argc, argv, arg);
++        } else if (arg == "--device" && i + 1 < argc && std::string(argv[i + 1]).rfind("HTP", 0) == 0) {
++            o.engine.backend.device = required_value(i, argc, argv, arg);
++        } else if (arg == "--device" || arg == "--backend") {
+             o.gpu = parse_device(required_value(i, argc, argv, arg), arg);
+             o.device_set = true;
+         } else if (arg == "--gpu") {
+@@ -613,7 +622,8 @@ print_transcribe_help(const char* program) {
+         "                            endpointing is enabled by default\n"
+ #endif
+         "  -l, --language CODE       Language code or prompt\n"
+-        "  --device, --backend DEVICE\n"
++        "  --backend cpu|hexagon; --device HTP0; --backend-lib PATH\n"
++        "  --frontend cpu|backend (legacy device names remain supported)\n"
+         "                            auto, cpu, cuda[:N], metal, or vulkan[:N]\n"
+         "  -c, --concurrency N       Concurrent utterances; one shared model\n"
+         "  -f, --format FORMAT       text, json, srt, or vtt (default: text)\n"
+@@ -709,6 +719,7 @@ command_transcribe(int argc, char** argv) {
+ 
+         asr::RecognizerConfig config = options.engine;
+         config.log_status = !cli_quiet() && !cli_json();
++        config.backend.diagnostics = config.backend.diagnostics || cli_verbose();
+         if (options.device_set)
+             config.backend.gpu = options.gpu;
+         config.model.path =
+diff --git a/include/nemo_speech/asr.h b/include/nemo_speech/asr.h
+index 70ceace..9d7d547 100644
+--- a/include/nemo_speech/asr.h
++++ b/include/nemo_speech/asr.h
+@@ -58,6 +58,13 @@ typedef enum nemo_speech_asr_decoder_kind {
+ typedef struct nemo_speech_asr_backend_config {
+     size_t size;
+     int32_t gpu;  // -1 = CPU
++    const char* name;  // NULL/empty = legacy; cpu or hexagon
++    const char* device;
++    const char* library_path;
++    int32_t threads;  // 0 = default
++    const char* frontend;  // NULL/empty = legacy; cpu or backend
++    const char* decoder_backend; // NULL/empty/backend = main backend; cpu = RNNT group
++    const char* position_backend; // NULL/empty/backend = main; cpu = cached position projections
+ } nemo_speech_asr_backend_config;
+ 
+ typedef struct nemo_speech_asr_model_config {
+diff --git a/src/asr/c_api.cpp b/src/asr/c_api.cpp
+index 1ea3997..f97eade 100644
+--- a/src/asr/c_api.cpp
++++ b/src/asr/c_api.cpp
+@@ -68,6 +68,13 @@ to_config(const nemo_speech_asr_recognizer_config* c) {
+         const auto* b = c->backend;
+         if (HAS_FIELD(b, nemo_speech_asr_backend_config, gpu))
+             cfg.backend.gpu = b->gpu;
++        if (HAS_FIELD(b, nemo_speech_asr_backend_config, name)) cfg.backend.name = str_or_empty(b->name);
++        if (HAS_FIELD(b, nemo_speech_asr_backend_config, device)) cfg.backend.device = str_or_empty(b->device);
++        if (HAS_FIELD(b, nemo_speech_asr_backend_config, library_path)) cfg.backend.library_path = str_or_empty(b->library_path);
++        if (HAS_FIELD(b, nemo_speech_asr_backend_config, threads)) cfg.backend.threads = b->threads;
++        if (HAS_FIELD(b, nemo_speech_asr_backend_config, frontend)) cfg.backend.frontend = str_or_empty(b->frontend);
++        if (HAS_FIELD(b, nemo_speech_asr_backend_config, decoder_backend)) cfg.backend.decoder_backend = str_or_empty(b->decoder_backend);
++        if (HAS_FIELD(b, nemo_speech_asr_backend_config, position_backend)) cfg.backend.position_backend = str_or_empty(b->position_backend);
+     }
+     if (HAS_FIELD(c, nemo_speech_asr_recognizer_config, model) && c->model) {
+         const auto* m = c->model;
+diff --git a/src/asr/decoders/rnnt_greedy_decoder.cpp b/src/asr/decoders/rnnt_greedy_decoder.cpp
+index 8b36670..b3185b4 100644
+--- a/src/asr/decoders/rnnt_greedy_decoder.cpp
++++ b/src/asr/decoders/rnnt_greedy_decoder.cpp
+@@ -8,6 +8,7 @@
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <memory>
+ #include <stdexcept>
+ #include <string>
+@@ -314,6 +315,13 @@ RnntGreedyDecoder::step_impl(
+         }
+ 
+         int first_emit = -1;
++        if (std::getenv("NEMO_SPEECH_RNNT_TRACE")) {
++            fprintf(stderr, "[rnnt-trace] frame=%lld prev=%d bank=%d tokens=",
++                    static_cast<long long>(frame_offset + t), prev_token_, active_bank_);
++            for (int i = 0; i < remaining; ++i)
++                fprintf(stderr, "%s%d", i ? "," : "", token_ids_[static_cast<size_t>(i)]);
++            fprintf(stderr, "\n");
++        }
+         for (int i = 0; i < remaining; ++i) {
+             if (token_ids_[static_cast<size_t>(i)] != blank_id) {
+                 first_emit = i;
+diff --git a/src/asr/decoders/rnnt_modules.cpp b/src/asr/decoders/rnnt_modules.cpp
+index e4fded5..21c005b 100644
+--- a/src/asr/decoders/rnnt_modules.cpp
++++ b/src/asr/decoders/rnnt_modules.cpp
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdlib>
+ #include <memory>
+ #include <stdexcept>
+ #include <string>
+@@ -268,6 +269,12 @@ RnntJointModule::build_joint_tail(
+             auto flat_logits = ggml_reshape_2d(bf_ctx.ctx, l.tensor, V, T * B);
+             auto flat_ids = ggml_argmax(bf_ctx.ctx, flat_logits);
+             out.add_tensor(ggml_runtime::ggml_bf_tensor(flat_ids, bf_ctx.buft));
++            // Keep logits alive until diagnostic readback. Ordinary runs still
++            // transfer only the compact IDs and retain their original graph.
++            if (std::getenv("NEMO_SPEECH_OUTPUT_TRACE_DIR")) {
++                ggml_set_name(flat_logits, "rnnt.trace.logits");
++                out.add_tensor(ggml_runtime::ggml_bf_tensor(flat_logits, bf_ctx.buft));
++            }
+             return out;
+         }
+ 
+diff --git a/src/asr/encoder/cache_aware_encoder.cpp b/src/asr/encoder/cache_aware_encoder.cpp
+index dc49f03..7f8050f 100644
+--- a/src/asr/encoder/cache_aware_encoder.cpp
++++ b/src/asr/encoder/cache_aware_encoder.cpp
+@@ -335,13 +335,13 @@ CacheAwareEncoder::zero_slots(std::vector<int> slots) {
+                 session_->model_tensor_container->get_tensor_by_name(encoder_->kv_cache_name(l))
+                     .tensor;
+             for (int plane = 0; plane < 2; ++plane)
+-                ggml_backend_tensor_memset(
++                ggml_runtime::tensor_memset(
+                     kv, 0, static_cast<size_t>(plane) * kv->nb[2] + start * kv->nb[1],
+                     count * kv->nb[1]);
+             auto conv =
+                 session_->model_tensor_container->get_tensor_by_name(encoder_->conv_cache_name(l))
+                     .tensor;
+-            ggml_backend_tensor_memset(conv, 0, start * conv->nb[1], count * conv->nb[1]);
++            ggml_runtime::tensor_memset(conv, 0, start * conv->nb[1], count * conv->nb[1]);
+         }
+         first = last;
+     }
+diff --git a/src/asr/encoder/fastconformer.cpp b/src/asr/encoder/fastconformer.cpp
+index 08e9497..db840e6 100644
+--- a/src/asr/encoder/fastconformer.cpp
++++ b/src/asr/encoder/fastconformer.cpp
+@@ -10,10 +10,19 @@ using namespace nemo_speech::asr;
+ 
+ 
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include "runtime.h"
+ 
++// Optional boundary labels for bounded scheduler-node diagnostics. They add
++// no graph operations or tensors and leave ordinary names unchanged.
++static void
++name_encoder_boundary(ggml_tensor* tensor, const std::string& module, const char* boundary) {
++    if (std::getenv("NEMO_SPEECH_ENCODER_BOUNDARIES") != nullptr)
++        ggml_set_name(tensor, (module + "." + boundary).c_str());
++}
++
+ // CUDA implements asymmetric left padding directly. Other builds retain the
+ // pad+roll formulation because Metal's PAD kernel rejects nonzero left pads.
+ // Keeping that compatibility choice at graph construction time avoids paying
+@@ -149,6 +158,7 @@ SubSampling::build_graph(
+         auto in_t = input_tensors.get_tensor(0);
+         auto bf_ctx_in = session_tensor_container->get_ctx_of_buffer_type(in_t.buft);
+         ggml_runtime::TensorBag bag = input_tensors;
++        size_t module_index = 0;
+         for (auto* m : conv_->modules) {
+             // Heuristic: pre-pad before stride-2 layers (Conv2D layer 0 and
+             // each Conv2DDW). 1x1 Conv2D / ReLU pass through untouched.
+@@ -162,6 +172,9 @@ SubSampling::build_graph(
+                 bag.set_first_tensor(ggml_runtime::ggml_bf_tensor(padded, t.buft));
+             }
+             bag = m->build_graph(session, bag, session_tensor_container);
++            name_encoder_boundary(
++                bag.get_tensor(0).tensor,
++                name_ + ".conv." + std::to_string(module_index++), "output");
+         }
+         conv_output = bag;
+         (void)bf_ctx_in;
+@@ -174,6 +187,7 @@ SubSampling::build_graph(
+     // transpose (0,2,1,3): (W, C, H, B), then view as (C*H, W, B) = (in, T, B).
+     auto transpose_1_2 = ggml_permute(buft_ctx.ctx, conv_ret_tensor.tensor, 0, 2, 1, 3);
+     auto cont_tensor = ggml_cont(buft_ctx.ctx, transpose_1_2);
++    name_encoder_boundary(cont_tensor, name_, "projection_input_contiguous");
+     auto reshape_tensor = ggml_reshape_4d(
+         buft_ctx.ctx, cont_tensor, cont_tensor->ne[0] * cont_tensor->ne[1], cont_tensor->ne[2],
+         cont_tensor->ne[3], 1);
+@@ -192,6 +206,7 @@ SubSampling::build_graph(
+             buft_ctx.ctx, ggml_cast(buft_ctx.ctx, value.tensor, GGML_TYPE_BF16), GGML_TYPE_F32);
+         projected.set_first_tensor(ggml_runtime::ggml_bf_tensor(rounded, value.buft));
+     }
++    name_encoder_boundary(projected.get_tensor(0).tensor, name_, "output");
+     return projected;
+ }
+ 
+@@ -387,7 +402,7 @@ ConformerConv::build_post_glu(
+         z_tensor = session->params.use_gpu && w2_mat->type == GGML_TYPE_BF16 &&
+                            y_ct->ne[2] * y_ct->ne[3] > 1
+                        ? ggml_add(bf_ctx.ctx, z_tensor, b2.tensor)
+-                       : ggml_add_inplace(bf_ctx.ctx, z_tensor, b2.tensor);
++                       : ggml_runtime::graph_add(session->params, bf_ctx.ctx, z_tensor, b2.tensor);
+     }
+     ggml_runtime::TensorBag out_bag;
+     out_bag.add_tensor(ggml_runtime::ggml_bf_tensor(z_tensor, y_normed.buft));
+@@ -449,7 +464,7 @@ ConformerConv::build_graph(
+         x_ct = session->params.use_gpu && w1_mat->type == GGML_TYPE_BF16 &&
+                        input_tensor.tensor->ne[2] * input_tensor.tensor->ne[3] > 1
+                    ? ggml_add(bf_ctx.ctx, x_ct, b1.tensor)
+-                   : ggml_add_inplace(bf_ctx.ctx, x_ct, b1.tensor);
++                   : ggml_runtime::graph_add(session->params, bf_ctx.ctx, x_ct, b1.tensor);
+     }
+     ggml_runtime::TensorBag out_bag;
+ #ifdef NEMO_SPEECH_CUDA_FAST_PATHS
+@@ -505,7 +520,7 @@ ConformerConv::build_graph_cached(
+         x_ct = session->params.use_gpu && w1_mat->type == GGML_TYPE_BF16 &&
+                        input_tensor.tensor->ne[2] * input_tensor.tensor->ne[3] > 1
+                    ? ggml_add(bf_ctx.ctx, x_ct, b1.tensor)
+-                   : ggml_add_inplace(bf_ctx.ctx, x_ct, b1.tensor);
++                   : ggml_runtime::graph_add(session->params, bf_ctx.ctx, x_ct, b1.tensor);
+     }
+     auto x_tc = ggml_cont(bf_ctx.ctx, ggml_permute(bf_ctx.ctx, x_ct, 1, 0, 2, 3));
+     ggml_runtime::TensorBag out_bag;
+@@ -562,7 +577,7 @@ ConformerConv::build_graph_cached_ct(
+     if (use_bias_) {
+         auto b =
+             session->model_tensor_container->get_tensor_by_name(name_ + ".pointwise_conv1.bias");
+-        y = ggml_add_inplace(bf_ctx.ctx, y, b.tensor);
++        y = ggml_runtime::graph_add(session->params, bf_ctx.ctx, y, b.tensor);
+     }
+ 
+     // GLU on dim-0 halves: x_glu = a * sigmoid(b).
+@@ -609,7 +624,7 @@ ConformerConv::build_graph_cached_ct(
+     if (use_bias_) {
+         auto b =
+             session->model_tensor_container->get_tensor_by_name(name_ + ".pointwise_conv2.bias");
+-        out_t = ggml_add_inplace(bf_ctx.ctx, out_t, b.tensor);
++        out_t = ggml_runtime::graph_add(session->params, bf_ctx.ctx, out_t, b.tensor);
+     }
+ 
+     // Updated conv cache: last (kernel-1) frames of u, already (C, time, B) —
+@@ -705,6 +720,7 @@ ConformerLayer::build_graph(
+     bag = feed_forward1_->build_graph(session, bag, session_tensor_container);
+     auto ff1 = bag.get_tensor(0);
+     residual = ggml_add(bf_ctx.ctx, residual, ggml_scale(bf_ctx.ctx, ff1.tensor, 0.5f));
++    name_encoder_boundary(residual, name_, "after_ff1");
+ 
+     // MHA: non-cached uses RelPositionMultiHeadAttention; cached path builds
+     // the same math manually with K/V concat'd from layer cache state.
+@@ -712,6 +728,7 @@ ConformerLayer::build_graph(
+     mha_in.add_tensor(ggml_runtime::ggml_bf_tensor(residual, input_tensor.buft));
+     mha_in = norm_self_att_->build_graph(session, mha_in, session_tensor_container);
+     auto x_normed = mha_in.get_tensor(0);
++    name_encoder_boundary(x_normed.tensor, name_, "self_attn.input");
+ 
+     ggml_tensor* attn_tensor = nullptr;
+     if (cache == nullptr) {
+@@ -731,6 +748,7 @@ ConformerLayer::build_graph(
+         attn_tensor = mha_out.get_tensor(0).tensor;
+     }
+     residual = ggml_add(bf_ctx.ctx, residual, attn_tensor);
++    name_encoder_boundary(residual, name_, "after_attention");
+ 
+     // Conv
+     ggml_runtime::TensorBag conv_in;
+@@ -757,6 +775,7 @@ ConformerLayer::build_graph(
+     }
+     auto conv_out = conv_in.get_tensor(0);
+     residual = ggml_add(bf_ctx.ctx, residual, conv_out.tensor);
++    name_encoder_boundary(residual, name_, "after_conv");
+ 
+     // FF2
+     ggml_runtime::TensorBag ff2_in;
+@@ -765,11 +784,13 @@ ConformerLayer::build_graph(
+     ff2_in = feed_forward2_->build_graph(session, ff2_in, session_tensor_container);
+     auto ff2 = ff2_in.get_tensor(0);
+     residual = ggml_add(bf_ctx.ctx, residual, ggml_scale(bf_ctx.ctx, ff2.tensor, 0.5f));
++    name_encoder_boundary(residual, name_, "after_ff2");
+ 
+     // Final norm
+     ggml_runtime::TensorBag out_in;
+     out_in.add_tensor(ggml_runtime::ggml_bf_tensor(residual, input_tensor.buft));
+     out_in = norm_out_->build_graph(session, out_in, session_tensor_container);
++    name_encoder_boundary(out_in.get_tensor(0).tensor, name_, "output");
+ 
+     // Offline: pass through pos_emb (and the optional offline mask, if one
+     // was threaded in at input_tensors[2]) so the next ConformerLayer can
+@@ -824,7 +845,7 @@ ConformerLayer::build_mha_cached(
+     auto add_bias = [&](ggml_tensor* y, const ggml_runtime::ggml_bf_tensor& b) {
+         if (b.tensor == nullptr)
+             return y;
+-        return ggml_add_inplace(bf_ctx.ctx, y, b.tensor);
++        return ggml_runtime::graph_add(session->params, bf_ctx.ctx, y, b.tensor);
+     };
+ 
+     // One fused GEMM (+ one bias add). Per-projection slices stay strided
+@@ -984,15 +1005,18 @@ ConformerLayer::build_mha_cached(
+         auto bv_4d = ggml_reshape_4d(bf_ctx.ctx, bias_v.tensor, d_k, 1, n_head, 1);
+         auto qu = ggml_add(bf_ctx.ctx, q_p, bu_4d);
+         auto qv = ggml_add(bf_ctx.ctx, q_p, bv_4d);
++        ggml_set_name(qv, (base + ".query_position").c_str());
+ 
+         // Content attention (NeMo's matrix_ac): K @ (q + pos_bias_u)
+         //   -> (kv_len, chunk_len, n_head, 1)
+         auto matrix_ac = ggml_mul_mat(bf_ctx.ctx, k_p, qu);
++        ggml_set_name(matrix_ac, (base + ".matrix_ac").c_str());
+ 
+         // Position attention (NeMo's matrix_bd, pre-shift): p @ (q + pos_bias_v)
+         //   -> (pos_len, chunk_len, n_head, batch).
+         // p_p broadcasts its singleton batch dim over qv's.
+         auto matrix_bd_raw = ggml_mul_mat(bf_ctx.ctx, p_p, qv);
++        ggml_set_name(matrix_bd_raw, (base + ".matrix_bd_raw").c_str());
+ 
+         // Transformer-XL relative shift, NeMo reference implementation:
+         // RelPositionMultiHeadAttention.rel_shift (pad-left by one, fold, drop
+@@ -1029,17 +1053,22 @@ ConformerLayer::build_mha_cached(
+                             bd_back->nb[2], bd_back->nb[3], 0));
+ 
+         ggml_tensor* scores = ggml_add(bf_ctx.ctx, matrix_ac, bd_clip);
+-        scores = ggml_scale_inplace(bf_ctx.ctx, scores, scale);
++        scores = ggml_runtime::graph_scale(session->params, bf_ctx.ctx, scores, scale);
+         // Apply attention mask: (kv_len, 1) broadcast across chunk_len, n_head, batch.
+         if (cache->attn_mask != nullptr) {
+             auto mask_bcast = ggml_reshape_4d(bf_ctx.ctx, cache->attn_mask, kv_len, 1, 1, batch);
+             scores = ggml_add(bf_ctx.ctx, scores, mask_bcast);
+         }
+-        auto attn = ggml_soft_max_inplace(bf_ctx.ctx, scores);
++        // Out-of-place output lets the scheduler place unsupported HTP
++        // softmax shapes on CPU without pinning its destination to HTP storage.
++        auto attn = session->params.backend_kind == "hexagon"
++            ? ggml_soft_max(bf_ctx.ctx, scores)
++            : ggml_soft_max_inplace(bf_ctx.ctx, scores);
+ 
+         // ctx = v^T @ attn -> permute v_p to (kv_len, d_k, n_head, 1) then matmul.
+         auto v_pt = ggml_cont(bf_ctx.ctx, ggml_permute(bf_ctx.ctx, v_p, 1, 0, 2, 3));
+         ctx_attn = ggml_mul_mat(bf_ctx.ctx, v_pt, attn);  // (d_k, chunk_len, n_head, 1)
++        ggml_set_name(ctx_attn, (base + ".context_matmul").c_str());
+         ctx_attn = ggml_cont(bf_ctx.ctx, ggml_permute(bf_ctx.ctx, ctx_attn, 0, 2, 1, 3));
+         ctx_attn = ggml_reshape_3d(bf_ctx.ctx, ctx_attn, n_feat, chunk_len, batch);
+     }
+@@ -1180,12 +1209,14 @@ FastConformerEncoder::build_precompute_graph(
+         // [d_model, slice_len] -> heads [d_k, head, slice] -> [d_k, slice, head],
+         // keeping only the rows the rel-shift can address for q <= chunk_frames.
+         auto pos = ggml_mul_mat(bf_ctx.ctx, wp.tensor, pos_emb_slice);
++        ggml_set_name(pos, ("encoder.precompute.position." + std::to_string(l)).c_str());
+         auto pos_mh = ggml_reshape_3d(bf_ctx.ctx, pos, d_k, cfg_.n_heads, slice_len);
+         auto pos_hs = ggml_permute(bf_ctx.ctx, pos_mh, 0, 2, 1, 3);
+         auto pos_rows = ggml_view_3d(
+             bf_ctx.ctx, pos_hs, d_k, kv_len + chunk_frames - 1, cfg_.n_heads, pos_hs->nb[1],
+             pos_hs->nb[2], 0);
+         auto store = ggml_cpy(bf_ctx.ctx, pos_rows, dst.tensor);
++        ggml_set_name(store, ("encoder.precompute.position_store." + std::to_string(l)).c_str());
+         out.add_tensor(ggml_runtime::ggml_bf_tensor(store, dst.buft));
+     }
+ 
+@@ -1228,10 +1259,10 @@ FastConformerEncoder::define_tensors(ggml_runtime::Session* session) {
+         // inside each layer.
+         for (int l = 0; l < cfg_.n_layers; l++) {
+             session->model_tensor_container->create_tensor_3d(
+-                kv_cache_name(l), GGML_TYPE_F32, d_model * cache_len, cfg_.cache_state_slots, 2);
++                kv_cache_name(l), GGML_TYPE_F32, d_model * cache_len, cfg_.cache_state_slots, 2, ggml_runtime::TensorRole::MutableState);
+             session->model_tensor_container->create_tensor_2d(
+                 conv_cache_name(l), GGML_TYPE_F32, d_model * conv_cache_len,
+-                cfg_.cache_state_slots);
++                cfg_.cache_state_slots, ggml_runtime::TensorRole::MutableState);
+         }
+ 
+         // Chunk-invariant positional projections, one per layer, filled once
+@@ -1245,7 +1276,7 @@ FastConformerEncoder::define_tensors(ggml_runtime::Session* session) {
+         // strided fused path reads K/V as F32 views of the concat windows.
+         for (int l = 0; l < cfg_.n_layers; l++) {
+             session->model_tensor_container->create_tensor_3d(
+-                pos_proj_name(l), GGML_TYPE_F32, d_k, pos_rows, cfg_.n_heads);
++                pos_proj_name(l), GGML_TYPE_F32, d_k, pos_rows, cfg_.n_heads, ggml_runtime::TensorRole::PreparedCompute);
+         }
+ 
+         // Channel-inner depthwise-conv weights for the cwhn direct kernel
+@@ -1256,7 +1287,7 @@ FastConformerEncoder::define_tensors(ggml_runtime::Session* session) {
+                 name_ + ".layers." + std::to_string(l) + ".conv.depthwise_conv.weight";
+             session->model_tensor_container->create_tensor_2d(
+                 dw_ct_name(l), session->gguf_loader->get_tensor_type(src), cfg_.d_model,
+-                cfg_.conv_kernel_size);
++                cfg_.conv_kernel_size, ggml_runtime::TensorRole::PreparedCompute);
+         }
+     }
+ }
+@@ -1589,7 +1620,7 @@ FastConformerEncoder::set_data(ggml_runtime::Session* session) {
+         for (int l = 0; l < cfg_.n_layers; ++l) {
+             for (const auto& name : {kv_cache_name(l), conv_cache_name(l)}) {
+                 auto t = session->model_tensor_container->get_tensor_by_name(name);
+-                ggml_backend_tensor_memset(t.tensor, 0, 0, ggml_nbytes(t.tensor));
++                ggml_runtime::tensor_memset(t.tensor, 0, 0, ggml_nbytes(t.tensor));
+             }
+         }
+     }
+diff --git a/src/asr/encoder/rel_pos_attention.cpp b/src/asr/encoder/rel_pos_attention.cpp
+index ada27be..1fe4888 100644
+--- a/src/asr/encoder/rel_pos_attention.cpp
++++ b/src/asr/encoder/rel_pos_attention.cpp
+@@ -21,7 +21,7 @@ namespace ggml_runtime {
+ void
+ RelPositionalEncoding::define_tensors(Session* session) {
+     session->model_tensor_container->create_tensor_2d(
+-        name + ".pe", GGML_TYPE_F32, d_model, max_len * 2 - 1);
++        name + ".pe", GGML_TYPE_F32, d_model, max_len * 2 - 1, TensorRole::PreparedCompute);
+ }
+ 
+ ggml_bf_tensor
+@@ -65,7 +65,7 @@ RelPositionalEncoding::get_pe_tensor(Session* session, TensorContainer* session_
+             sin_grid_interleave_2_tensor->ne[2],
+         sin_grid_interleave_2_tensor->ne[3]);
+ 
+-    auto pe_tensor = ggml_add_inplace(
++    auto pe_tensor = ggml_runtime::graph_add(session->params,
+         bf_ctx.ctx, cos_grid_interleave_1_compact_tensor, sin_grid_interleave_2_compact_tensor);
+ 
+     auto pe_bf_tensor = ggml_bf_tensor(pe_tensor, bf_ctx.buft);
+@@ -192,7 +192,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
+             qkv = session->params.use_gpu && qkv_weight.tensor->type == GGML_TYPE_BF16 &&
+                           input_tensor.tensor->ne[2] * input_tensor.tensor->ne[3] > 1
+                       ? ggml_add(bf_ctx.ctx, qkv, bias.tensor)
+-                      : ggml_add_inplace(bf_ctx.ctx, qkv, bias.tensor);
++                      : ggml_runtime::graph_add(session->params, bf_ctx.ctx, qkv, bias.tensor);
+         }
+         const size_t es = ggml_element_size(qkv);
+         auto slice = [&](int idx) {
+@@ -300,7 +300,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
+             matrix_bd->nb[3], 0);
+         matrix_bd = ggml_cont(bf_ctx.ctx, matrix_bd);
+ 
+-        auto scores = ggml_scale_inplace(
++        auto scores = ggml_runtime::graph_scale(session->params,
+             bf_ctx.ctx, ggml_add(bf_ctx.ctx, matrix_ac, matrix_bd), scale_factor);
+ 
+         // Optional attention mask: caller passes an additive mask shaped to
+@@ -312,7 +312,11 @@ RelPositionMultiHeadAttention::build_graph_masked(
+             scores = ggml_add(bf_ctx.ctx, scores, attn_mask);
+         }
+ 
+-        auto soft = ggml_soft_max_inplace(bf_ctx.ctx, scores);
++        // Out-of-place output lets the scheduler place unsupported HTP
++        // softmax shapes on CPU without pinning its destination to HTP storage.
++        auto soft = session->params.backend_kind == "hexagon"
++            ? ggml_soft_max(bf_ctx.ctx, scores)
++            : ggml_soft_max_inplace(bf_ctx.ctx, scores);
+         auto vtk = ggml_cont(bf_ctx.ctx, ggml_permute(bf_ctx.ctx, vh, 1, 0, 2, 3));
+         auto ctxh = ggml_mul_mat(bf_ctx.ctx, vtk, soft);    // [dk,T,H,B]
+         attn = ggml_permute(bf_ctx.ctx, ctxh, 0, 2, 1, 3);  // [dk,H,T,B]
+@@ -346,6 +350,8 @@ RelPositionMultiHeadAttention::set_data(Session* session) {
+     // all three quant planes before all three scale planes instead.
+     {
+         ggml_bf_tensor w = session->model_tensor_container->get_tensor_by_name(qkv_weight_name);
++        if (ggml_backend_buffer_get_usage(w.tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
++            throw std::runtime_error("fused QKV upload requires static-weight storage: " + name);
+         const size_t third = ggml_nbytes(w.tensor) / 3;
+         const std::string qkv_q8_layout =
+             session->gguf_loader->get_str("asr.encoder.qkv_q8_layout");
+diff --git a/src/asr/features/fe.cpp b/src/asr/features/fe.cpp
+index 382a535..5995605 100644
+--- a/src/asr/features/fe.cpp
++++ b/src/asr/features/fe.cpp
+@@ -303,7 +303,7 @@ MelSpectrogramExtractor::MelSpectrogramExtractor(
+     init_mel_basis();
+     init_cpu_tables();
+ 
+-    if (bm_ != nullptr && bm_->gpu_backend_handle() != nullptr) {
++    if (bm_ != nullptr && bm_->get_params().frontend_policy != "cpu" && bm_->gpu_backend_handle() != nullptr) {
+         module_ = std::make_unique<FeModule>(cfg_, window_, mel_basis_);
+         session_ =
+             std::make_unique<ggml_runtime::Session>(*bm_, module_.get(), /*gguf_loader=*/nullptr);
+diff --git a/src/asr/model.cpp b/src/asr/model.cpp
+index e2bcbcd..ae63362 100644
+--- a/src/asr/model.cpp
++++ b/src/asr/model.cpp
+@@ -121,8 +121,13 @@ class RnntModel::RnntEncoderTail : public ggml_runtime::Module {
+             prompt_in.add_tensor(enc);
+             prompt_in.add_tensor(input.get_tensor(1));
+             enc = prompt_->build_graph(s, prompt_in, tc).get_tensor(0);
++            if (std::getenv("NEMO_SPEECH_ENCODER_BOUNDARIES") != nullptr)
++                ggml_set_name(enc.tensor, "encoder.prompt_fusion");
+         }
+-        return joint_->build_encoder_projection(s, enc, tc);
++        auto projected = joint_->build_encoder_projection(s, enc, tc);
++        if (std::getenv("NEMO_SPEECH_ENCODER_BOUNDARIES") != nullptr)
++            ggml_set_name(projected.get_tensor(0).tensor, "encoder.joint_projection");
++        return projected;
+     }
+     void set_data(ggml_runtime::Session* s) override {
+         joint_->set_encoder_data(s);
+@@ -312,13 +317,13 @@ class RnntModel::RnntDecoderStages : public ggml_runtime::Module {
+         for (int bank = 0; bank < 2; ++bank) {
+             for (int l = 0; l < cfg.pred_num_layers; ++l) {
+                 s->model_tensor_container->create_tensor_2d(
+-                    rnnt_h_state_name(bank, l), GGML_TYPE_F32, cfg.pred_hidden, slots_);
++                    rnnt_h_state_name(bank, l), GGML_TYPE_F32, cfg.pred_hidden, slots_, ggml_runtime::TensorRole::MutableState);
+                 s->model_tensor_container->create_tensor_2d(
+-                    rnnt_c_state_name(bank, l), GGML_TYPE_F32, cfg.pred_hidden, slots_);
++                    rnnt_c_state_name(bank, l), GGML_TYPE_F32, cfg.pred_hidden, slots_, ggml_runtime::TensorRole::MutableState);
+             }
+         }
+         s->model_tensor_container->create_tensor_2d(
+-            kRnntPredProjectionState, GGML_TYPE_F32, cfg.joint_dim, slots_);
++            kRnntPredProjectionState, GGML_TYPE_F32, cfg.joint_dim, slots_, ggml_runtime::TensorRole::MutableState);
+     }
+     ggml_runtime::TensorBag build_graph(
+         ggml_runtime::Session* s, ggml_runtime::TensorBag input,
+@@ -422,10 +427,10 @@ class RnntModel::RnntDecoderStages : public ggml_runtime::Module {
+             for (int l = 0; l < cfg.pred_num_layers; ++l)
+                 for (const auto& name : {rnnt_h_state_name(bank, l), rnnt_c_state_name(bank, l)}) {
+                     auto t = s->model_tensor_container->get_tensor_by_name(name);
+-                    ggml_backend_tensor_memset(t.tensor, 0, 0, ggml_nbytes(t.tensor));
++                    ggml_runtime::tensor_memset(t.tensor, 0, 0, ggml_nbytes(t.tensor));
+                 }
+         auto p = s->model_tensor_container->get_tensor_by_name(kRnntPredProjectionState);
+-        ggml_backend_tensor_memset(p.tensor, 0, 0, ggml_nbytes(p.tensor));
++        ggml_runtime::tensor_memset(p.tensor, 0, 0, ggml_nbytes(p.tensor));
+     }
+ 
+    private:
+@@ -1688,8 +1693,17 @@ RnntModel::RnntModel(ggml_runtime::BackendManager& bm, Common&& c, const Batchin
+     }
+     rnnt_decoder_stages_ = std::make_unique<RnntDecoderStages>(
+         rnnt_predictor_.get(), rnnt_joint_.get(), decoder_arena_slots_);
++    if (bm.get_params().decoder_backend == "cpu" && bm.gpu_backend_handle() != nullptr) {
++        auto cpu_params = bm.get_params();
++        cpu_params.backend_kind = "cpu";
++        cpu_params.backend_device.clear();
++        cpu_params.backend_library.clear();
++        cpu_params.use_gpu = false;
++        cpu_decoder_manager_ = std::make_unique<ggml_runtime::BackendManager>(cpu_params);
++        GGMLF_LOG_INFO("RNNT predictor/joiner backend: CPU; encoder stays on main backend\n");
++    }
+     decoder_session_ = std::make_unique<ggml_runtime::Session>(
+-        backend_manager(), rnnt_decoder_stages_.get(), loader());
++        cpu_decoder_manager_ ? *cpu_decoder_manager_ : backend_manager(), rnnt_decoder_stages_.get(), loader());
+     // Bound graph variants across predictor batch and joint time shapes.
+     decoder_session_->set_run_cache_capacity(64);
+     decoder_session_->setup();
+@@ -1932,6 +1946,23 @@ RnntModel::joint_argmax_device(
+         throw std::invalid_argument("joint_argmax_device: stream state belongs to another engine");
+     if (!enc_proj.valid() || joint_dim != rnnt_cfg_.joint_dim || frame_offset < 0 || T <= 0)
+         throw std::runtime_error("joint_argmax_device: invalid projected encoder input");
++    if (cpu_decoder_manager_) {
++        if (enc_proj.tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(enc_proj.tensor))
++            throw std::runtime_error("CPU decoder requires contiguous float32 encoder projection");
++        const size_t offset = enc_proj.byte_offset + size_t(frame_offset) * joint_dim * sizeof(float);
++        const size_t bytes = size_t(T) * joint_dim * sizeof(float);
++        const size_t available = ggml_nbytes(enc_proj.tensor);
++        if (offset > available || bytes > available - offset)
++            throw std::runtime_error("CPU decoder: encoder device slice out of range");
++        std::vector<float> host(size_t(T) * joint_dim);
++        {
++            std::lock_guard<std::mutex> lock(backend_manager().compute_mutex());
++            for (auto backend : backend_manager().get_backends()) ggml_backend_synchronize(backend);
++            ggml_backend_tensor_get(enc_proj.tensor, host.data(), offset, bytes);
++        }
++        joint_argmax(stream_state, host.data(), joint_dim, T, token_ids, logit_bias);
++        return;
++    }
+     auto result = decoder_batchers_->joint_device(
+         state->slot, enc_proj, frame_offset, T, logit_bias, rnnt_cfg_.vocab_size);
+     std::copy(result.tokens.begin(), result.tokens.end(), token_ids);
+@@ -1952,6 +1983,11 @@ RnntModel::predict_and_joint_rnnt_argmax_device(
+     if (active_bank != 0 && active_bank != 1)
+         throw std::invalid_argument(
+             "predict_and_joint_rnnt_argmax_device: active bank must be 0 or 1");
++    if (cpu_decoder_manager_) {
++        predict_rnnt(stream_state, prev_token, active_bank);
++        joint_argmax_device(stream_state, enc_proj, frame_offset, joint_dim, T, token_ids, logit_bias);
++        return;
++    }
+     auto result = decoder_batchers_->predict_joint_rnnt_device(
+         state->slot, static_cast<int32_t>(prev_token), active_bank, enc_proj, frame_offset, T,
+         logit_bias, rnnt_cfg_.vocab_size, state->needs_reset);
+@@ -2055,14 +2091,18 @@ RnntModel::zero_decoder_slots(std::vector<int> slots) {
+                 for (const auto& name : {rnnt_h_state_name(bank, l), rnnt_c_state_name(bank, l)}) {
+                     auto t =
+                         decoder_session_->model_tensor_container->get_tensor_by_name(name).tensor;
+-                    ggml_backend_tensor_memset(t, 0, start * t->nb[1], count * t->nb[1]);
++                    if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE)
++                        throw std::runtime_error("decoder reset cannot write weight storage");
++                    ggml_runtime::tensor_memset(t, 0, start * t->nb[1], count * t->nb[1]);
+                 }
+             }
+         }
+         auto p =
+             decoder_session_->model_tensor_container->get_tensor_by_name(kRnntPredProjectionState)
+                 .tensor;
+-        ggml_backend_tensor_memset(p, 0, start * p->nb[1], count * p->nb[1]);
++        if (ggml_backend_buffer_get_usage(p->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE)
++            throw std::runtime_error("predictor reset cannot write weight storage");
++        ggml_runtime::tensor_memset(p, 0, start * p->nb[1], count * p->nb[1]);
+         first = last;
+     }
+ }
+diff --git a/src/asr/model.h b/src/asr/model.h
+index 9f7aa8c..d3ebd55 100644
+--- a/src/asr/model.h
++++ b/src/asr/model.h
+@@ -286,6 +286,8 @@ class RnntModel final : public AsrModel, public RnntEngine {
+     std::unique_ptr<PromptFusionModule> prompt_fusion_;
+     std::unique_ptr<RnntEncoderTail> rnnt_encoder_tail_;
+     std::unique_ptr<RnntDecoderStages> rnnt_decoder_stages_;
++    // Declared before its Session so the manager outlives all decoder storage.
++    std::unique_ptr<ggml_runtime::BackendManager> cpu_decoder_manager_;
+     std::unique_ptr<ggml_runtime::Session> decoder_session_;
+     std::unique_ptr<DecoderBatchers> decoder_batchers_;
+     int decoder_arena_slots_ = 0;
+diff --git a/src/asr/recognizer.cpp b/src/asr/recognizer.cpp
+index abaf38d..28f1668 100644
+--- a/src/asr/recognizer.cpp
++++ b/src/asr/recognizer.cpp
+@@ -15,6 +15,7 @@
+ #include <vector>
+ 
+ #include "model.h"
++#include "model_logging.h"
+ #include "silero_vad.h"
+ #ifdef NEMO_SPEECH_WITH_FLASHLIGHT
+ #include "flashlight_decoder.h"
+@@ -39,7 +40,18 @@ head_name(HeadKind head) {
+ 
+ std::unique_ptr<ggml_runtime::BackendManager>
+ make_backend(const BackendConfig& backend) {
++    common::ensure_ggml_logging(backend.diagnostics);
+     ggml_runtime::Params p;
++    p.backend_kind = backend.name;
++    p.backend_device = backend.device;
++    p.backend_library = backend.library_path;
++    p.decoder_backend = backend.decoder_backend;
++    if (!backend.position_backend.empty() && backend.position_backend != "cpu" &&
++        backend.position_backend != "backend")
++        throw std::runtime_error("unsupported position backend: " + backend.position_backend);
++    if (backend.position_backend == "cpu") p.cpu_node_prefix = "encoder.precompute.position.";
++    p.frontend_policy = backend.frontend.empty() && backend.name == "hexagon"
++        ? "cpu" : backend.frontend;
+     p.use_gpu = (backend.gpu >= 0);
+     p.gpu_device_idx = std::max(backend.gpu, 0);
+     p.pe_bin_path = const_cast<char*>("");
+diff --git a/src/asr/recognizer.h b/src/asr/recognizer.h
+index 8b7add0..9e4e9c4 100644
+--- a/src/asr/recognizer.h
++++ b/src/asr/recognizer.h
+@@ -27,9 +27,23 @@ class SileroVadModel;
+ class Recognizer;
+ 
+ struct BackendConfig {
++    std::string name;
++    std::string device;
++    std::string library_path;
++    std::string frontend;
++    bool diagnostics = false;
+     int gpu = 0;      // -1 = CPU
+     int threads = 0;  // CPU backend threads; 0 = min(8, hardware threads)
++    std::string decoder_backend;
++    std::string position_backend;
+     void Register(common::ParameterParser& p) {
++        p.Register("diagnostics", &diagnostics, "Backend and ggml diagnostics");
++        p.Register("name", &name, "Explicit backend: cpu or hexagon");
++        p.Register("device", &device, "Exact backend device name");
++        p.Register("library_path", &library_path, "External backend module path");
++        p.Register("frontend", &frontend, "Frontend: cpu or backend (empty = legacy)");
++        p.Register("decoder_backend", &decoder_backend, "RNNT predictor/joiner: cpu or backend");
++        p.Register("position_backend", &position_backend, "Cached encoder position projections: cpu or backend");
+         p.Register("gpu", &gpu, "GPU device index (-1 = CPU)", {"--gpu", "-g"});
+         p.Register("threads", &threads, "CPU backend threads (0 = min(8, hardware threads))");
+     }
+diff --git a/src/asr/vad/silero_vad.cpp b/src/asr/vad/silero_vad.cpp
+index 7797454..8f3d819 100644
+--- a/src/asr/vad/silero_vad.cpp
++++ b/src/asr/vad/silero_vad.cpp
+@@ -76,7 +76,7 @@ class SileroVadModule : public ggml_runtime::Module {
+         session->load_weight("final_conv.bias");
+         for (const char* name : {"lstm.h_arena", "lstm.c_arena"}) {
+             auto t = session->model_tensor_container->get_tensor_by_name(name);
+-            ggml_backend_tensor_memset(t.tensor, 0, 0, ggml_nbytes(t.tensor));
++            ggml_runtime::tensor_memset(t.tensor, 0, 0, ggml_nbytes(t.tensor));
+         }
+     }
+ 
+@@ -351,7 +351,7 @@ SileroVadModel::zero_slots(std::vector<int> slots) {
+         const size_t count = last - first;
+         for (const char* name : {"lstm.h_arena", "lstm.c_arena"}) {
+             auto t = session_->model_tensor_container->get_tensor_by_name(name).tensor;
+-            ggml_backend_tensor_memset(t, 0, start * t->nb[1], count * t->nb[1]);
++            ggml_runtime::tensor_memset(t, 0, start * t->nb[1], count * t->nb[1]);
+         }
+         first = last;
+     }

@@ -1,3 +1,6 @@
 [submodule "llama.cpp"]
 	path = llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "NeMo-Speech.cpp"]
+	path = NeMo-Speech.cpp
+	url = https://github.com/NVIDIA/NeMo-Speech.cpp.git
