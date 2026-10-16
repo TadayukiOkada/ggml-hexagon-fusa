@@ -108,18 +108,13 @@ Hexagon registry:
 | `ggml_backend_buffer_metadata_count` | `size_t (*)(ggml_backend_buffer_t)` | tensor metadata entries held by the buffer (bounded across resets), `SIZE_MAX` for a non-Hexagon buffer |
 
 Support reasons: `supported`, `explicit_opfilter` (`GGML_HEXAGON_OPFILTER`),
-`unsupported_op` (no kernel for the op or its variant), `unsupported_dtype`,
-`unsupported_shape`, `unsupported_shape_alignment`, `unsupported_stride_layout`,
-`unsupported_params` (op parameters, such as a RoPE mode), `unsupported_sinks`,
-`unsupported_weight_layout` (repacked or viewed quantized weights),
-`unsupported_kernel` (no kernel configuration for the shape), `vtcm_limit`,
-`op_budget` (estimated time over the per-op budget, left to the CPU; MUL_MAT,
-from the FLOP rate and src0 bytes, with the measured rate of the kernel when src0
-is not a weight, such as attention keys; SOFT_MAX by element count, in builds
-without `GGML_HEXAGON_HTP_YIELD_IN_OPS`, which otherwise runs it in rounds) and
-`unknown`. Reasons are recorded for MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, ROPE,
-SOFT_MAX, the binary and unary ops, GLU, GET_ROWS, SET_ROWS, CPY, CONT, ARGSORT
-and TOP_K; other ops report `unknown` when rejected.
+`unsupported_op` (no kernel for the op), `op_budget` (estimated time over the
+per-op budget, left to the CPU; MUL_MAT from the FLOP rate and src0 bytes, with
+the measured rate of the kernel when src0 is not a weight, such as attention
+keys; SOFT_MAX by element count, in builds without
+`GGML_HEXAGON_HTP_YIELD_IN_OPS`, which otherwise runs it in rounds) and
+`unknown` (the kernel parameter checks of the op reject it: a type, shape,
+layout or VTCM size the kernels do not cover).
 
 ## Speech recognition
 

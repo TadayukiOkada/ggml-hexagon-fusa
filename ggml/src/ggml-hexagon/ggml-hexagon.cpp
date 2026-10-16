@@ -3096,32 +3096,53 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_host_buffer_ty
 // IMPORTANT: supports_op runs before buffer allocation and before tensor data is populated.
 // Never check buffer usage, buffer properties, or repacking state (is_tiled) here.
 // Support must depend only on static tensor properties (shape, type, strides).
-static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
-    auto sess    = dev_ctx->session();
-
+// Why supports_op rejects an op, or nullptr when it is supported. The kernel parameter checks
+// record no reason of their own: they fail as "unknown".
+static const char * ggml_hexagon_reject_reason(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     // reject ops that match the filter
     if (opt_opfilter && std::regex_match(ggml_op_desc(op), *opt_opfilter)) {
-        return false;
+        return "explicit_opfilter";
     }
 
-    bool supp = false;
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-            supp = true;
-            break;
+            return nullptr;
 
         default:
-            supp = htp_kparams_check(sess, op) && htp_op_within_budget(sess, op);
-            break;
+            if (htp_op_remap(op) == HTP_OP_INVALID) {
+                return "unsupported_op";
+            }
+            if (!htp_kparams_check(sess, op)) {
+                return "unknown";
+            }
+            if (!htp_op_within_budget(sess, op)) {
+                return "op_budget";
+            }
+            return nullptr;
     }
+}
+
+static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+    auto sess    = dev_ctx->session();
+
+    const bool supp = ggml_hexagon_reject_reason(sess, op) == nullptr;
 
     ggml_hexagon_dump_op_supp(sess->c_name(), op, supp);
     return supp;
+}
+
+// Optional extension (get_proc_address "ggml_backend_hexagon_support_reason"): why supports_op
+// rejects an op, from the same checks.
+static const char * ggml_backend_hexagon_support_reason(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+
+    const char * reason = ggml_hexagon_reject_reason(dev_ctx->session(), op);
+    return reason ? reason : "supported";
 }
 
 static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -3350,6 +3371,9 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
 
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_hexagon_support_reason") == 0) {
+        return (void *) ggml_backend_hexagon_support_reason;
+    }
     if (strcmp(name, "ggml_backend_buffer_metadata_count") == 0) {
         return (void *) ggml_backend_hexagon_buffer_metadata_count;
     }
