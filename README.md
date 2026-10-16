@@ -91,6 +91,26 @@ Queue records pair successful batch submissions with received DSP responses
 `graph_dispatch.queued_ops` counts enqueue attempts before queue fusion. These
 are neither individual FastRPC invocation counts nor DSP execution durations.
 
+Optional entry points, found with `ggml_backend_reg_get_proc_address()` on the
+Hexagon registry:
+
+| Name | Type | Returns |
+|---|---|---|
+| `ggml_backend_hexagon_support_reason` | `const char * (*)(ggml_backend_dev_t, const ggml_tensor *)` | why `supports_op` rejects the op, from the same checks (below) |
+| `ggml_backend_buffer_metadata_epoch` | `uint64_t (*)(ggml_backend_buffer_t)` | a value that changes on every buffer reset, 0 for a non-Hexagon buffer. A tensor bound outside the graph allocator must be initialized again when it changes |
+| `ggml_backend_buffer_metadata_count` | `size_t (*)(ggml_backend_buffer_t)` | tensor metadata entries held by the buffer (bounded across resets), `SIZE_MAX` for a non-Hexagon buffer |
+
+Support reasons: `supported`, `explicit_opfilter` (`GGML_HEXAGON_OPFILTER`),
+`unsupported_op` (no kernel for the op or its variant), `unsupported_dtype`,
+`unsupported_shape`, `unsupported_shape_alignment`, `unsupported_stride_layout`,
+`unsupported_params` (op parameters, such as a RoPE mode), `unsupported_sinks`,
+`unsupported_weight_layout` (repacked or viewed quantized weights),
+`unsupported_kernel` (no kernel configuration for the shape), `vtcm_limit`,
+`op_budget` (estimated time over the per-op budget, left to the CPU) and
+`unknown`. Reasons are recorded for MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, ROPE,
+SOFT_MAX, the binary and unary ops, GLU, GET_ROWS, SET_ROWS, CPY, CONT, ARGSORT
+and TOP_K; other ops report `unknown` when rejected.
+
 ## Relation to upstream
 
 The backend sources start from upstream `ggml/src/ggml-hexagon/`. The

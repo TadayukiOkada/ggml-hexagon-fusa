@@ -5811,7 +5811,11 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     return true;
 }
 
-static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+// A supports_op check that fails records why, for ggml_backend_hexagon_support_reason().
+// The functions take an optional `const char ** reason`; nullptr when only the answer matters.
+#define HEX_REJECT(why) do { if (reason) { *reason = (why); } return false; } while (0)
+
+static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * src2 = op->src[2];
@@ -5823,37 +5827,37 @@ static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_sess
     if ((src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32) ||
         (src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_Q8_0) ||
         (src2->type != GGML_TYPE_F16 && src2->type != GGML_TYPE_Q8_0)) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (src3 && src3->type != GGML_TYPE_F16) {  // mask
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (src4 && src4->type != GGML_TYPE_F32) {  // sinks
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     // For now we support F32 or F16 output as htp backend often converts output on the fly if needed,
     // but the op implementation writes to F16 or F32.
     // Let's assume dst can be F32 or F16.
     if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (dst->ne[3] != 1) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     struct htp_fa_kernel_params kparams;
     if (!ggml_hexagon_precompute_flash_attn_params(sess, op, &kparams)) {
-        return false;
+        HEX_REJECT("unsupported_kernel");
     }
 
     if ((size_t) kparams.vtcm_size > sess->vtcm_size) {
         HEX_VERBOSE("ggml-hex: skip flash_attn_ext because VTCM needed (%d) > budget (%zu)\n",
                     kparams.vtcm_size, sess->vtcm_size);
-        return false;
+        HEX_REJECT("vtcm_limit");
     }
 
     return true;
@@ -7448,16 +7452,16 @@ static bool ggml_hexagon_tensor_is_non_host(const struct ggml_hexagon_session * 
     GGML_UNUSED(sess);
 }
 
-static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst) {
+static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
     if (dst->type != GGML_TYPE_F32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     switch (src0->type) {
@@ -7472,19 +7476,19 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q2_K:
             if (!ggml_is_contiguous(src0) || ggml_is_permuted(src0)) {
-                return false;
+                HEX_REJECT("unsupported_stride_layout");
             }
 
             if (src0->ne[0] % ((src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q4_K ||
                                 src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q2_K) ? QK_K : 32)) {
-                return false;
+                HEX_REJECT("unsupported_shape_alignment");
             }
 
             if (src1->ne[2] < src0->ne[2] || src1->ne[3] < src0->ne[3]) {
-                return false;
+                HEX_REJECT("unsupported_shape");
             }
             if (src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
-                return false;
+                HEX_REJECT("unsupported_shape");
             }
 
             if (!src0->buffer) {
@@ -7494,40 +7498,40 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
 
         case GGML_TYPE_F16:
             if (src0->nb[1] < src0->nb[0]) {
-                return false;
+                HEX_REJECT("unsupported_stride_layout");
             }
             if (src1->ne[2] < src0->ne[2] || src1->ne[3] < src0->ne[3]) {
-                return false;
+                HEX_REJECT("unsupported_shape");
             }
             if (src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
-                return false;
+                HEX_REJECT("unsupported_shape");
             }
             break;
 
         case GGML_TYPE_F32:
             if (src1->type != GGML_TYPE_F32) {
-                return false;
+                HEX_REJECT("unsupported_dtype");
             }
             if (src0->nb[1] < src0->nb[0]) {
-                return false;
+                HEX_REJECT("unsupported_stride_layout");
             }
             if (src1->ne[2] < src0->ne[2] || src1->ne[3] < src0->ne[3]) {
-                return false;
+                HEX_REJECT("unsupported_shape");
             }
             if (src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
-                return false;
+                HEX_REJECT("unsupported_shape");
             }
             break;
 
         default:
-            return false;
+            HEX_REJECT("unsupported_dtype");
     }
 
     struct htp_mm_kernel_params kparams;
     ggml_hexagon_precompute_matmul_params(sess, src0, src1, dst, &kparams);
     if (kparams.kernel_type == HTP_MM_KERNEL_UNSUPPORTED || (size_t) kparams.vtcm_size > sess->vtcm_size) {
         HEX_VERBOSE("ggml-hex: %s supported MUL_MAT VTCM size needed (%d) > budget (%zu)\n", sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
-        return false;
+        HEX_REJECT(kparams.kernel_type == HTP_MM_KERNEL_UNSUPPORTED ? "unsupported_kernel" : "vtcm_limit");
     }
 
     // The long matmuls are output projections over many tokens (perplexity, embeddings). The HMX
@@ -7549,25 +7553,25 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         if (est > opt_op_budget_ms) {
             HEX_VERBOSE("ggml-hex: %s MUL_MAT %s estimated %.1f ms > budget %.1f ms, left to the CPU\n", sess->c_name(),
                         dst->name, est, opt_op_budget_ms);
-            return false;
+            HEX_REJECT("op_budget");
         }
     }
 
     return true;
 }
 
-static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * src2 = op->src[2];
     const struct ggml_tensor * dst  = op;
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src2->type != GGML_TYPE_I32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
-        return false;
+        HEX_REJECT("unsupported_params");
     }
 
     switch (src0->type) {
@@ -7582,12 +7586,12 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q2_K:
             if (!ggml_is_contiguous(src0) || ggml_is_permuted(src0)) {
-                return false;
+                HEX_REJECT("unsupported_stride_layout");
             }
 
             if (src0->ne[0] % ((src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q4_K ||
                                 src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q2_K) ? QK_K : 32)) {
-                return false;
+                HEX_REJECT("unsupported_shape_alignment");
             }
 
             if (!src0->buffer) {
@@ -7596,56 +7600,59 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
             break;
 
         default:
-            return false;
+            HEX_REJECT("unsupported_dtype");
     }
 
     struct htp_mm_kernel_params kparams;
     ggml_hexagon_precompute_matmul_params(sess, src0, src1, dst, &kparams);
     if (kparams.kernel_type == HTP_MM_KERNEL_UNSUPPORTED || (size_t) kparams.vtcm_size > sess->vtcm_size) {
         HEX_VERBOSE("ggml-hex: %s supported MUL_MAT_ID VTCM size needed (%d) > budget (%zu)\n", sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
-        return false;
+        HEX_REJECT(kparams.kernel_type == HTP_MM_KERNEL_UNSUPPORTED ? "unsupported_kernel" : "vtcm_limit");
     }
 
     return true;
 }
 
-static bool ggml_hexagon_supported_binary(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_binary(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst  = op;
 
     if (src0->type == GGML_TYPE_F32) {
         if (src1->type != GGML_TYPE_F32) {
-            return false;
+            HEX_REJECT("unsupported_dtype");
         }
         if (dst->type != GGML_TYPE_F32) {
-            return false;
+            HEX_REJECT("unsupported_dtype");
         }
     }
     else if (src0->type == GGML_TYPE_F16) {
         if (src1->type != GGML_TYPE_F16) {
-            return false;
+            HEX_REJECT("unsupported_dtype");
         }
         if (dst->type != GGML_TYPE_F16) {
-            return false;
+            HEX_REJECT("unsupported_dtype");
         }
     }
     else {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (ggml_is_permuted(src0) || ggml_is_permuted(dst)) {
-        return false;
+        HEX_REJECT("unsupported_stride_layout");
     }
     if (!ggml_are_same_shape(src0, dst)) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
     if (!ggml_can_repeat(src1, src0) || ggml_is_permuted(src1)) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     struct htp_binary_kernel_params kparams;
-    return ggml_hexagon_precompute_binary_params(sess, op_remap_to_htp(op), src0, src1, dst, &kparams);
+    if (!ggml_hexagon_precompute_binary_params(sess, op_remap_to_htp(op), src0, src1, dst, &kparams)) {
+        HEX_REJECT("unsupported_kernel");
+    }
+    return true;
 }
 
 static bool ggml_hexagon_supported_add_id(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
@@ -7682,18 +7689,18 @@ static bool ggml_hexagon_supported_add_id(const struct ggml_hexagon_session * se
     return ggml_hexagon_precompute_binary_params(sess, HTP_OP_ADD_ID, src0, src1, dst, &kparams);
 }
 
-static bool ggml_hexagon_supported_unary(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_unary(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * dst  = op;
 
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
     if (dst->type != src0->type) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
     if (!ggml_is_contiguous_rows(src0)) {
-        return false;
+        HEX_REJECT("unsupported_stride_layout");
     }
 
     // F16 device kernels only cover this explicit whitelist (must stay in sync with
@@ -7712,21 +7719,21 @@ static bool ggml_hexagon_supported_unary(const struct ggml_hexagon_session * ses
             case GGML_OP_UNARY:
                 if (ggml_get_unary_op(op) != GGML_UNARY_OP_ABS &&
                     ggml_get_unary_op(op) != GGML_UNARY_OP_STEP) {
-                    return false;
+                    HEX_REJECT("unsupported_op");
                 }
                 break;
             default:
-                return false;
+                HEX_REJECT("unsupported_op");
         }
     }
 
     if (!ggml_are_same_shape(src0, dst)) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     // dst must be contiguous; src0 may be non-contiguous
     if (!ggml_is_contiguous(dst)) {
-        return false;
+        HEX_REJECT("unsupported_stride_layout");
     }
 
     return true;
@@ -7865,39 +7872,39 @@ static bool ggml_hexagon_supported_pool_1d(const struct ggml_hexagon_session * s
     return htp_pool_solve_layout(&layout, (uint32_t) src0->ne[0], 1, (uint32_t) op->ne[0], 1, n_threads, sess->vtcm_size);
 }
 
-static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst  = op;
 
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
     if (dst->type != src0->type) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
     // the f16 kernels (execute_op_activations_f16) have no GEGLU_ERF / GEGLU_QUICK
     if (src0->type == GGML_TYPE_F16 && op->op == GGML_OP_GLU &&
         (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU_ERF || ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU_QUICK)) {
-        return false;
+        HEX_REJECT("unsupported_op");
     }
 
     if (!ggml_is_contiguous_1(src0)) {
-        return false;
+        HEX_REJECT("unsupported_stride_layout");
     }
     if (!ggml_is_contiguous(dst)) {
-        return false;
+        HEX_REJECT("unsupported_stride_layout");
     }
 
     if (src1) {
         if (src1->type != src0->type) {
-            return false;
+            HEX_REJECT("unsupported_dtype");
         }
         if (!ggml_are_same_shape(src0, src1)) {
-            return false;
+            HEX_REJECT("unsupported_shape");
         }
         if (!ggml_is_contiguous_1(src1)) {
-            return false;
+            HEX_REJECT("unsupported_stride_layout");
         }
     }
 
@@ -7906,52 +7913,52 @@ static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session
     GGML_UNUSED(sess);
 }
 
-static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * src2 = op->src[2];
     const struct ggml_tensor * dst  = op;
 
     if (src2) {
-        return false;  // FIXME: add support for sinks
+        HEX_REJECT("unsupported_sinks");  // FIXME: add support for sinks
     }
 
     if (src0->type != GGML_TYPE_F32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
     if (dst->type != GGML_TYPE_F32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (src0->ne[2] > 512) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     if (src1) {
         if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) {
-            return false;
+            HEX_REJECT("unsupported_dtype");
         }
         if (src0->ne[0] != src1->ne[0]) {
-            return false;
+            HEX_REJECT("unsupported_shape");
         }
         if (src1->ne[1] < src0->ne[1]) {
-            return false;
+            HEX_REJECT("unsupported_shape");
         }
         if (src0->ne[2] % src1->ne[2] != 0) {
-            return false;
+            HEX_REJECT("unsupported_shape");
         }
         if (src0->ne[3] % src1->ne[3] != 0) {
-            return false;
+            HEX_REJECT("unsupported_shape");
         }
     }
 
     if (src1) {
         if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
-            return false;
+            HEX_REJECT("unsupported_stride_layout");
         }
     } else {
         if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) {
-            return false;
+            HEX_REJECT("unsupported_stride_layout");
         }
     }
 
@@ -7960,7 +7967,7 @@ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * s
     // Small sizes (ne[0] <= 32) work correctly with tail-only processing
     const int64_t ne0 = src0->ne[0];
     if (ne0 > 32 && (ne0 & (32 - 1)) != 0) {
-        return false;
+        HEX_REJECT("unsupported_shape_alignment");
     }
 
     // HVX vector size constraints for softmax
@@ -7969,7 +7976,7 @@ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * s
     // Reject very large row sizes to avoid numerical precision issues
     // Softmax accumulation over many elements can lead to precision loss
     if (ne0 > SOFTMAX_MAX_ROW_SIZE) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
@@ -7977,7 +7984,7 @@ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * s
     struct htp_softmax_vtcm_layout layout;
     htp_softmax_vtcm_layout_build(&layout, src0->ne[0], src1 ? src1->ne[0] : 1, src1 != nullptr, src1 && src1->type == GGML_TYPE_F16, n_threads);
     if (layout.total_bytes > sess->vtcm_size) {
-        return false;
+        HEX_REJECT("vtcm_limit");
     }
 
     return true;
@@ -7985,25 +7992,25 @@ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * s
     GGML_UNUSED(sess);
 }
 
-static bool ggml_hexagon_supported_set_rows(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_set_rows(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0]; // values
     const struct ggml_tensor * src1 = op->src[1]; // indices
     const struct ggml_tensor * dst  = op->src[2] ? op->src[2] : op;
 
     if (dst->type == GGML_TYPE_Q8_0 && src0->ne[0] < 32) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     if (src0->type != GGML_TYPE_F32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_Q8_0) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     return true;
@@ -8011,13 +8018,13 @@ static bool ggml_hexagon_supported_set_rows(const struct ggml_hexagon_session * 
     GGML_UNUSED(sess);
 }
 
-static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0]; // values
     const struct ggml_tensor * src1 = op->src[1]; // indices
     const struct ggml_tensor * dst  = op;
 
     if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) && src0->view_src) {
-        return false;
+        HEX_REJECT("unsupported_weight_layout");
     }
 
     const ggml_tensor * src0_base = src0->view_src ? src0->view_src : src0;
@@ -8026,45 +8033,45 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
         const auto * extra = (const ggml_hexagon_tensor_extra *) src0_base->extra;
         is_repacked = (extra->flags & GGML_HEXAGON_TENSOR_REPACK) != 0;
         if (is_repacked && src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q8_0) {
-            return false;
+            HEX_REJECT("unsupported_weight_layout");
         }
     }
     is_repacked = is_repacked || sess->needs_repack.count(src0_base) || sess->needs_repack.count(src0);
 
     // View offsets use the raw quantized layout and cannot address a tiled allocation.
     if (src0->view_src && is_repacked) {
-        return false;
+        HEX_REJECT("unsupported_weight_layout");
     }
 
     if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) && src0->buffer && ggml_backend_buffer_get_size(src0->buffer) != 0 && !is_repacked) {
-        return false;
+        HEX_REJECT("unsupported_weight_layout");
     }
 
     if (src0->type != dst->type && src0->ne[0] < 32) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
         src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_I32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) && (!ggml_is_contiguous(src0) || ggml_is_permuted(src0) || src0->ne[0] % QK_K)) {
-        return false;
+        HEX_REJECT("unsupported_stride_layout");
     }
 
     if (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (src0->type == dst->type) {
         if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_I32 && src0->type != GGML_TYPE_F16) {
-            return false;
+            HEX_REJECT("unsupported_dtype");
         }
     } else if (src0->type == GGML_TYPE_I32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     } else if (dst->type != GGML_TYPE_F32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     // Empty recurrent-state gathers are skipped at execution; do not split the graph for them.
@@ -8075,7 +8082,7 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
     struct htp_get_rows_kernel_params kparams;
     ggml_hexagon_precompute_get_rows_params(sess, src0, src1, dst, &kparams);
     if (kparams.n_threads == 0 || (size_t) kparams.vtcm_size > sess->vtcm_size) {
-        return false;
+        HEX_REJECT(kparams.n_threads == 0 ? "unsupported_kernel" : "vtcm_limit");
     }
 
     // Tiled quantized weights have no raw fallback. Mark only accepted tensors for repacking.
@@ -8133,12 +8140,12 @@ static bool ggml_hexagon_sort_within_budget(const struct ggml_hexagon_session * 
     return true;
 }
 
-static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0]; // values
     const struct ggml_tensor * dst  = op;         // indices
 
     if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     const uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
@@ -8147,18 +8154,21 @@ static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * s
 
     struct htp_sort_vtcm_layout layout;
     if (!htp_sort_solve_layout(&layout, src0->ne[0], total_rows, dst->ne[0], n_threads_max, vtcm_budget, false)) {
-        return false;
+        HEX_REJECT("vtcm_limit");
     }
 
-    return ggml_hexagon_sort_within_budget(sess, op, -1);
+    if (!ggml_hexagon_sort_within_budget(sess, op, -1)) {
+        HEX_REJECT("op_budget");
+    }
+    return true;
 }
 
-static bool ggml_hexagon_supported_top_k(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_top_k(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0]; // values
     const struct ggml_tensor * dst  = op;         // indices
 
     if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     const uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
@@ -8167,33 +8177,36 @@ static bool ggml_hexagon_supported_top_k(const struct ggml_hexagon_session * ses
 
     struct htp_sort_vtcm_layout layout;
     if (!htp_sort_solve_layout(&layout, src0->ne[0], total_rows, dst->ne[0], n_threads_max, vtcm_budget, true)) {
-        return false;
+        HEX_REJECT("vtcm_limit");
     }
 
-    return ggml_hexagon_sort_within_budget(sess, op, dst->ne[0]);
+    if (!ggml_hexagon_sort_within_budget(sess, op, dst->ne[0])) {
+        HEX_REJECT("op_budget");
+    }
+    return true;
 }
 
-static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * src2 = op->src[2];
     const struct ggml_tensor * dst  = op;
 
     if (!ggml_are_same_shape(src0, dst)) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_I32) {
-        return false;
+        HEX_REJECT("unsupported_dtype");
     }
 
     if (src0->ne[0] <= 0) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
     if (src0_nrows == 0) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     const int32_t * op_params = &op->op_params[0];
@@ -8204,18 +8217,18 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
     // llama probes weight placement with a dummy rope where every param is 0 (llama-model-loader.cpp).
     // Rejecting it puts rope_freqs on the CPU, which then splits the graph at every full-attention layer.
     if (n_dims < 0 || n_dims % 2 != 0) {
-        return false;
+        HEX_REJECT("unsupported_params");
     }
 
     // ggml_rope_set_offset: HVX kernels need a VLEN-aligned window start (32 f32 elems)
     if (n_offs < 0 || (n_offs % 32 != 0) || (n_offs + n_dims > src0->ne[0])) {
-        return false;
+        HEX_REJECT("unsupported_params");
     }
 
     float freq_base;
     memcpy(&freq_base, op_params + 5, sizeof(float));
     if (freq_base < 0.0f) {
-        return false;
+        HEX_REJECT("unsupported_params");
     }
 
     if (mode != GGML_ROPE_TYPE_NORMAL &&
@@ -8223,7 +8236,7 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
         mode != GGML_ROPE_TYPE_MROPE &&
         mode != GGML_ROPE_TYPE_VISION &&
         mode != GGML_ROPE_TYPE_IMROPE) {
-        return false;
+        HEX_REJECT("unsupported_params");
     }
 
     const bool is_mrope = (mode & GGML_ROPE_TYPE_MROPE) != 0;
@@ -8231,38 +8244,38 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
     // n_dims == ne0/2, so the rotation spans the full row
     if (mode == GGML_ROPE_TYPE_VISION) {
         if (n_dims != (int) (src0->ne[0] / 2) || n_offs != 0) {
-            return false;
+            HEX_REJECT("unsupported_params");
         }
     }
 
     if (is_mrope) {
         const int32_t * sections = op_params + 11;
         if (sections[0] <= 0 && sections[1] <= 0 && sections[2] <= 0) {
-            return false;
+            HEX_REJECT("unsupported_params");
         }
     }
 
     const int64_t min_pos_len = (is_mrope || mode == GGML_ROPE_TYPE_VISION) ? src0->ne[2] * 4 : src0->ne[2];
     if (src1->ne[0] < min_pos_len || !ggml_is_contiguous(src1)) {
-        return false;
+        HEX_REJECT("unsupported_shape");
     }
 
     if (src2) {
         if (src2->type != GGML_TYPE_F32 || !ggml_is_contiguous(src2)) {
-            return false;
+            HEX_REJECT("unsupported_dtype");
         }
         if (src2->ne[0] < (n_dims / 2)) {
-            return false;
+            HEX_REJECT("unsupported_shape");
         }
     }
 
     // src0/dst elements within a row must be contiguous (nb[0] == sizeof(float)).
     // nb[1] may exceed ne[0]*sizeof(float) when the tensor is a strided view of a larger one
     if (src0->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
-        return false;
+        HEX_REJECT("unsupported_stride_layout");
     }
     if (src0->nb[1] < src0->ne[0] * sizeof(float) || dst->nb[1] < dst->ne[0] * sizeof(float)) {
-        return false;
+        HEX_REJECT("unsupported_stride_layout");
     }
 
     const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, src0_nrows);
@@ -8271,7 +8284,7 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
     struct htp_rope_vtcm_layout layout;
     htp_rope_vtcm_layout_build(&layout, src0->ne[0], n_threads, n_freq_factors);
     if (layout.total_bytes > sess->vtcm_size) {
-        return false;
+        HEX_REJECT("vtcm_limit");
     }
 
     return true;
@@ -9458,14 +9471,20 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_host_buffer_ty
     return &dev_ctx->host_buffer_type;
 }
 
-static bool ggml_hexagon_supported_cpy(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_cpy(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     struct htp_copy_kernel_params kparams;
-    return ggml_hexagon_precompute_cpy_params(sess, op, &kparams);
+    if (!ggml_hexagon_precompute_cpy_params(sess, op, &kparams)) {
+        HEX_REJECT("unsupported_kernel");
+    }
+    return true;
 }
 
-static bool ggml_hexagon_supported_cont(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+static bool ggml_hexagon_supported_cont(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op, const char ** reason = nullptr) {
     struct htp_copy_kernel_params kparams;
-    return ggml_hexagon_precompute_cpy_params(sess, op, &kparams);
+    if (!ggml_hexagon_precompute_cpy_params(sess, op, &kparams)) {
+        HEX_REJECT("unsupported_kernel");
+    }
+    return true;
 }
 
 static bool ggml_hexagon_supported_repeat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
@@ -9546,13 +9565,11 @@ static bool ggml_hexagon_supported_roll(const struct ggml_hexagon_session * sess
     return true;
 }
 
-static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
-    auto sess    = dev_ctx->session();
-
+static bool ggml_hexagon_supports_op(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op,
+                                     const char ** reason = nullptr) {
     // reject ops that match the filter
     if (opt_opfilter && std::regex_match(ggml_op_desc(op), *opt_opfilter)) {
-        return false;
+        HEX_REJECT("explicit_opfilter");
     }
 
     bool supp = false;
@@ -9569,15 +9586,15 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_DIV:
-            supp = ggml_hexagon_supported_binary(sess, op);
+            supp = ggml_hexagon_supported_binary(sess, op, reason);
             break;
 
         case GGML_OP_MUL_MAT:
-            supp = ggml_hexagon_supported_mul_mat(sess, op);
+            supp = ggml_hexagon_supported_mul_mat(sess, op, reason);
             break;
 
         case GGML_OP_MUL_MAT_ID:
-            supp = ggml_hexagon_supported_mul_mat_id(sess, op);
+            supp = ggml_hexagon_supported_mul_mat_id(sess, op, reason);
             break;
 
         case GGML_OP_ADD_ID:
@@ -9590,13 +9607,13 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SCALE:
         case GGML_OP_CLAMP:
         case GGML_OP_LEAKY_RELU:
-            supp = ggml_hexagon_supported_unary(sess, op);
+            supp = ggml_hexagon_supported_unary(sess, op, reason);
             break;
 
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_LOG:
-            supp = ggml_hexagon_supported_unary(sess, op);
+            supp = ggml_hexagon_supported_unary(sess, op, reason);
             break;
 
         case GGML_OP_SUM:
@@ -9620,7 +9637,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         case GGML_OP_SOFT_MAX:
-            supp = ggml_hexagon_supported_softmax(sess, op);
+            supp = ggml_hexagon_supported_softmax(sess, op, reason);
             break;
 
         case GGML_OP_UNARY:
@@ -9637,11 +9654,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_UNARY_OP_GELU_ERF:
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_STEP:
-                    supp = ggml_hexagon_supported_unary(sess, op);
+                    supp = ggml_hexagon_supported_unary(sess, op, reason);
                     break;
                 default:
-                    supp = false;
-                    break;
+                    HEX_REJECT("unsupported_op");
             }
             break;
 
@@ -9653,37 +9669,36 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_GEGLU_ERF:
-                    supp = ggml_hexagon_supported_activations(sess, op);
+                    supp = ggml_hexagon_supported_activations(sess, op, reason);
                     break;
                 default:
-                    supp = false;
-                    break;
+                    HEX_REJECT("unsupported_op");
             }
             break;
 
         case GGML_OP_ROPE:
-            supp = ggml_hexagon_supported_rope(sess, op);
+            supp = ggml_hexagon_supported_rope(sess, op, reason);
             break;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            supp = ggml_hexagon_supported_flash_attn_ext(sess, op);
+            supp = ggml_hexagon_supported_flash_attn_ext(sess, op, reason);
             break;
 
         case GGML_OP_SET_ROWS:
-            supp = ggml_hexagon_supported_set_rows(sess, op);
+            supp = ggml_hexagon_supported_set_rows(sess, op, reason);
             break;
 
         case GGML_OP_GET_ROWS:
-            supp = ggml_hexagon_supported_get_rows(sess, op);
+            supp = ggml_hexagon_supported_get_rows(sess, op, reason);
             break;
 
         case GGML_OP_DUP:
         case GGML_OP_CPY:
-            supp = ggml_hexagon_supported_cpy(sess, op);
+            supp = ggml_hexagon_supported_cpy(sess, op, reason);
             break;
 
         case GGML_OP_CONT:
-            supp = ggml_hexagon_supported_cont(sess, op);
+            supp = ggml_hexagon_supported_cont(sess, op, reason);
             break;
 
         case GGML_OP_REPEAT:
@@ -9691,11 +9706,11 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         case GGML_OP_ARGSORT:
-            supp = ggml_hexagon_supported_argsort(sess, op);
+            supp = ggml_hexagon_supported_argsort(sess, op, reason);
             break;
 
         case GGML_OP_TOP_K:
-            supp = ggml_hexagon_supported_top_k(sess, op);
+            supp = ggml_hexagon_supported_top_k(sess, op, reason);
             break;
 
         case GGML_OP_SSM_CONV:
@@ -9743,11 +9758,31 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         default:
-            break;
+            HEX_REJECT("unsupported_op");
     }
 
+    return supp;
+}
+
+static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+    auto sess    = dev_ctx->session();
+
+    bool supp = ggml_hexagon_supports_op(sess, op);
     ggml_hexagon_dump_op_supp(sess->name, op, supp);
     return supp;
+}
+
+// Optional extension (get_proc_address "ggml_backend_hexagon_support_reason"): why supports_op
+// rejects an op, from the same checks. "unknown" means the failing check records no reason.
+static const char * ggml_backend_hexagon_support_reason(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+
+    const char * reason = nullptr;
+    if (ggml_hexagon_supports_op(dev_ctx->session(), op, &reason)) {
+        return "supported";
+    }
+    return reason ? reason : "unknown";
 }
 
 static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -9991,6 +10026,9 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
 
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_hexagon_support_reason") == 0) {
+        return (void *) ggml_backend_hexagon_support_reason;
+    }
     if (strcmp(name, "ggml_backend_buffer_metadata_count") == 0) {
         return (void *) ggml_backend_hexagon_buffer_metadata_count;
     }
