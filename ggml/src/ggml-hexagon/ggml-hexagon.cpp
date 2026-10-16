@@ -63,6 +63,7 @@
 #include "htp-kparams.h"
 #include "htp-fusion.h"
 #include "htp-budget.h"
+#include "host-io-trace.h"
 
 using intvec  = std::vector<int>;
 using uintvec = std::vector<unsigned int>;
@@ -750,6 +751,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     if ((extra->flags & HTP_TENSOR_TILED) == 0) {
         memcpy((char *) tensor->data + offset, data, size);
+        hex_io_trace.tensor("set_tensor", sess->c_name(), tensor, buffer, size, 1, false);
         return;
     }
 
@@ -758,9 +760,11 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         extra->repack_initialized = true;
         std::vector<uint8_t>().swap(extra->shadow_buf);
         std::vector<std::pair<size_t, size_t>>().swap(extra->shadow_ranges);
+        hex_io_trace.tensor("set_tensor", sess->c_name(), tensor, buffer, size, 1, true);
         return;
     }
     htp_update_repack_shadow(tensor, data, offset, size, 1, 0, 0);
+    hex_io_trace.tensor("set_tensor", sess->c_name(), tensor, buffer, size, 1, true);
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -777,10 +781,12 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     if ((extra->flags & HTP_TENSOR_TILED) == 0) {
         memcpy(data, (const char *) tensor->data + offset, size);
+        hex_io_trace.tensor("get_tensor", sess->c_name(), tensor, buffer, size, 1, false);
         return;
     }
 
     htp_unpack_tensor_tiled(data, tensor, offset, size);
+    hex_io_trace.tensor("get_tensor", sess->c_name(), tensor, buffer, size, 1, true);
 }
 
 static bool ggml_backend_hexagon_buffer_cpy_tensor(ggml_backend_buffer_t      buffer,
@@ -820,10 +826,12 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
         for (size_t i = 0; i < n_copies; i++) {
             memcpy((uint8_t *) tensor->data + offset + i * stride_tensor, (const uint8_t *) data + i * stride_data, size);
         }
+        hex_io_trace.tensor("set_tensor_2d", sess->c_name(), tensor, buffer, size, n_copies, false);
         return;
     }
 
     htp_update_repack_shadow(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+    hex_io_trace.tensor("set_tensor_2d", sess->c_name(), tensor, buffer, size, n_copies, true);
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
@@ -845,6 +853,7 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
         for (size_t i = 0; i < n_copies; i++) {
             memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)tensor->data + offset + i * stride_tensor, size);
         }
+        hex_io_trace.tensor("get_tensor_2d", sess->c_name(), tensor, buffer, size, n_copies, false);
         return;
     }
 
@@ -863,6 +872,7 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
     for (size_t i = 0; i < n_copies; i++) {
         memcpy((uint8_t *) data + i * stride_data, temp_buf.data() + i * stride_tensor, size);
     }
+    hex_io_trace.tensor("get_tensor_2d", sess->c_name(), tensor, buffer, size, n_copies, true, true);
 }
 
 static void ggml_backend_hexagon_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -1820,6 +1830,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
         this->batch_rsp_seq = rsp.seq;
+        hex_io_trace.record("batch_complete", c_name(), ",\"batch_seq\":%" PRIu64 ",\"status\":%u",
+                            (uint64_t) rsp.seq, (unsigned) rsp.status);
 
         if (!all) break;
     }
@@ -1828,6 +1840,9 @@ void ggml_hexagon_session::flush_pending(bool all) {
 void ggml_hexagon_session::flush_sync(bool all) {
     flush_async();
     flush_pending(all);
+    hex_io_trace.record("flush_sync_return", c_name(),
+                        ",\"requested_seq\":%" PRIu64 ",\"completed_seq\":%" PRIu64 ",\"all\":%s",
+                        (uint64_t) batch_req_seq, (uint64_t) batch_rsp_seq, all ? "true" : "false");
 }
 
 void ggml_hexagon_session::start_batch() {
@@ -1871,6 +1886,8 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         if (err != 0) {
             GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", sub->c_name(), (unsigned) err);
         }
+        hex_io_trace.record("batch_submit", sub->c_name(), ",\"batch_seq\":%" PRIu64 ",\"queued_ops\":%u,\"descriptor_bytes\":%u",
+                            seq, (unsigned) op_batch->n_ops, (unsigned) sub_dbuf.size);
     }
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
@@ -1879,6 +1896,8 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
+    hex_io_trace.record("batch_submit", c_name(), ",\"batch_seq\":%" PRIu64 ",\"queued_ops\":%u,\"descriptor_bytes\":%u",
+                        seq, (unsigned) op_batch->n_ops, (unsigned) dbuf.size);
 
     op_batch->reset();
 }
@@ -2517,6 +2536,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         return GGML_STATUS_FAILED;
     }
 
+    hex_io_trace.record("graph_dispatch", sess->c_name(), ",\"logical_nodes\":%d,\"queued_ops\":%zu,\"cache_hit\":%s",
+                        graph->n_nodes, nodes_ptr->size(), cache_hit ? "true" : "false");
     return GGML_STATUS_SUCCESS;
 }
 
@@ -3456,6 +3477,7 @@ static void ggml_hexagon_discover_devices() {
 }
 
 static void ggml_hexagon_init(ggml_backend_reg * reg) {
+    hex_io_trace.init();
     // Basic sanity checks to make sure definitions match
     static_assert((unsigned int) HTP_TYPE_Q4_0 == (unsigned int) GGML_TYPE_Q4_0,
                   "please update hexagon_type to match ggml_type");
