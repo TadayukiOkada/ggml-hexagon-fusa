@@ -1,0 +1,29 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10220,6 +10220,25 @@
+         }
+     }
+ 
++    // Fewer output rows than HTP threads take the pure-DDR kernel instead of one thread per row:
++    // 1D convs of 1-3 batches (strided/padded and exact tiling) and short 2D images. With several
++    // devices all must pick the same kernel: 5 rows split 3 + 2, and exact-tiling rows that fit
++    // VTCM for one thread but not two.
++    for (int64_t n : {1, 2, 3, 5}) {
++        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16,
++            {3000, 80, n, 1}, {3, 80, 384, 1}, 1, 0, 1, 0, 1, 0, false));
++        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16,
++            {3000, 128, n, 1}, {2, 128, 128, 1}, 2, 0, 0, 0, 1, 0, false));
++        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16,
++            {600, 128, n, 1}, {2, 128, 128, 1}, 2, 0, 0, 0, 1, 0, false));
++    }
++    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32,
++        {3000, 80, 1, 1}, {3, 80, 384, 1}, 1, 0, 1, 0, 1, 0, false));
++    for (int64_t ih : {3, 5}) {
++        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16,
++            {256, ih, 64, 1}, {3, 3, 64, 64}, 1, 1, 0, 0, 1, 1, true));
++    }
++
+     // im2col 3D
+     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32));

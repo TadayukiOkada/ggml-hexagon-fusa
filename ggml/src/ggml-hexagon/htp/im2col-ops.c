@@ -548,19 +548,22 @@ int op_im2col(struct htp_ops_context * octx) {
 
     uint32_t row_base = 0;
     uint32_t nrows    = total_rows;
+    uint32_t rows_max = total_rows;  // the most rows any device gets
     if (octx->ctx->mdev.count > 1) {
         const uint32_t row_size = dst->nb[2];
         const uint32_t rows_per_chunk =
             (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
-        const struct htp_tensor_mdev_range range =
-            htp_tensor_mdev_partition(total_rows, htp_tensor_mdev_data_aligned(dst) ? rows_per_chunk : 0,
-                                      octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
-        row_base = range.start;
-        nrows    = range.count;
-    }
-
-    if (npatches == 0 && nrows == 0) {
-        return HTP_STATUS_OK;
+        const uint32_t row_chunk = htp_tensor_mdev_data_aligned(dst) ? rows_per_chunk : 0;
+        rows_max = 0;
+        for (uint32_t d = 0; d < octx->ctx->mdev.count; d++) {
+            const struct htp_tensor_mdev_range range =
+                htp_tensor_mdev_partition(total_rows, row_chunk, d, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            rows_max = MAX(rows_max, range.count);
+            if (d == octx->ctx->mdev.idx) {
+                row_base = range.start;
+                nrows    = range.count;
+            }
+        }
     }
 
     const uint32_t n_threads = MIN(octx->n_threads, MAX(npatches, 1));
@@ -581,25 +584,32 @@ int op_im2col(struct htp_ops_context * octx) {
 #else
     const bool row_fits_yield_budget = true;
 #endif
-    if (nrows > 0 && row_fits_yield_budget) {
-        const uint32_t pth = MIN(octx->n_threads, nrows);
-        if (pth > 0) {
-            ictx.pe_row_base = row_base;
-            ictx.pe_nrows    = nrows;
-            const bool exact = im2col_use_patchembed_dma(octx);
-            if (exact && im2col_patchembed_dma_fits(octx, &ictx, pth)) {
-                im2col_run_rows(octx, &ictx, dst->type == HTP_TYPE_F16 ? im2col_patchembed_dma_thread
-                                                                       : im2col_patchembed_dma_f32_thread,
-                                row_base, nrows, pth, dst->nb[2]);
-                return HTP_STATUS_OK;
+    // The row kernels run one thread per row, so with few rows (a 1D conv of one or two batches)
+    // the pure-DDR kernel, split over all threads, can be faster. Per thread the exact-tiling
+    // kernel is about 2.4x and the blocked kernel about 1.5x the pure-DDR kernel on v73: they win
+    // from n_threads/2 and from more than n_threads/2 rows.
+    // All devices must pick the same kernel: rows and patches are partitioned differently, so a
+    // device on a row kernel next to one on the pure-DDR kernel would leave part of dst unwritten.
+    // Decide from values every device computes alike (the shape and rows_max), never from nrows.
+    const uint32_t pth_max = MIN(octx->n_threads, rows_max);
+    const bool     exact   = im2col_use_patchembed_dma(octx);
+    const bool     enough_rows = exact ? 2 * rows_max >= octx->n_threads : 2 * rows_max > octx->n_threads;
+    worker_callback_t row_fn = NULL;
+    if (rows_max > 0 && row_fits_yield_budget && enough_rows) {
+        if (exact) {
+            if (im2col_patchembed_dma_fits(octx, &ictx, pth_max)) {
+                row_fn = dst->type == HTP_TYPE_F16 ? im2col_patchembed_dma_thread : im2col_patchembed_dma_f32_thread;
             }
-            if (!exact && im2col_blocked_dma_fits(octx, &ictx, pth)) {
-                im2col_run_rows(octx, &ictx, dst->type == HTP_TYPE_F16 ? im2col_blocked_dma_thread
-                                                                       : im2col_blocked_dma_f32_thread,
-                                row_base, nrows, pth, dst->nb[2]);
-                return HTP_STATUS_OK;
-            }
+        } else if (im2col_blocked_dma_fits(octx, &ictx, pth_max)) {
+            row_fn = dst->type == HTP_TYPE_F16 ? im2col_blocked_dma_thread : im2col_blocked_dma_f32_thread;
         }
+    }
+    if (row_fn) {
+        // The VTCM layout above is sized for pth_max threads; this device may use fewer.
+        if (nrows > 0) {
+            im2col_run_rows(octx, &ictx, row_fn, row_base, nrows, MIN(octx->n_threads, nrows), dst->nb[2]);
+        }
+        return HTP_STATUS_OK;
     }
     // Fall through to pure-DDR.
     if (npatches == 0) {
