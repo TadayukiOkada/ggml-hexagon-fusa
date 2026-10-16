@@ -241,3 +241,7 @@ void work_queue_wakeup(work_queue_t q) {
 void work_queue_suspend(work_queue_t q) {
     atomic_store_explicit(&q->active, 0, memory_order_release);
 }
+
+bool work_queue_is_active(work_queue_t q) {
+    return atomic_load_explicit(&q->active, memory_order_relaxed) != 0;
+}

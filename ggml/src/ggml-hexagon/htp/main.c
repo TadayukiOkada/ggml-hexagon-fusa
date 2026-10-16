@@ -1285,19 +1285,27 @@ void htp_vtcm_yield(struct htp_context * ctx) {
         return;
     }
 
-    // The hmx-queue thread holds the HMX lock and the workers spin while active
-    if (ctx->hmx_queue) {
-        hmx_queue_suspend(ctx->hmx_queue);
-        hmx_queue_flush(ctx->hmx_queue);
+    // Both queues are woken and suspended together. They are active inside a batch; the
+    // mdev barrier at the end of a batch runs after they are suspended, so leave them so.
+    const bool active = work_queue_is_active(ctx->work_queue);
+
+    if (active) {
+        // The hmx-queue thread holds the HMX lock and the workers spin while active
+        if (ctx->hmx_queue) {
+            hmx_queue_suspend(ctx->hmx_queue);
+            hmx_queue_flush(ctx->hmx_queue);
+        }
+        work_queue_suspend(ctx->work_queue);
     }
-    work_queue_suspend(ctx->work_queue);
 
     vtcm_release(ctx);
     vtcm_acquire(ctx);
 
-    work_queue_wakeup(ctx->work_queue);
-    if (ctx->hmx_queue) {
-        hmx_queue_wakeup(ctx->hmx_queue);
+    if (active) {
+        work_queue_wakeup(ctx->work_queue);
+        if (ctx->hmx_queue) {
+            hmx_queue_wakeup(ctx->hmx_queue);
+        }
     }
 }
 #endif // HTP_YIELD_BETWEEN_OPS
