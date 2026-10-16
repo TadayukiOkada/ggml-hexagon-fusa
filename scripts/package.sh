@@ -116,6 +116,26 @@ RUN
     chmod +x "$out/run-asr.sh"
 fi
 
+# Licenses of what the package contains: this backend, llama.cpp/ggml and the
+# notices llama.cpp ships, and for --asr NeMo-Speech.cpp and SentencePiece.
+lic=$out/licenses; mkdir -p "$lic"
+cp "$top/LICENSE" "$lic/LICENSE"
+cp "$top/llama.cpp/LICENSE" "$lic/llama.cpp-LICENSE"
+for f in "$top"/llama.cpp/licenses/*; do [ -f "$f" ] && cp "$f" "$lic/llama.cpp-$(basename "$f")"; done
+if [ $asr -eq 1 ]; then
+    for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md; do cp "$top/NeMo-Speech.cpp/$f" "$lic/NeMo-Speech.cpp-$f"; done
+    echo "NeMo-Speech.cpp is built with the changes in asr/patches of ggml-hexagon-fusa." > "$lic/NeMo-Speech.cpp-MODIFIED"
+    spm=$build/asr/sentencepiece/src/sentencepiece
+    if [ -f "$spm/LICENSE" ]; then
+        cp "$spm/LICENSE" "$lic/sentencepiece-LICENSE"
+        for d in "$spm"/third_party/*/; do
+            [ -f "$d/LICENSE" ] && cp "$d/LICENSE" "$lic/sentencepiece-$(basename "$d")-LICENSE"
+        done
+    else
+        echo "package: add the licenses of the SentencePiece library given to the build to $lic" >&2
+    fi
+fi
+
 {
     echo "build-id:   $(cat "$build/hexagon-build-id.txt")"
     echo "llama.cpp:  $(git -C "$top/llama.cpp" rev-parse HEAD)"

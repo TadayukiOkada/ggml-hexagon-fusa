@@ -11,6 +11,10 @@ libraries always have to come from the same build.
 
 > Status: work in progress. Built and tested on an HTP v73 FuSa board and a
 > QCS9075 (v73) development kit; interfaces may still change.
+>
+> "FuSa" names the DSP firmware this backend runs alongside. The backend itself
+> is not developed or assessed to any functional-safety standard, and this
+> project is not affiliated with or endorsed by Qualcomm.
 
 ## Scope
 
@@ -162,3 +166,7 @@ commit, then build all presets and run the device tests before committing.
 
 MIT, see [LICENSE](LICENSE). The backend is derived from llama.cpp /
 ggml by the ggml authors.
+
+`asr/patches/` modify NeMo-Speech.cpp and are under its Apache License 2.0.
+Packages made by `scripts/package.sh` carry the licenses of their contents in
+`licenses/`.
