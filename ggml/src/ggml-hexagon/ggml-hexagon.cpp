@@ -5154,6 +5154,11 @@ void ggml_hexagon_session::enqueue_allreduce(
 ggml_hexagon_shared_buffer * ggml_hexagon_session::mmap_tensor(const ggml_tensor * t) {
     if (!t) return nullptr;
 
+    if (!t->buffer || !ggml_backend_buffer_is_hexagon(t->buffer)) {
+        GGML_ABORT("HTP enqueue tensor '%s' has non-Hexagon storage '%s' (op %s)",
+                   t->name, t->buffer ? ggml_backend_buffer_name(t->buffer) : "unallocated",
+                   ggml_op_name(t->op));
+    }
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
     if (!sbuf->mapped) {
         const bool is_weight = ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
