@@ -289,6 +289,10 @@ AEEResult htp_iface_munmap(remote_handle64 handle, uint32 fd) {
 static void vtcm_acquire(struct htp_context * ctx) {
     if (!ctx->vtcm_valid) {
         if (ctx->profiler) atomic_store(&ctx->resource_request_us, 0);
+        // Clear before asking, not after: a release request can come as soon as the resources
+        // are granted, and clearing it afterwards lost it, so the holder kept them until its
+        // batch ran out (about 0.5 s for a 512-token prefill) while the requester waited.
+        ctx->vtcm_needs_release = false;
         // The resource manager takes the caller's thread priority as the request priority. Ask at
         // the lowered priority the resources are held with (below), so that two sessions on one
         // CDSP do not take them from each other at every op boundary: a client above both (the
@@ -311,7 +315,6 @@ static void vtcm_acquire(struct htp_context * ctx) {
             abort();
         }
 
-        ctx->vtcm_needs_release = false;
         ctx->vtcm_valid = true;
         if (ctx->profiler) {
             ctx->resource_acquired_us = HAP_perf_get_time_us();
