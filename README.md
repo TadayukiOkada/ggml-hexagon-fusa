@@ -194,6 +194,8 @@ F16 query embeddings are converted to float instead of being read as F32.
 With HTP, attention uses flash attention with F16 keys and values: it releases
 VTCM between output blocks, so the segment length is not bounded by the FuSa
 self-test period, and the scores (segment length squared) are never stored.
+The CTC head computes the best token of each frame in chunks of 256 frames, so
+its logits (25055 per frame) are not kept for the whole segment either.
 On the CPU (`--backend cpu`) the graph and results are those of the upstream
 implementation.
 

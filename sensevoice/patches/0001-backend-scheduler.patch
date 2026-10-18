@@ -1,5 +1,5 @@
 diff --git a/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp b/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
-index 778eaee..69fe8e1 100644
+index 778eaee..b7cc09a 100644
 --- a/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
 +++ b/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
 @@ -9,6 +9,7 @@
@@ -79,7 +79,7 @@ index 778eaee..69fe8e1 100644
    // load model
    model m; gguf_init_params gp={false,&m.ctx_w}; gguf_context*gg=gguf_init_from_file(gguf_path.c_str(),gp);
    if(!gg){fprintf(stderr,"load gguf failed\n");return 1;}
-@@ -126,33 +133,35 @@ int main(int argc,char**argv){
+@@ -126,48 +133,56 @@ int main(int argc,char**argv){
    std::vector<std::string> vocab; {int ki=gguf_find_key(gg,"sv.vocab"); if(ki>=0){int nv=gguf_get_arr_n(gg,ki); vocab.resize(nv); for(int i=0;i<nv;i++){const char*s=gguf_get_arr_str(gg,ki,i); vocab[i]=s?s:"";}}}
    for(int i=0;i<gguf_get_n_tensors(gg);i++){const char*nm=gguf_get_tensor_name(gg,i);m.t[nm]=ggml_get_tensor(m.ctx_w,nm);}
    gguf_free(gg);
@@ -113,20 +113,34 @@ index 778eaee..69fe8e1 100644
 -    for(int i=0;i<m.c.tp_blocks;i++) h=sanm_layer(c,m,"encoder.tp_encoders."+std::to_string(i)+".",h,N,true);
 +    for(int i=0;i<m.c.tp_blocks;i++) h=sanm_layer(c,m,"encoder.tp_encoders."+std::to_string(i)+".",h,N,true,flash);
      h=lnorm(c,h,m.g("encoder.tp_norm.weight"),m.g("encoder.tp_norm.bias"));
-     ggml_tensor*logits=lin(c,m.g("ctc.ctc_lo.weight"),m.g("ctc.ctc_lo.bias"),h);  // [V, N]
-     ggml_set_output(logits);
-     ggml_cgraph*gf=ggml_new_graph_custom(c,32768,false); ggml_build_forward_expand(gf,logits);
+-    ggml_tensor*logits=lin(c,m.g("ctc.ctc_lo.weight"),m.g("ctc.ctc_lo.bias"),h);  // [V, N]
+-    ggml_set_output(logits);
+-    ggml_cgraph*gf=ggml_new_graph_custom(c,32768,false); ggml_build_forward_expand(gf,logits);
 -    ggml_gallocr_t ga=ggml_gallocr_new(ggml_backend_cpu_buffer_type()); ggml_gallocr_alloc_graph(ga,gf);
 -    ggml_backend_tensor_set(x,inp.data(),0,ggml_nbytes(x)); ggml_backend_cpu_set_n_threads(be,8);
 -    if(ggml_backend_graph_compute(be,gf)!=GGML_STATUS_SUCCESS){fprintf(stderr,"compute failed\n");}
+-    std::vector<float> lg((size_t)V*N); ggml_backend_tensor_get(logits,lg.data(),0,ggml_nbytes(logits));
+-    std::vector<int> seg_ids; int prev=-1;   // greedy CTC: argmax per frame -> collapse -> drop blank
+-    for(int n=0;n<N;n++){ const float*col=&lg[(size_t)n*V]; int am=0; float best=col[0];
+-      for(int v=1;v<V;v++) if(col[v]>best){best=col[v];am=v;}
+-      if(am!=prev && am!=m.c.blank) seg_ids.push_back(am); prev=am; }
++    ggml_cgraph*gf=ggml_new_graph_custom(c,32768,false);
++    ggml_tensor*logits=nullptr; std::vector<ggml_tensor*> best;
++    if(flash){ best=funasr::chunked_argmax(c,m.g("ctc.ctc_lo.weight"),m.g("ctc.ctc_lo.bias"),h);  // no [V, N] logits
++      for(auto t:best) ggml_build_forward_expand(gf,t); }
++    else { logits=lin(c,m.g("ctc.ctc_lo.weight"),m.g("ctc.ctc_lo.bias"),h);  // [V, N]
++      ggml_set_output(logits); ggml_build_forward_expand(gf,logits); }
 +    auto sched=runtime.allocate_graph(gf);
 +    ggml_backend_tensor_set(x,inp.data(),0,ggml_nbytes(x));
 +    if(ggml_backend_sched_graph_compute(sched,gf)!=GGML_STATUS_SUCCESS){ggml_backend_sched_free(sched);ggml_free(c);throw std::runtime_error("compute failed");}
-     std::vector<float> lg((size_t)V*N); ggml_backend_tensor_get(logits,lg.data(),0,ggml_nbytes(logits));
-     std::vector<int> seg_ids; int prev=-1;   // greedy CTC: argmax per frame -> collapse -> drop blank
-     for(int n=0;n<N;n++){ const float*col=&lg[(size_t)n*V]; int am=0; float best=col[0];
-@@ -160,14 +169,14 @@ int main(int argc,char**argv){
-       if(am!=prev && am!=m.c.blank) seg_ids.push_back(am); prev=am; }
++    std::vector<int> frame_ids;   // greedy CTC: argmax per frame -> collapse -> drop blank
++    if(flash) frame_ids=funasr::read_argmax(best);
++    else { std::vector<float> lg((size_t)V*N); ggml_backend_tensor_get(logits,lg.data(),0,ggml_nbytes(logits));
++      for(int n=0;n<N;n++){ const float*col=&lg[(size_t)n*V]; int am=0; float bv=col[0];
++        for(int v=1;v<V;v++) if(col[v]>bv){bv=col[v];am=v;}
++        frame_ids.push_back(am); } }
++    std::vector<int> seg_ids; int prev=-1;
++    for(int am:frame_ids){ if(am!=prev && am!=m.c.blank) seg_ids.push_back(am); prev=am; }
      if(emit_ids){ for(int id:seg_ids) printf("%d ",id); }
      else { std::string t=detok_sv(seg_ids,vocab,keep_tags); printf("%s",t.c_str()); }
 -    ggml_gallocr_free(ga); ggml_free(c); ggml_backend_free(be);
@@ -142,7 +156,7 @@ index 778eaee..69fe8e1 100644
      for(auto&s:segs){ int off=(int)((int64_t)s.first*16000/1000), end=(int)((int64_t)s.second*16000/1000);
        if(end>(int)wav.size())end=wav.size(); if(end-off<WINLEN)continue;
        std::vector<float> seg(wav.begin()+off,wav.begin()+end); int t=0; auto fb=compute_fbank(seg,t); run_seg(fb,t); }
-@@ -180,12 +189,18 @@ int main(int argc,char**argv){
+@@ -180,12 +195,18 @@ int main(int argc,char**argv){
      } else {
        FILE*f=fopen(fbank_path.c_str(),"rb"); if(!f){fprintf(stderr,"open fbank\n");return 1;}
        if(fread(&T,4,1,f)!=1||fread(&Fc,4,1,f)!=1){fclose(f);return 1;}

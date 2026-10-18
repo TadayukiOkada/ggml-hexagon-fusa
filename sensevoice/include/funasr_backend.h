@@ -178,4 +178,34 @@ inline ggml_tensor * attention(ggml_context * c, ggml_tensor * q, ggml_tensor * 
     auto kq = ggml_soft_max(c, ggml_scale(c, ggml_mul_mat(c, k, q), scale));
     return ggml_cont_2d(c, ggml_permute(c, ggml_mul_mat(c, vh, kq), 0, 2, 1, 3), D, T);
 }
+// Per-frame argmax of a linear layer (weights w, optional bias b) over x [D, N], computed in
+// chunks of frames so that the [V, N] scores are never stored at once: greedy CTC needs only the
+// best token of each frame, and the CTC logits are 25055 x frames floats (1 GB for 10 minutes).
+// A chunk also bounds the HTP argmax, which does not release VTCM inside the op: 256 frames of
+// 25055 scores take about 9 ms on v73 (512 frames 17 ms).
+// Returns the I32 argmax outputs of the chunks in frame order; build the graph from all of them.
+static constexpr int argmax_chunk_frames = 256;
+
+inline std::vector<ggml_tensor *> chunked_argmax(ggml_context * c, ggml_tensor * w, ggml_tensor * b,
+                                                 ggml_tensor * x, int chunk = argmax_chunk_frames) {
+    std::vector<ggml_tensor *> out;
+    for (int64_t i = 0; i < x->ne[1]; i += chunk) {
+        const int64_t n = std::min<int64_t>(chunk, x->ne[1] - i);
+        auto y = ggml_mul_mat(c, w, ggml_view_2d(c, x, x->ne[0], n, x->nb[1], i * x->nb[1]));
+        auto am = ggml_argmax(c, b ? ggml_add(c, y, b) : y);
+        ggml_set_output(am);
+        out.push_back(am);
+    }
+    return out;
+}
+
+inline std::vector<int> read_argmax(const std::vector<ggml_tensor *> & chunks) {
+    std::vector<int> ids;
+    for (auto t : chunks) {
+        std::vector<int32_t> part(t->ne[0]);
+        ggml_backend_tensor_get(t, part.data(), 0, ggml_nbytes(t));
+        ids.insert(ids.end(), part.begin(), part.end());
+    }
+    return ids;
+}
 } // namespace funasr

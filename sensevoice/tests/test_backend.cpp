@@ -1,4 +1,4 @@
-// CPU scheduling, weights, query dtypes, attention and fail-closed backend selection.
+// CPU scheduling, weights, query dtypes, attention, chunked argmax and fail-closed backend selection.
 #include "funasr_backend.h"
 #include <cmath>
 #include <iostream>
@@ -82,6 +82,41 @@ int main() {
                     for (int j = 0; j < frames; ++j) o += p[j] / sum * qkv[2][(size_t) j * D + h * dk + c];
                     require(fabs(output[(size_t) i * D + h * dk + c] - o) < (flash ? 1e-2 : 1e-4), "incorrect attention result");
                 }
+            }
+            ggml_backend_sched_free(sched); ggml_free(ctx);
+        }
+        // Per-frame argmax of a linear layer in chunks (three chunks, the last one short) against
+        // a direct computation.
+        {
+            const int D = 8, V = 37, frames = 2 * funasr::argmax_chunk_frames + 77;
+            std::vector<float> w((size_t) D * V), b(V), x((size_t) D * frames);
+            for (size_t i = 0; i < w.size(); ++i) w[i] = sinf(0.71f * i + 0.2f);
+            for (size_t i = 0; i < b.size(); ++i) b[i] = 0.1f * cosf(1.3f * i);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = sinf(0.37f * i + 1.1f);
+            ggml_init_params params = {1024 * 1024, nullptr, true};
+            auto ctx = ggml_init(params);
+            auto tw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, V), tb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, V);
+            auto tx = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, frames);
+            for (auto t : {tw, tb, tx}) ggml_set_input(t);
+            auto chunks = funasr::chunked_argmax(ctx, tw, tb, tx);
+            require(chunks.size() == 3, "argmax chunk count");
+            auto graph = ggml_new_graph(ctx);
+            for (auto t : chunks) ggml_build_forward_expand(graph, t);
+            auto sched = runtime.allocate_graph(graph);
+            ggml_backend_tensor_set(tw, w.data(), 0, ggml_nbytes(tw));
+            ggml_backend_tensor_set(tb, b.data(), 0, ggml_nbytes(tb));
+            ggml_backend_tensor_set(tx, x.data(), 0, ggml_nbytes(tx));
+            require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "argmax compute failed");
+            auto ids = funasr::read_argmax(chunks);
+            require(ids.size() == (size_t) frames, "argmax id count");
+            for (int n = 0; n < frames; ++n) {
+                int best = 0; double top = -INFINITY;
+                for (int v = 0; v < V; ++v) {
+                    double s = b[v];
+                    for (int d = 0; d < D; ++d) s += (double) w[(size_t) v * D + d] * x[(size_t) n * D + d];
+                    if (s > top) { top = s; best = v; }
+                }
+                require(ids[n] == best, "incorrect chunked argmax");
             }
             ggml_backend_sched_free(sched); ggml_free(ctx);
         }
