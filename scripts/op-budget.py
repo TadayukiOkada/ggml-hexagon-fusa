@@ -29,11 +29,11 @@ LINE = re.compile(
 
 # Ops that release VTCM/HMX on request inside the op in builds with GGML_HEXAGON_HTP_YIELD_IN_CPY
 # (CONT, CPY) and GGML_HEXAGON_HTP_YIELD_IN_OPS (flash attention, IM2COL, GET_ROWS, PAD, unary ops,
-# multi-row sorts, the HMX 2D matmul), plus fence waits with GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS.
+# SOFT_MAX, multi-row sorts, the HMX 2D matmul), plus fence waits with GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS.
 # "OP:tag" only counts the op with that tag: the kernel
 # path for matmuls and flash attention (e.g. hmx-tiled), otherwise multi-row or single-row.
 YIELDING = ["CONT", "CPY", "FENCE_WAIT", "FLASH_ATTN_EXT", "IM2COL", "GET_ROWS", "PAD", "MUL_MAT:hmx-tiled",
-            "ARGSORT:multi-row", "TOP_K:multi-row",
+            "SOFT_MAX", "ARGSORT:multi-row", "TOP_K:multi-row",
             "SCALE", "CLAMP", "LEAKY_RELU", "SQR", "SQRT", "NEG", "EXP", "SIGMOID", "SILU", "GELU",
             "GELU_QUICK", "GELU_ERF", "SOFTPLUS", "TANH", "ABS", "LOG", "RELU", "STEP",
             "NORM", "RMS_NORM", "RMS_NORM_MUL", "L2_NORM", "TRI"]

@@ -8012,6 +8012,19 @@ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * s
         HEX_REJECT("vtcm_limit");
     }
 
+#ifndef GGML_HEXAGON_HTP_YIELD_IN_OPS
+    // Without rounds the whole op holds VTCM: about 1.7 G elements/s on v73 (attention scores
+    // without flash attention, 12288 keys x 512 rows x 16 heads, take 58 ms).
+    if (opt_op_budget_ms > 0) {
+        const double est = (double) ggml_nelements(src0) / 1.2e6;
+        if (est > opt_op_budget_ms) {
+            HEX_VERBOSE("ggml-hex: %s SOFT_MAX %s estimated %.1f ms > budget %.1f ms, left to the CPU\n",
+                        sess->c_name(), dst->name, est, opt_op_budget_ms);
+            HEX_REJECT("op_budget");
+        }
+    }
+#endif
+
     return true;
 
     GGML_UNUSED(sess);

@@ -86,10 +86,9 @@ public:
     backend & operator=(const backend &) = delete;
 
     // SAN-M attention grows with the square of the segment length. On v73 its score matmul takes
-    // about 10 ms for 512 frames (38 ms for 1024, over the FuSa self-test period); the backend
-    // leaves such a matmul to the CPU, but its softmax has no estimate and no release point. So
-    // longer segments (more than about 30 s of audio; --vad keeps them shorter) are computed on
-    // the CPU.
+    // about 10 ms for 512 frames (38 ms for 1024, over the FuSa self-test period, which the
+    // backend's budget leaves to the CPU). Rather than go back and forth in every layer, longer
+    // segments (more than about 30 s of audio; --vad keeps them shorter) are computed on the CPU.
     static constexpr int max_accelerated_frames = 512;
 
     bool accelerates(int frames) const {
