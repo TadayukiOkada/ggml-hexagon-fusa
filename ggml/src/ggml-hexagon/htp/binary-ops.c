@@ -993,6 +993,75 @@ static void binary_thread_chunked(unsigned int nth, unsigned int ith, void * dat
     dma_queue_flush(dma_q);
 }
 
+// Stage the operands that the row kernels read from VTCM for all rows (row broadcast, scalar,
+// repeat, complex, ADD_ID), before the rows and again after VTCM was given away.
+static void binary_stage_srcs(struct htp_ops_context * octx, const struct htp_binary_kernel_params * kparams,
+                              struct htp_binary_context * bctx, size_t elem_size) {
+    if (kparams->kernel_type != HTP_BINARY_KERNEL_ROW_BCAST &&
+        kparams->kernel_type != HTP_BINARY_KERNEL_SCALAR &&
+        kparams->kernel_type != HTP_BINARY_KERNEL_REPEAT &&
+        kparams->kernel_type != HTP_BINARY_KERNEL_COMPLEX &&
+        kparams->kernel_type != HTP_BINARY_KERNEL_ADD_ID) {
+        return;
+    }
+
+    const struct htp_tensor * src1 = octx->src[1];
+    const uint32_t src0_type = octx->src[0]->type;
+
+    dma_queue * dma_q = octx->ctx->dma[0];
+    uint8_t * vtcm_src1 = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, bctx->vtcm_layout.off_src1);
+    if (kparams->kernel_type == HTP_BINARY_KERNEL_ROW_BCAST) {
+        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data), bctx->vtcm_layout.src1_size, 0, src1->ne[0] * elem_size, 1);
+    } else if (kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR ||
+               kparams->kernel_type == HTP_BINARY_KERNEL_REPEAT ||
+               kparams->kernel_type == HTP_BINARY_KERNEL_COMPLEX) {
+        if (!kparams->src1_strided) {
+            const size_t src1_bytes = (size_t) src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3] * elem_size;
+            dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data), bctx->vtcm_layout.src1_size, 0, src1_bytes, 1);
+            if (kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR && octx->src[2] != NULL) {
+                uint8_t * vtcm_src2 = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, bctx->vtcm_layout.off_src2);
+                dma_queue_push(dma_q, dma_make_data(vtcm_src2, octx->src[2]->data), bctx->vtcm_layout.src2_size, 0, src1_bytes, 1);
+            }
+        } else {
+            const uint32_t ne11 = src1->ne[1];
+            const uint32_t ne12 = src1->ne[2];
+            const uint32_t ne13 = src1->ne[3];
+            const size_t row_bytes = src1->ne[0] * elem_size;
+            for (uint32_t i13 = 0; i13 < ne13; i13++) {
+                for (uint32_t i12 = 0; i12 < ne12; i12++) {
+                    dma_addr_t src_addr = src1->data + i13 * src1->nb[3] + i12 * src1->nb[2];
+                    uint8_t * dst_ptr = vtcm_src1 + (i13 * ne12 * ne11 + i12 * ne11) * row_bytes;
+                    while (!dma_queue_push(dma_q, dma_make_data(dst_ptr, src_addr),
+                                           row_bytes, src1->nb[1], row_bytes, ne11)) {
+                        dma_queue_pop(dma_q);
+                    }
+                }
+            }
+        }
+    } else if (kparams->kernel_type == HTP_BINARY_KERNEL_ADD_ID) {
+        const struct htp_tensor * src2 = octx->src[2];
+        uint8_t * vtcm_src2 = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, bctx->vtcm_layout.off_src2);
+        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data),
+                       kparams->src1_row_size_aligned, src1->nb[1],
+                       src1->ne[0] * elem_size, src1->ne[1]);
+        const size_t src2_row_bytes = src2->ne[0] * sizeof(int32_t);
+        dma_queue_push(dma_q, dma_make_data(vtcm_src2, src2->data),
+                       src2_row_bytes, src2->nb[1],
+                       src2_row_bytes, src2->ne[1]);
+    }
+
+    dma_queue_flush(dma_q);
+    if (kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR && octx->src[2] != NULL && octx->op == HTP_OP_MUL) {
+        uint8_t * vtcm_src2 = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, bctx->vtcm_layout.off_src2);
+        const uint32_t n_scalars = src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3];
+        if (src0_type == HTP_TYPE_F32) {
+            hvx_mul_f32_aaa(vtcm_src1, vtcm_src1, vtcm_src2, n_scalars);
+        } else if (src0_type == HTP_TYPE_F16) {
+            hvx_mul_f16_aaa(vtcm_src1, vtcm_src1, vtcm_src2, n_scalars);
+        }
+    }
+}
+
 static int execute_op_binary(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
@@ -1139,6 +1208,27 @@ static int execute_op_binary(struct htp_ops_context * octx) {
             .compute_scalar_f16  = compute_scalar_f16,
         };
 
+#ifdef HTP_YIELD_IN_OPS
+        // Large element-wise ops run in rounds of about 32 MiB of src0, so VTCM can be given away
+        // between rounds when a release is requested. Rounds start on chunk boundaries, and the
+        // scalar operand is already in a register.
+        const uint32_t round_chunks = MAX(n_threads, (uint32_t) MAX((size_t) 1, (32u << 20) / ((size_t) chunk_size * elem_size)) / n_threads * n_threads);
+        if (round_chunks < total_chunks) {
+            for (uint32_t done = 0; done < total_chunks;) {
+                const uint32_t n = MIN(round_chunks, total_chunks - done);
+                cctx.elem_start        = elem_start + done * chunk_size;
+                cctx.nelem             = MIN(n * chunk_size, nelem - done * chunk_size);
+                cctx.total_chunks      = n;
+                cctx.chunks_per_thread = (n + n_threads - 1) / n_threads;
+                work_queue_run(octx->ctx->work_queue, binary_thread_chunked, &cctx, n_threads);
+                done += n;
+                if (done < total_chunks && atomic_load(&octx->ctx->vtcm_needs_release)) {
+                    htp_vtcm_yield(octx->ctx);
+                }
+            }
+            return HTP_STATUS_OK;
+        }
+#endif
         work_queue_run(octx->ctx->work_queue, binary_thread_chunked, &cctx, n_threads);
         return HTP_STATUS_OK;
     }
@@ -1293,48 +1383,6 @@ static int execute_op_binary(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    dma_queue * dma_q = octx->ctx->dma[0];
-    uint8_t * vtcm_src1 = VTCM_LAYOUT_PTR(uint8_t, bctx.vtcm_base, bctx.vtcm_layout.off_src1);
-    if (kparams->kernel_type == HTP_BINARY_KERNEL_ROW_BCAST) {
-        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data), bctx.vtcm_layout.src1_size, 0, src1->ne[0] * elem_size, 1);
-    } else if (kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR ||
-               kparams->kernel_type == HTP_BINARY_KERNEL_REPEAT ||
-               kparams->kernel_type == HTP_BINARY_KERNEL_COMPLEX) {
-        if (!kparams->src1_strided) {
-            const size_t src1_bytes = (size_t) src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3] * elem_size;
-            dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data), bctx.vtcm_layout.src1_size, 0, src1_bytes, 1);
-            if (kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR && octx->src[2] != NULL) {
-                uint8_t * vtcm_src2 = VTCM_LAYOUT_PTR(uint8_t, bctx.vtcm_base, bctx.vtcm_layout.off_src2);
-                dma_queue_push(dma_q, dma_make_data(vtcm_src2, octx->src[2]->data), bctx.vtcm_layout.src2_size, 0, src1_bytes, 1);
-            }
-        } else {
-            const uint32_t ne11 = src1->ne[1];
-            const uint32_t ne12 = src1->ne[2];
-            const uint32_t ne13 = src1->ne[3];
-            const size_t row_bytes = src1->ne[0] * elem_size;
-            for (uint32_t i13 = 0; i13 < ne13; i13++) {
-                for (uint32_t i12 = 0; i12 < ne12; i12++) {
-                    dma_addr_t src_addr = src1->data + i13 * src1->nb[3] + i12 * src1->nb[2];
-                    uint8_t * dst_ptr = vtcm_src1 + (i13 * ne12 * ne11 + i12 * ne11) * row_bytes;
-                    while (!dma_queue_push(dma_q, dma_make_data(dst_ptr, src_addr),
-                                           row_bytes, src1->nb[1], row_bytes, ne11)) {
-                        dma_queue_pop(dma_q);
-                    }
-                }
-            }
-        }
-    } else if (kparams->kernel_type == HTP_BINARY_KERNEL_ADD_ID) {
-        const struct htp_tensor * src2 = octx->src[2];
-        uint8_t * vtcm_src2 = VTCM_LAYOUT_PTR(uint8_t, bctx.vtcm_base, bctx.vtcm_layout.off_src2);
-        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data),
-                       kparams->src1_row_size_aligned, src1->nb[1],
-                       src1->ne[0] * elem_size, src1->ne[1]);
-        const size_t src2_row_bytes = src2->ne[0] * sizeof(int32_t);
-        dma_queue_push(dma_q, dma_make_data(vtcm_src2, src2->data),
-                       src2_row_bytes, src2->nb[1],
-                       src2_row_bytes, src2->ne[1]);
-    }
-
     bctx.octx                  = octx;
     bctx.nrows_per_thread      = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
     bctx.total_rows            = nrows;
@@ -1358,23 +1406,30 @@ static int execute_op_binary(struct htp_ops_context * octx) {
     bctx.split_at_ne02  = kparams->split_at_ne02;
     bctx.compute        = compute_func;
 
-    if (kparams->kernel_type == HTP_BINARY_KERNEL_ROW_BCAST ||
-        kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR ||
-        kparams->kernel_type == HTP_BINARY_KERNEL_REPEAT ||
-        kparams->kernel_type == HTP_BINARY_KERNEL_COMPLEX ||
-        kparams->kernel_type == HTP_BINARY_KERNEL_ADD_ID) {
-        dma_queue_flush(dma_q);
-        if (kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR && octx->src[2] != NULL && octx->op == HTP_OP_MUL) {
-            uint8_t * vtcm_src2 = VTCM_LAYOUT_PTR(uint8_t, bctx.vtcm_base, bctx.vtcm_layout.off_src2);
-            const uint32_t n_scalars = src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3];
-            if (src0_type == HTP_TYPE_F32) {
-                hvx_mul_f32_aaa(vtcm_src1, vtcm_src1, vtcm_src2, n_scalars);
-            } else if (src0_type == HTP_TYPE_F16) {
-                hvx_mul_f16_aaa(vtcm_src1, vtcm_src1, vtcm_src2, n_scalars);
+    binary_stage_srcs(octx, kparams, &bctx, elem_size);
+
+#ifdef HTP_YIELD_IN_OPS
+    // Large ops (e.g. the CTC bias of a 5-minute speech segment, 25055 x 5004, 18 ms on v73) run
+    // in rounds of about 32 MiB of src0 rows, so VTCM can be given away between rounds when a
+    // release is requested. The operands kept in VTCM for all rows are staged again after a release.
+    const size_t   rows_32m   = (32u << 20) / MAX(src0_row_size, (size_t) 1);
+    const uint32_t round_rows = MAX(n_threads, (uint32_t) MIN(rows_32m, (size_t) nrows) / n_threads * n_threads);
+    if (round_rows < nrows) {
+        for (uint32_t done = 0; done < nrows;) {
+            const uint32_t n = MIN(round_rows, nrows - done);
+            bctx.row_start        = row_start + done;
+            bctx.total_rows       = n;
+            bctx.nrows_per_thread = fastdiv(n + n_threads - 1, &octx->n_threads_div);
+            work_queue_run(octx->ctx->work_queue, worker_func, &bctx, n_threads);
+            done += n;
+            if (done < nrows && atomic_load(&octx->ctx->vtcm_needs_release)) {
+                htp_vtcm_yield(octx->ctx);
+                binary_stage_srcs(octx, kparams, &bctx, elem_size);
             }
         }
+        return HTP_STATUS_OK;
     }
-
+#endif
     work_queue_run(octx->ctx->work_queue, worker_func, &bctx, n_threads);
 
     return HTP_STATUS_OK;
