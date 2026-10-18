@@ -1065,6 +1065,29 @@ static void binary_thread_chunked(unsigned int nth, unsigned int ith, void * dat
     dma_queue_flush(dma_q);
 }
 
+// Kernels that read src1 from VTCM for all rows: it is staged once, before the rows.
+static inline bool binary_stages_src1(const struct htp_binary_kernel_params * kparams) {
+    return kparams->kernel_type == HTP_BINARY_KERNEL_ROW_BCAST ||
+           kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR_DMA ||
+           kparams->kernel_type == HTP_BINARY_KERNEL_ADD_ID;
+}
+
+static void binary_stage_src1(struct htp_ops_context * octx, const struct htp_binary_kernel_params * kparams,
+                              const struct htp_binary_vtcm_layout * layout, uint8_t * vtcm_base, size_t elem_size) {
+    const struct htp_tensor * src1 = octx->src[1];
+    dma_queue * dma_q = octx->ctx->dma[0];
+    uint8_t * vtcm_src1 = VTCM_LAYOUT_PTR(uint8_t, vtcm_base, layout->off_src1);
+    if (kparams->kernel_type == HTP_BINARY_KERNEL_ROW_BCAST) {
+        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data), layout->src1_size, 0, src1->ne[0] * elem_size, 1);
+    } else if (kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR_DMA) {
+        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data), layout->src1_size, 0, src1->ne[1] * elem_size, 1);
+    } else if (kparams->kernel_type == HTP_BINARY_KERNEL_ADD_ID) {
+        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data),
+                       kparams->src1_row_size_aligned, src1->nb[1],
+                       src1->ne[0] * elem_size, src1->ne[1]);
+    }
+}
+
 static int execute_op_binary(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
@@ -1205,6 +1228,27 @@ static int execute_op_binary(struct htp_ops_context * octx) {
             .compute_scalar_f16  = compute_scalar_f16,
         };
 
+#ifdef HTP_YIELD_IN_OPS
+        // Large element-wise ops run in rounds of about 32 MiB of src0, so VTCM can be given away
+        // between rounds when a release is requested. Rounds start on chunk boundaries, and the
+        // scalar operand is already in a register.
+        const uint32_t round_chunks = MAX(n_threads, (uint32_t) MAX((size_t) 1, (32u << 20) / ((size_t) chunk_size * elem_size)) / n_threads * n_threads);
+        if (round_chunks < total_chunks) {
+            for (uint32_t done = 0; done < total_chunks;) {
+                const uint32_t n = MIN(round_chunks, total_chunks - done);
+                cctx.elem_start        = elem_start + done * chunk_size;
+                cctx.nelem             = MIN(n * chunk_size, nelem - done * chunk_size);
+                cctx.total_chunks      = n;
+                cctx.chunks_per_thread = (n + n_threads - 1) / n_threads;
+                work_queue_run(octx->ctx->work_queue, binary_thread_chunked, &cctx, n_threads);
+                done += n;
+                if (done < total_chunks && atomic_load(&octx->ctx->vtcm_needs_release)) {
+                    htp_vtcm_yield(octx->ctx);
+                }
+            }
+            return HTP_STATUS_OK;
+        }
+#endif
         work_queue_run(octx->ctx->work_queue, binary_thread_chunked, &cctx, n_threads);
         return HTP_STATUS_OK;
     }
@@ -1256,16 +1300,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
     }
 
     dma_queue * dma_q = octx->ctx->dma[0];
-    uint8_t * vtcm_src1 = VTCM_LAYOUT_PTR(uint8_t, bctx.vtcm_base, bctx.vtcm_layout.off_src1);
-    if (kparams->kernel_type == HTP_BINARY_KERNEL_ROW_BCAST) {
-        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data), bctx.vtcm_layout.src1_size, 0, src1->ne[0] * elem_size, 1);
-    } else if (kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR_DMA) {
-        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data), bctx.vtcm_layout.src1_size, 0, src1->ne[1] * elem_size, 1);
-    } else if (kparams->kernel_type == HTP_BINARY_KERNEL_ADD_ID) {
-        dma_queue_push(dma_q, dma_make_data(vtcm_src1, src1->data),
-                       kparams->src1_row_size_aligned, src1->nb[1],
-                       src1->ne[0] * elem_size, src1->ne[1]);
-    }
+    binary_stage_src1(octx, kparams, &bctx.vtcm_layout, bctx.vtcm_base, elem_size);
 
     bctx.octx                  = octx;
     bctx.nrows_per_thread      = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
@@ -1434,12 +1469,35 @@ static int execute_op_binary(struct htp_ops_context * octx) {
 
     bctx.compute = compute_func;
 
-    if (kparams->kernel_type == HTP_BINARY_KERNEL_ROW_BCAST ||
-        kparams->kernel_type == HTP_BINARY_KERNEL_SCALAR_DMA ||
-        kparams->kernel_type == HTP_BINARY_KERNEL_ADD_ID) {
+    if (binary_stages_src1(kparams)) {
         dma_queue_pop(dma_q);
     }
 
+#ifdef HTP_YIELD_IN_OPS
+    // Large ops (e.g. the CTC bias of a 5-minute speech segment, 25055 x 5004, 18 ms on v73) run
+    // in rounds of about 32 MiB of src0 rows, so VTCM can be given away between rounds when a
+    // release is requested. A src1 kept in VTCM for all rows is staged again after a release.
+    const size_t   rows_32m = (32u << 20) / MAX(src0_row_size, (size_t) 1);
+    const uint32_t round    = MAX(n_threads, (uint32_t) MIN(rows_32m, (size_t) nrows) / n_threads * n_threads);
+    if (round < nrows) {
+        for (uint32_t done = 0; done < nrows;) {
+            const uint32_t n = MIN(round, nrows - done);
+            bctx.row_start        = row_start + done;
+            bctx.total_rows       = n;
+            bctx.nrows_per_thread = fastdiv(n + n_threads - 1, &octx->n_threads_div);
+            work_queue_run(octx->ctx->work_queue, worker_func, &bctx, n_threads);
+            done += n;
+            if (done < nrows && atomic_load(&octx->ctx->vtcm_needs_release)) {
+                htp_vtcm_yield(octx->ctx);
+                if (binary_stages_src1(kparams)) {
+                    binary_stage_src1(octx, kparams, &bctx.vtcm_layout, bctx.vtcm_base, elem_size);
+                    dma_queue_pop(dma_q);
+                }
+            }
+        }
+        return HTP_STATUS_OK;
+    }
+#endif
     work_queue_run(octx->ctx->work_queue, worker_func, &bctx, n_threads);
 
     return HTP_STATUS_OK;

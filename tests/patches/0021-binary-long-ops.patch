@@ -1,0 +1,17 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 2c37f59..28c3d79 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9907,6 +9907,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
+     // 8 heads of 128), and rows broadcast over dim 2
+     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 1048576, 1, 1 }, { 1, 1 }, 524288, false));
+     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 65536, 4, 1 }, { 1, 1 }, 32768, false));
++    // element-wise ops over 32 MiB (the CTC bias of a long speech segment): row broadcast,
++    // same shape and a scalar
++    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, { 4096, 1, 1, 1 }, { 1, 4096, 1, 1 }));
++    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, { 4096, 4096, 1, 1 }, { 1, 1, 1, 1 }));
++    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F16, { 4096, 4096, 1, 1 }, { 1, 1, 1, 1 }));
++    test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, { 1, 1, 1, 1 }, { 4096, 4096, 1, 1 }));
+     // F32 attention of a speech encoder (SenseVoice: head 128, 4 heads), the keys padded to a
+     // multiple of 32: KQ and KQV with stored src0, and KQ with src0 computed in the graph, which
+     // the backend has to estimate as well

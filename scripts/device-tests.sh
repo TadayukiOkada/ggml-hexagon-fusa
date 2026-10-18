@@ -67,6 +67,8 @@ if [ $long -eq 1 ]; then
         "attnact MUL_MAT type=f32,m=(512|1024)," \
         "softmax SOFT_MAX ne=\[(512,128,16,4|4096,512,16,1|8192,512,16,1)\]" \
         "setrows SET_ROWS ne=\[1,(1048576|65536)," \
+        "binadd ADD ne=\[4096,(1|4096),1,1\],nr=\[1,(4096|1),1,1\]" \
+        "binmul MUL ne=\[(4096,4096|1,1),1,1\],nr=\[(1,1|4096,4096),1,1\]" \
         "argsort ARGSORT ne=\[(151936|262144),1,1,1\]" \
         "repeat REPEAT ne=\[(1,4096,1,1|128,16,512,1)\]" \
         "fa FLASH_ATTN_EXT hsk=128,hsv=128,nh=8,nr23=\[2,1\],kv=(512|4096|8192|16384),nb=512,"
