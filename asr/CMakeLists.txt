@@ -31,12 +31,16 @@ endif()
 file(ARCHIVE_EXTRACT INPUT ${_tmp}.tar DESTINATION ${_tmp})
 file(REMOVE ${_tmp}.tar)
 
-# git apply works outside a repository, on paths relative to the working directory.
+# git apply works outside a repository, on paths relative to the working directory. Inside one
+# (a build directory in this checkout) it skips the paths and still succeeds, so the search for
+# a repository stops above the work directory, and a skipped patch is an error.
+get_filename_component(_ceiling ${_tmp} DIRECTORY)
 foreach(_p IN LISTS _patches)
-    execute_process(COMMAND ${GIT_EXECUTABLE} apply --whitespace=nowarn ${_p}
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${_ceiling}
+            ${GIT_EXECUTABLE} apply --verbose --whitespace=nowarn ${_p}
         WORKING_DIRECTORY ${_tmp}
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-    if (NOT _rc EQUAL 0)
+    if (NOT _rc EQUAL 0 OR _out MATCHES "Skipped patch")
         message(FATAL_ERROR "asr: ${_p} does not apply to ${NEMO_DIR}:\n${_out}")
     endif()
 endforeach()

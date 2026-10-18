@@ -25,10 +25,12 @@ if(NOT _rc EQUAL 0)
 endif()
 file(ARCHIVE_EXTRACT INPUT "${_tmp}.tar" DESTINATION "${_tmp}")
 file(REMOVE "${_tmp}.tar")
+# Outside any repository, as in asr/: inside this checkout git apply would skip the paths.
 foreach(_patch IN LISTS _patches)
-    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --whitespace=nowarn "${_patch}"
-        WORKING_DIRECTORY "${_tmp}" RESULT_VARIABLE _rc ERROR_VARIABLE _out)
-    if(NOT _rc EQUAL 0)
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+            "${GIT_EXECUTABLE}" apply --verbose --whitespace=nowarn "${_patch}"
+        WORKING_DIRECTORY "${_tmp}" RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
+    if(NOT _rc EQUAL 0 OR _out MATCHES "Skipped patch")
         message(FATAL_ERROR "sensevoice: ${_patch} does not apply: ${_out}")
     endif()
 endforeach()
