@@ -123,6 +123,12 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
             return htp_budget_check(sess, op, htp_estimate_sort_ms(op->src[0], op->ne[0], n_threads));
         case GGML_OP_MUL_MAT:
             return htp_mul_mat_within_budget(sess, op);
+#ifndef GGML_HEXAGON_HTP_YIELD_IN_OPS
+        case GGML_OP_SOFT_MAX:
+            // Without rounds the whole op holds VTCM: about 1.7 G elements/s on v73 (attention scores
+            // without flash attention, 12288 keys x 512 rows x 16 heads, take 58 ms).
+            return htp_budget_check(sess, op, (double) ggml_nelements(op->src[0]) / 1.2e6);
+#endif
         default:
             return true;
     }

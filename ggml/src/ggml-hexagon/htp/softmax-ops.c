@@ -596,7 +596,26 @@ static int execute_op_softmax_f32(struct htp_ops_context * octx) {
     }
 
     work_queue_func_t task_func = kparams->use_src1 ? softmax_thread_mask_dma : softmax_thread_dma;
+#ifdef HTP_YIELD_IN_OPS
+    // Attention scores without flash attention are large (12288 keys x 512 rows x 16 heads take
+    // 58 ms on v73), so rows run in rounds of about 32 MiB, as in unary ops, and VTCM can be
+    // given away between rounds when a release is requested. Each round stages its own rows.
+    const size_t   rows_32m   = (32u << 20) / MAX((size_t) src0->ne[0] * sizeof(float), (size_t) 1);
+    const uint32_t round_rows = MAX(n_threads, (uint32_t) MIN(rows_32m, (size_t) nrows) / n_threads * n_threads);
+    for (uint32_t done = 0; done < nrows;) {
+        const uint32_t n = MIN(round_rows, nrows - done);
+        smctx.row_start             = row_start + done;
+        smctx.nrows                 = n;
+        smctx.src0_nrows_per_thread = fastdiv(n + n_threads - 1, &octx->n_threads_div);
+        work_queue_run(octx->ctx->work_queue, task_func, &smctx, n_threads);
+        done += n;
+        if (done < nrows && atomic_load(&octx->ctx->vtcm_needs_release)) {
+            htp_vtcm_yield(octx->ctx);
+        }
+    }
+#else
     work_queue_run(octx->ctx->work_queue, task_func, &smctx, n_threads);
+#endif
 
     return HTP_STATUS_OK;
 }
