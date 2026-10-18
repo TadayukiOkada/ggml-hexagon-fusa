@@ -29,3 +29,13 @@ The DSP side includes a few ggml headers by paths relative to
 `ggml/src/ggml-hexagon/htp`. They are symlinks into the submodule
 (`ggml/src/ggml-common.h`, `ggml/src/ggml-impl.h`, `ggml/include/ggml.h`,
 `ggml/include/gguf.h`), so they always match the pinned llama.cpp.
+
+## SenseVoice runtime
+
+`SenseVoice/` pins QwenAudio/SenseVoice at
+`586bbdb2b052f4fe19322581825228b6810a9fb3`. Its official `runtime/llama.cpp`
+implementation is exported and patched by `sensevoice/CMakeLists.txt`, without
+changing the submodule. It uses this repository's pinned llama.cpp/ggml instead
+of downloading another revision. When updating the SenseVoice pin, refresh
+`sensevoice/patches/`, run the CPU reference and packaging tests documented in
+README.md, then validate recognition and schedule placement on the target HTP.

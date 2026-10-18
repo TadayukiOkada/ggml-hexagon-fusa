@@ -4,3 +4,6 @@
 [submodule "NeMo-Speech.cpp"]
 	path = NeMo-Speech.cpp
 	url = https://github.com/NVIDIA/NeMo-Speech.cpp.git
+[submodule "SenseVoice"]
+	path = SenseVoice
+	url = https://github.com/QwenAudio/SenseVoice.git

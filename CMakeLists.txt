@@ -94,3 +94,8 @@ if (GGML_HEXAGON_FUSA)
             VERBATIM)
     endforeach()
 endif()
+
+option(GGML_HEXAGON_SENSEVOICE "ggml-hexagon: build the SenseVoice llama.cpp runtime" OFF)
+if(GGML_HEXAGON_SENSEVOICE)
+    add_subdirectory(sensevoice)
+endif()

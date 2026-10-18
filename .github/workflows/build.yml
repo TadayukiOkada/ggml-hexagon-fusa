@@ -41,7 +41,7 @@ jobs:
       - name: Configure
         run: |
           git config --global --add safe.directory '*'
-          cmake --preset ${{ matrix.preset }} -B build
+          cmake --preset ${{ matrix.preset }} -B build -DGGML_HEXAGON_SENSEVOICE=ON
 
       - name: Build
         run: cmake --build build -j $(nproc)
@@ -53,3 +53,24 @@ jobs:
         with:
           name: ggml-hexagon-fusa-${{ matrix.target }}
           path: pkg
+
+  sensevoice-cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: python -m pip install numpy==1.26.4 PyYAML==6.0.2
+      - name: Build CPU runtime
+        run: |
+          cmake -S sensevoice -B build-sensevoice-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-sensevoice-cpu -j 2
+      - name: Test backend, reference inference and packaging
+        run: |
+          ctest --test-dir build-sensevoice-cpu/sensevoice-build --output-on-failure
+          python sensevoice/tests/test_cli.py --binary build-sensevoice-cpu/sensevoice-build/bin/llama-funasr-sensevoice --llama llama.cpp
+          python sensevoice/tests/test_package.py

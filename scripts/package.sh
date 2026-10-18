@@ -4,7 +4,7 @@
 # toolchain's crt objects carry build-machine paths); skels are copied as
 # built, since stripping would invalidate an embedded SWIV CRC.
 #
-# usage: scripts/package.sh [--split | --asr] <build dir> <output dir>
+# usage: scripts/package.sh [--split | --asr | --sensevoice] <build dir> <output dir>
 #
 # --split puts tools and backend modules in bin/ and the other libraries and
 # the skels in lib/, the layout of an upstream llama.cpp install (the QDC test
@@ -23,10 +23,10 @@
 # any packaged file. The source dir, build dir and $HOME are always checked.
 set -euo pipefail
 
-split=0 asr=0
-if [ "${1:-}" = --split ]; then split=1; shift; elif [ "${1:-}" = --asr ]; then asr=1; shift; fi
-build=$(cd "${1:?usage: $0 [--split | --asr] <build dir> <output dir>}" && pwd)
-out=${2:?usage: $0 [--split | --asr] <build dir> <output dir>}
+split=0 asr=0 sensevoice_only=0
+if [ "${1:-}" = --split ]; then split=1; shift; elif [ "${1:-}" = --asr ]; then asr=1; shift; elif [ "${1:-}" = --sensevoice ]; then sensevoice_only=1; shift; fi
+build=$(cd "${1:?usage: $0 [--split | --asr | --sensevoice] <build dir> <output dir>}" && pwd)
+out=${2:?usage: $0 [--split | --asr | --sensevoice] <build dir> <output dir>}
 top=$(cd "$(dirname "$0")/.." && pwd)
 
 cache=$build/CMakeCache.txt
@@ -55,6 +55,18 @@ if [ $asr -eq 1 ] && [ $with_asr -eq 0 ]; then
     echo "package: no $nemo/nemo-speech (configure with GGML_HEXAGON_ASR=ON)" >&2; exit 2
 fi
 
+sv=$build/sensevoice/sensevoice-build/bin
+with_sensevoice=0
+[ -x "$sv/llama-funasr-sensevoice" ] && [ $asr -eq 0 ] && with_sensevoice=1
+if [ $sensevoice_only -eq 1 ] && [ $with_sensevoice -eq 0 ]; then
+    echo "package: no SenseVoice runtime (configure with GGML_HEXAGON_SENSEVOICE=ON)" >&2; exit 2
+fi
+copy_sensevoice() {  # <executables> <private ggml libraries>
+    for f in "$sv"/llama-funasr-sensevoice "$sv"/test-sensevoice-backend; do [ -f "$f" ] && cp -L "$f" "$1/"; done
+    for f in "$sv"/lib*.so*; do [ -f "$f" ] && cp -L "$f" "$2/"; done
+    strip_dir "$1"; strip_dir "$2"
+}
+
 # NeMo: nemo-speech (and its storage test) with NeMo's own ggml libraries.
 copy_nemo() {  # <dir for executables> <dir for libraries>
     for f in "$nemo"/nemo-speech "$nemo"/test_backend_storage; do [ -f "$f" ] && cp -L "$f" "$1/"; done
@@ -63,7 +75,11 @@ copy_nemo() {  # <dir for executables> <dir for libraries>
 }
 
 rm -rf "$out"; mkdir -p "$out"
-if [ $asr -eq 1 ]; then
+if [ $sensevoice_only -eq 1 ]; then
+    with_asr=0
+    copy_sensevoice "$out" "$out"
+    cp "$build"/bin/libggml-hexagon.so "$out/"
+elif [ $asr -eq 1 ]; then
     copy_nemo "$out" "$out"
     cp "$build"/bin/libggml-hexagon.so "$out/"
 else
@@ -93,6 +109,10 @@ if [ $split -eq 1 ]; then
         mkdir -p "$out/lib/nemo-speech"
         copy_nemo "$out/bin" "$out/lib/nemo-speech"
     fi
+    if [ $with_sensevoice -eq 1 ]; then
+        mkdir -p "$out/lib/sensevoice"
+        copy_sensevoice "$out/bin" "$out/lib/sensevoice"
+    fi
     cat > "$out/run.sh" <<'RUN'
 #!/bin/sh
 # usage: ./run.sh <tool> [args...]
@@ -101,10 +121,14 @@ if [ $split -eq 1 ]; then
 d=$(cd "$(dirname "$0")" && pwd)
 tool=$1; shift
 lib=$d/lib
-case $tool in nemo-speech|test_backend_storage) lib=$d/lib/nemo-speech:$d/lib ;; esac
+case $tool in
+    nemo-speech|test_backend_storage) lib=$d/lib/nemo-speech:$d/lib ;;
+    llama-funasr-sensevoice|test-sensevoice-backend) lib=$d/lib/sensevoice:$d/lib ;;
+esac
 ADSP_LIBRARY_PATH="$d/lib;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
 LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/bin/$tool" "$@"
 RUN
+    sv_exe='$d/bin' sv_libs='$d/lib/sensevoice'
     exe='$d/bin' libs='$d/lib/nemo-speech' skels='$d/lib' hex='$d/bin'
 else
 cat > "$out/run.sh" <<'RUN'
@@ -118,10 +142,20 @@ cat > "$out/run.sh" <<'RUN'
 d=$(cd "$(dirname "$0")" && pwd)
 tool=$1; shift
 exe=$d lib=$d
-case $tool in nemo-speech|test_backend_storage) exe=$d/nemo-speech lib=$d/nemo-speech:$d ;; esac
+case $tool in
+    nemo-speech|test_backend_storage) exe=$d/nemo-speech lib=$d/nemo-speech:$d ;;
+    llama-funasr-sensevoice|test-sensevoice-backend)
+        if [ -d "$d/sensevoice" ]; then exe=$d/sensevoice lib=$d/sensevoice:$d; fi ;;
+esac
 ADSP_LIBRARY_PATH="$d;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
 LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$exe/$tool" "$@"
 RUN
+    sv_exe='$d' sv_libs='$d'
+    if [ $with_sensevoice -eq 1 ] && [ $sensevoice_only -eq 0 ]; then
+        mkdir -p "$out/sensevoice"
+        copy_sensevoice "$out/sensevoice" "$out/sensevoice"
+        sv_exe='$d/sensevoice' sv_libs='$d/sensevoice'
+    fi
     exe='$d' libs='$d' skels='$d' hex='$d'
     if [ $with_asr -eq 1 ] && [ $asr -eq 0 ]; then
         mkdir -p "$out/nemo-speech"
@@ -159,6 +193,27 @@ RUN
     chmod +x "$out/run-asr.sh"
 fi
 
+if [ $with_sensevoice -eq 1 ]; then
+    {
+        cat <<'RUN'
+#!/bin/sh
+# usage: ./run-sensevoice.sh <model.gguf> <audio.wav> [SenseVoice options]
+d=$(cd "$(dirname "$0")" && pwd)
+[ $# -ge 2 ] || { echo "usage: $0 <model.gguf> <audio.wav> [options]" >&2; exit 2; }
+model=$1 audio=$2; shift 2
+dev=${SENSEVOICE_DEVICE:-HTP0}
+RUN
+        echo "exe=\"$sv_exe\" libs=\"$sv_libs\" skels=\"$skels\" hex=\"$hex\""
+        cat <<'RUN'
+GGML_HEXAGON_DEVICES=${GGML_HEXAGON_DEVICES:-$dev} \
+ADSP_LIBRARY_PATH="$skels;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
+LD_LIBRARY_PATH="$libs:$skels${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$exe/llama-funasr-sensevoice" \
+    -m "$model" -a "$audio" --backend hexagon --backend-lib "$hex/libggml-hexagon.so" --device "$dev" "$@"
+RUN
+    } > "$out/run-sensevoice.sh"
+    chmod +x "$out/run-sensevoice.sh"
+fi
+
 # Licenses of what the package contains: this backend, llama.cpp/ggml and the
 # notices llama.cpp ships, and with speech recognition NeMo-Speech.cpp and SentencePiece.
 lic=$out/licenses; mkdir -p "$lic"
@@ -179,6 +234,13 @@ if [ $with_asr -eq 1 ]; then
     fi
 fi
 
+if [ $with_sensevoice -eq 1 ]; then
+    cp "$top/SenseVoice/LICENSE" "$lic/SenseVoice-LICENSE"
+    sed -n '/^This software is available as a choice/,$p' \
+        "$top/SenseVoice/runtime/llama.cpp/funasr-common/miniaudio.h" > "$lic/miniaudio-LICENSE"
+    echo "SenseVoice runtime is built with sensevoice/patches and sensevoice/include of ggml-hexagon-fusa." > "$lic/SenseVoice-MODIFIED"
+fi
+
 {
     echo "build-id:   $(cat "$build/hexagon-build-id.txt")"
     echo "llama.cpp:  $(git -C "$top/llama.cpp" rev-parse HEAD)"
@@ -186,7 +248,11 @@ fi
         echo "NeMo-Speech.cpp: $(git -C "$top/NeMo-Speech.cpp" rev-parse HEAD) + asr/patches"
         (cd "$top" && sha256sum asr/patches/*.patch)
     fi
-    for v in GGML_HEXAGON_FUSA GGML_HEXAGON_HTP_ARCHS GGML_HEXAGON_TOOLV GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY GGML_HEXAGON_HTP_YIELD_IN_OPS; do
+    if [ $with_sensevoice -eq 1 ]; then
+        echo "SenseVoice: $(git -C "$top/SenseVoice" rev-parse HEAD) + sensevoice/patches"
+        (cd "$top" && sha256sum sensevoice/patches/*.patch sensevoice/include/*.h sensevoice/runtime/CMakeLists.txt)
+    fi
+    for v in GGML_HEXAGON_SENSEVOICE GGML_HEXAGON_ASR GGML_HEXAGON_FUSA GGML_HEXAGON_HTP_ARCHS GGML_HEXAGON_TOOLV GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY GGML_HEXAGON_HTP_YIELD_IN_OPS; do
         printf '%-36s %s\n' "$v" "$(sed -n "s/^$v:[A-Z]*=//p" "$cache")"
     done
     echo

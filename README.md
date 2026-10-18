@@ -162,6 +162,68 @@ To move the NeMo pin, update the submodule and refresh the patches until
 configure applies them, then rerun `test_backend_storage` and recognition on
 the target.
 
+## SenseVoice
+
+`GGML_HEXAGON_SENSEVOICE=ON` builds the official llama.cpp implementation from
+[QwenAudio/SenseVoice](https://github.com/QwenAudio/SenseVoice), pinned as the
+unmodified `SenseVoice/` submodule. Like NeMo, configure exports the source into
+the build directory and applies `sensevoice/patches/*.patch`. The runtime uses
+the same pinned llama.cpp/ggml as the backend, with private shared libraries.
+
+```sh
+git submodule update --init llama.cpp SenseVoice
+cmake --preset arm64-oe-linux-v73-fusa-sensevoice -B build
+cmake --build build -j
+scripts/package.sh --split build pkg
+pkg/run-sensevoice.sh sensevoice-small-f16.gguf input.wav --threads 8
+SENSEVOICE_DEVICE=HTP1 pkg/run-sensevoice.sh sensevoice-small-f16.gguf input.wav
+pkg/run.sh llama-funasr-sensevoice -m sensevoice-small-f16.gguf -a input.wav --backend cpu
+```
+
+The wrapper explicitly loads the packaged `libggml-hexagon.so`; unavailable HTP
+libraries or devices fail with an error. `--trace-schedule` prints each graph
+node's backend and rejection reason. All weights except the query embeddings
+have persistent HTP storage across segments, and the encoder and CTC head run
+on HTP as one graph split, within the backend's shape and FuSa operation-budget
+checks. For the HTP softmax, attention keys are padded to a multiple of 32 and
+masked. Audio preprocessing, query embeddings and optional VAD use the CPU.
+F16 query embeddings are converted to float instead of being read as F32.
+
+Attention multiplies activations, which the backend's operation budget does not
+estimate, and its time grows with the square of the segment length. A segment
+longer than 512 frames (about 30 s of audio) is therefore computed on the CPU,
+with a message; use `--vad` (segments of at most `--vad-maxseg`, 30 s by
+default) for longer audio. On the CPU the graph and results are those of the
+upstream implementation.
+
+The default flat package keeps SenseVoice and its ggml libraries in
+`sensevoice/`; `--split` puts executables in `bin/` and private libraries in
+`lib/sensevoice/`. `scripts/package.sh --sensevoice build pkg` creates a flat
+SenseVoice-only package. All layouts include `run-sensevoice.sh`, source pins,
+patch hashes and third-party licenses, and reuse the host backend and skels
+from the same build. Both speech runtimes may be enabled together.
+
+CPU validation needs no Hexagon SDK or downloaded model. The reference test
+creates a small deterministic model and compares F32/F16 embedding inference
+against an independent NumPy SAN-M/CTC implementation; the backend test also
+checks persistent weights across graph shapes and the padded, masked attention
+against a direct computation. Packaging tests exercise all
+three layouts and argument/library routing.
+
+```sh
+cmake -S sensevoice -B build-sensevoice-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-sensevoice-cpu -j 2
+ctest --test-dir build-sensevoice-cpu/sensevoice-build --output-on-failure
+# Python tests require numpy and PyYAML (CI pins 1.26.4 and 6.0.2).
+python3 sensevoice/tests/test_cli.py --binary build-sensevoice-cpu/sensevoice-build/bin/llama-funasr-sensevoice --llama llama.cpp
+python3 sensevoice/tests/test_package.py
+```
+
+CI builds the Android/Linux ARM64 integration and runs these CPU tests. HTP
+execution and real speech accuracy still require validation on the target:
+compare `--ids` output with CPU for the same model and audio, inspect
+`--trace-schedule`, and repeat with different segment lengths and `--vad`.
+
 ## Relation to upstream
 
 The backend sources start from upstream `ggml/src/ggml-hexagon/`. The
