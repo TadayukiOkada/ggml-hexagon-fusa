@@ -1,5 +1,5 @@
 diff --git a/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp b/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
-index 778eaee..67da686 100644
+index 778eaee..69fe8e1 100644
 --- a/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
 +++ b/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
 @@ -9,6 +9,7 @@
@@ -24,7 +24,7 @@ index 778eaee..67da686 100644
  static ggml_tensor* lnorm(ggml_context*c,ggml_tensor*x,ggml_tensor*g,ggml_tensor*b){return ggml_add(c,ggml_mul(c,ggml_norm(c,x,LN_EPS),g),b);}
 -static ggml_tensor* sanm_attn(ggml_context*c,model&m,const std::string&p,ggml_tensor*x,int T){
 -  const int D=m.c.d_model,H=m.c.n_head,dk=D/H,K=m.c.kernel;
-+static ggml_tensor* sanm_attn(ggml_context*c,model&m,const std::string&p,ggml_tensor*x,int T,ggml_tensor*kq_mask){
++static ggml_tensor* sanm_attn(ggml_context*c,model&m,const std::string&p,ggml_tensor*x,int T,bool flash){
 +  const int D=m.c.d_model,H=m.c.n_head,K=m.c.kernel;
    ggml_tensor*qkv=lin(c,m.g(p+"linear_q_k_v.weight"),m.g(p+"linear_q_k_v.bias"),x); size_t nb1=qkv->nb[1];
    ggml_tensor*q=ggml_cont(c,ggml_view_2d(c,qkv,D,T,nb1,0));
@@ -39,14 +39,14 @@ index 778eaee..67da686 100644
 -  ggml_tensor*kq=ggml_soft_max(c,ggml_scale(c,ggml_mul_mat(c,k,q),1.0f/sqrtf((float)dk)));
 -  ggml_tensor*o=ggml_cont_2d(c,ggml_permute(c,ggml_mul_mat(c,vh,kq),0,2,1,3),D,T);
 +    auto wj=ggml_view_1d(c,fk,D,(size_t)j*fk->nb[1]); fsmn=ggml_add(c,fsmn,ggml_mul(c,sl,wj));}  // vp rows are contiguous: sl needs no copy
-+  ggml_tensor*o=funasr::attention(c,q,k,v,H,kq_mask);  // keys padded to kq_mask's width for the HTP
++  ggml_tensor*o=funasr::attention(c,q,k,v,H,flash);  // flash attention on the HTP
    return ggml_add(c,lin(c,m.g(p+"linear_out.weight"),m.g(p+"linear_out.bias"),o),fsmn);
  }
 -static ggml_tensor* sanm_layer(ggml_context*c,model&m,const std::string&p,ggml_tensor*x,int T,bool res){
-+static ggml_tensor* sanm_layer(ggml_context*c,model&m,const std::string&p,ggml_tensor*x,int T,bool res,ggml_tensor*kq_mask){
++static ggml_tensor* sanm_layer(ggml_context*c,model&m,const std::string&p,ggml_tensor*x,int T,bool res,bool flash){
    auto r=x; auto h=lnorm(c,x,m.g(p+"norm1.weight"),m.g(p+"norm1.bias"));
 -  auto sa=sanm_attn(c,m,p+"self_attn.",h,T); x=res?ggml_add(c,r,sa):sa; r=x;
-+  auto sa=sanm_attn(c,m,p+"self_attn.",h,T,kq_mask); x=res?ggml_add(c,r,sa):sa; r=x;
++  auto sa=sanm_attn(c,m,p+"self_attn.",h,T,flash); x=res?ggml_add(c,r,sa):sa; r=x;
    h=lnorm(c,x,m.g(p+"norm2.weight"),m.g(p+"norm2.bias"));
    h=lin(c,m.g(p+"feed_forward.w_1.weight"),m.g(p+"feed_forward.w_1.bias"),h); h=ggml_relu(c,h);
    h=lin(c,m.g(p+"feed_forward.w_2.weight"),m.g(p+"feed_forward.w_2.bias"),h); return ggml_add(c,r,h);
@@ -79,7 +79,7 @@ index 778eaee..67da686 100644
    // load model
    model m; gguf_init_params gp={false,&m.ctx_w}; gguf_context*gg=gguf_init_from_file(gguf_path.c_str(),gp);
    if(!gg){fprintf(stderr,"load gguf failed\n");return 1;}
-@@ -126,33 +133,36 @@ int main(int argc,char**argv){
+@@ -126,33 +133,35 @@ int main(int argc,char**argv){
    std::vector<std::string> vocab; {int ki=gguf_find_key(gg,"sv.vocab"); if(ki>=0){int nv=gguf_get_arr_n(gg,ki); vocab.resize(nv); for(int i=0;i<nv;i++){const char*s=gguf_get_arr_str(gg,ki,i); vocab[i]=s?s:"";}}}
    for(int i=0;i<gguf_get_n_tensors(gg);i++){const char*nm=gguf_get_tensor_name(gg,i);m.t[nm]=ggml_get_tensor(m.ctx_w,nm);}
    gguf_free(gg);
@@ -106,13 +106,12 @@ index 778eaee..67da686 100644
      ggml_tensor*x=ggml_new_tensor_2d(c,GGML_TYPE_F32,F,N); ggml_set_input(x);
 -    ggml_tensor*h=sanm_layer(c,m,"encoder.encoders0.0.",x,N,false);
 -    for(int i=0;i<m.c.num_blocks-1;i++) h=sanm_layer(c,m,"encoder.encoders."+std::to_string(i)+".",h,N,true);
-+    const bool accel=runtime.accelerates(funasr::attention_keys(N));
-+    ggml_tensor*kq_mask=accel?funasr::attention_mask(c,N):nullptr;  // CPU-only segments keep the upstream graph
-+    ggml_tensor*h=sanm_layer(c,m,"encoder.encoders0.0.",x,N,false,kq_mask);
-+    for(int i=0;i<m.c.num_blocks-1;i++) h=sanm_layer(c,m,"encoder.encoders."+std::to_string(i)+".",h,N,true,kq_mask);
++    const bool flash=runtime.accelerated();  // CPU-only runs keep the upstream graph
++    ggml_tensor*h=sanm_layer(c,m,"encoder.encoders0.0.",x,N,false,flash);
++    for(int i=0;i<m.c.num_blocks-1;i++) h=sanm_layer(c,m,"encoder.encoders."+std::to_string(i)+".",h,N,true,flash);
      h=lnorm(c,h,m.g("encoder.after_norm.weight"),m.g("encoder.after_norm.bias"));
 -    for(int i=0;i<m.c.tp_blocks;i++) h=sanm_layer(c,m,"encoder.tp_encoders."+std::to_string(i)+".",h,N,true);
-+    for(int i=0;i<m.c.tp_blocks;i++) h=sanm_layer(c,m,"encoder.tp_encoders."+std::to_string(i)+".",h,N,true,kq_mask);
++    for(int i=0;i<m.c.tp_blocks;i++) h=sanm_layer(c,m,"encoder.tp_encoders."+std::to_string(i)+".",h,N,true,flash);
      h=lnorm(c,h,m.g("encoder.tp_norm.weight"),m.g("encoder.tp_norm.bias"));
      ggml_tensor*logits=lin(c,m.g("ctc.ctc_lo.weight"),m.g("ctc.ctc_lo.bias"),h);  // [V, N]
      ggml_set_output(logits);
@@ -120,13 +119,13 @@ index 778eaee..67da686 100644
 -    ggml_gallocr_t ga=ggml_gallocr_new(ggml_backend_cpu_buffer_type()); ggml_gallocr_alloc_graph(ga,gf);
 -    ggml_backend_tensor_set(x,inp.data(),0,ggml_nbytes(x)); ggml_backend_cpu_set_n_threads(be,8);
 -    if(ggml_backend_graph_compute(be,gf)!=GGML_STATUS_SUCCESS){fprintf(stderr,"compute failed\n");}
-+    auto sched=runtime.allocate_graph(gf,accel);
-+    ggml_backend_tensor_set(x,inp.data(),0,ggml_nbytes(x)); funasr::set_attention_mask(kq_mask);
++    auto sched=runtime.allocate_graph(gf);
++    ggml_backend_tensor_set(x,inp.data(),0,ggml_nbytes(x));
 +    if(ggml_backend_sched_graph_compute(sched,gf)!=GGML_STATUS_SUCCESS){ggml_backend_sched_free(sched);ggml_free(c);throw std::runtime_error("compute failed");}
      std::vector<float> lg((size_t)V*N); ggml_backend_tensor_get(logits,lg.data(),0,ggml_nbytes(logits));
      std::vector<int> seg_ids; int prev=-1;   // greedy CTC: argmax per frame -> collapse -> drop blank
      for(int n=0;n<N;n++){ const float*col=&lg[(size_t)n*V]; int am=0; float best=col[0];
-@@ -160,14 +170,14 @@ int main(int argc,char**argv){
+@@ -160,14 +169,14 @@ int main(int argc,char**argv){
        if(am!=prev && am!=m.c.blank) seg_ids.push_back(am); prev=am; }
      if(emit_ids){ for(int id:seg_ids) printf("%d ",id); }
      else { std::string t=detok_sv(seg_ids,vocab,keep_tags); printf("%s",t.c_str()); }
@@ -143,7 +142,7 @@ index 778eaee..67da686 100644
      for(auto&s:segs){ int off=(int)((int64_t)s.first*16000/1000), end=(int)((int64_t)s.second*16000/1000);
        if(end>(int)wav.size())end=wav.size(); if(end-off<WINLEN)continue;
        std::vector<float> seg(wav.begin()+off,wav.begin()+end); int t=0; auto fb=compute_fbank(seg,t); run_seg(fb,t); }
-@@ -180,12 +190,18 @@ int main(int argc,char**argv){
+@@ -180,12 +189,18 @@ int main(int argc,char**argv){
      } else {
        FILE*f=fopen(fbank_path.c_str(),"rb"); if(!f){fprintf(stderr,"open fbank\n");return 1;}
        if(fread(&T,4,1,f)!=1||fread(&Fc,4,1,f)!=1){fclose(f);return 1;}

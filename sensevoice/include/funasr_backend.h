@@ -85,18 +85,7 @@ public:
     backend(const backend &) = delete;
     backend & operator=(const backend &) = delete;
 
-    // SAN-M attention grows with the square of the segment length. On v73 its score matmul takes
-    // about 10 ms for 512 frames (38 ms for 1024, over the FuSa self-test period, which the
-    // backend's budget leaves to the CPU). Rather than go back and forth in every layer, longer
-    // segments (more than about 30 s of audio; --vad keeps them shorter) are computed on the CPU.
-    static constexpr int max_accelerated_frames = 512;
-
-    bool accelerates(int frames) const {
-        if (accelerator_ && frames > max_accelerated_frames)
-            fprintf(stderr, "[sensevoice] %d frames > %d: segment computed on the CPU (use --vad)\n",
-                    frames, max_accelerated_frames);
-        return accelerator_ && frames <= max_accelerated_frames;
-    }
+    bool accelerated() const { return accelerator_ != nullptr; }
 
     // Weights get persistent storage on the accelerator, so a graph has no CPU splits for
     // biases, norms or FSMN taps. Query embeddings are read on the host and stay on the CPU.
@@ -145,7 +134,7 @@ public:
                     fprintf(stderr, "[sensevoice-schedule] op=%s name=%s backend=%s reason=%s\n",
                             ggml_op_name(node->op), node->name,
                             assigned ? ggml_backend_name(assigned) : "view",
-                            accelerator_ && !accelerate ? "frame_limit" :
+                            accelerator_ && !accelerate ? "cpu_requested" :
                             reason ? reason(ggml_backend_get_device(accelerator_), node) : "cpu");
                 }
             }
@@ -168,44 +157,25 @@ inline void embedding_row(const ggml_tensor * embedding, int id, int width, floa
     }
 }
 
-// The HTP softmax takes rows of at most 32 or a multiple of 32. On the accelerator, longer
-// attention pads the keys with zero rows to that width, and the mask's -inf columns give them
-// zero weight. Segments computed on the CPU keep the upstream graph, and its results.
-inline int attention_keys(int frames) { return frames > 32 ? (frames + 31) / 32 * 32 : frames; }
-
-// [keys, frames] mask input, or nullptr when no keys are added.
-inline ggml_tensor * attention_mask(ggml_context * ctx, int frames) {
-    const int keys = attention_keys(frames);
-    if (keys == frames) return nullptr;
-    auto mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, keys, frames);
-    ggml_set_input(mask);
-    return mask;
-}
-
-inline void set_attention_mask(ggml_tensor * mask) {
-    if (!mask) return;
-    const int keys = mask->ne[0], frames = mask->ne[1];
-    std::vector<float> data((size_t) keys * frames, 0.0f);
-    for (int r = 0; r < frames; ++r)
-        std::fill(data.begin() + (size_t) r * keys + frames, data.begin() + (size_t) (r + 1) * keys, -INFINITY);
-    ggml_backend_tensor_set(mask, data.data(), 0, ggml_nbytes(mask));
-}
-
 // Multi-head attention of contiguous q, k, v [D, T] -> [D, T], as in SenseVoice's SAN-M.
-// Without a mask this is the upstream graph; with one, keys and values get zero rows.
+// flash = false is the upstream graph. flash = true uses flash attention with F16 keys and
+// values: on the HTP it releases VTCM between output blocks, so the FuSa self-test period does
+// not bound the segment length, and the T x T scores are never stored.
 inline ggml_tensor * attention(ggml_context * c, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
-                               int heads, ggml_tensor * mask) {
-    const int D = q->ne[0], T = q->ne[1], dk = D / heads, keys = mask ? mask->ne[0] : T;
+                               int heads, bool flash) {
+    const int D = q->ne[0], T = q->ne[1], dk = D / heads;
     const float scale = 1.0f / sqrtf((float) dk);
-    if (keys != T) {
-        k = ggml_pad(c, k, 0, keys - T, 0, 0);
-        v = ggml_pad(c, v, 0, keys - T, 0, 0);
-    }
     q = ggml_permute(c, ggml_reshape_3d(c, q, dk, heads, T), 0, 2, 1, 3);
-    k = ggml_permute(c, ggml_reshape_3d(c, k, dk, heads, keys), 0, 2, 1, 3);
-    auto vh = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, v, dk, heads, keys), 1, 2, 0, 3));
-    auto kq = mask ? ggml_soft_max_ext(c, ggml_mul_mat(c, k, q), mask, scale, 0.0f)
-                   : ggml_soft_max(c, ggml_scale(c, ggml_mul_mat(c, k, q), scale));
+    if (flash) {
+        k = ggml_permute(c, ggml_reshape_3d(c, ggml_cast(c, k, GGML_TYPE_F16), dk, heads, T), 0, 2, 1, 3);
+        v = ggml_permute(c, ggml_reshape_3d(c, ggml_cast(c, v, GGML_TYPE_F16), dk, heads, T), 0, 2, 1, 3);
+        auto o = ggml_flash_attn_ext(c, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        ggml_prec_set_acc(o, GGML_PREC_F32);
+        return ggml_reshape_2d(c, o, D, T);  // [dk, heads, T]
+    }
+    k = ggml_permute(c, ggml_reshape_3d(c, k, dk, heads, T), 0, 2, 1, 3);
+    auto vh = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, v, dk, heads, T), 1, 2, 0, 3));
+    auto kq = ggml_soft_max(c, ggml_scale(c, ggml_mul_mat(c, k, q), scale));
     return ggml_cont_2d(c, ggml_permute(c, ggml_mul_mat(c, vh, kq), 0, 2, 1, 3), D, T);
 }
 } // namespace funasr

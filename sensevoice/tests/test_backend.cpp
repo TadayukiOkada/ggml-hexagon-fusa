@@ -1,4 +1,4 @@
-// CPU scheduling, weights, query dtypes, padded attention and fail-closed backend selection.
+// CPU scheduling, weights, query dtypes, attention and fail-closed backend selection.
 #include "funasr_backend.h"
 #include <cmath>
 #include <iostream>
@@ -28,7 +28,7 @@ int main() {
         try { funasr::embedding_row(tensors.at("embed.weight"), 1, 2, embedding); }
         catch (const std::exception &) { failed = true; }
         require(failed, "invalid embedding index accepted");
-        require(!runtime.accelerates(1), "CPU backend reported an accelerator");
+        require(!runtime.accelerated(), "CPU backend reported an accelerator");
         // Different graph/input shapes must work across successive segment runs.
         for (int frames : {1, 3, 1}) {
             ggml_init_params params = {1024 * 1024, nullptr, true};
@@ -47,9 +47,9 @@ int main() {
                 require(output[2*i] == 3 && output[2*i+1] == 7, "incorrect graph result");
             ggml_backend_sched_free(sched); ggml_free(ctx);
         }
-        // Attention with and without padded keys against a direct computation.
-        require(funasr::attention_keys(32) == 32 && funasr::attention_keys(33) == 64, "attention key padding");
-        for (int frames : {9, 37}) {
+        // The upstream attention graph and flash attention (F16 keys and values) against a direct
+        // computation.
+        for (bool flash : {false, true}) for (int frames : {9, 37, 100}) {
             const int D = 8, heads = 2, dk = D / heads;
             std::vector<float> qkv[3];
             for (int t = 0; t < 3; ++t) {
@@ -60,14 +60,11 @@ int main() {
             auto ctx = ggml_init(params);
             ggml_tensor * in[3];
             for (auto & t : in) { t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, frames); ggml_set_input(t); }
-            auto mask = funasr::attention_mask(ctx, frames);
-            require((mask != nullptr) == (frames > 32), "attention mask presence");
-            auto y = funasr::attention(ctx, in[0], in[1], in[2], heads, mask);
+            auto y = funasr::attention(ctx, in[0], in[1], in[2], heads, flash);
             ggml_set_output(y);
             auto graph = ggml_new_graph(ctx); ggml_build_forward_expand(graph, y);
             auto sched = runtime.allocate_graph(graph);
             for (int t = 0; t < 3; ++t) ggml_backend_tensor_set(in[t], qkv[t].data(), 0, qkv[t].size() * sizeof(float));
-            funasr::set_attention_mask(mask);
             require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "attention compute failed");
             std::vector<float> output((size_t) D * frames);
             ggml_backend_tensor_get(y, output.data(), 0, output.size() * sizeof(float));
@@ -83,7 +80,7 @@ int main() {
                 for (int c = 0; c < dk; ++c) {
                     double o = 0;
                     for (int j = 0; j < frames; ++j) o += p[j] / sum * qkv[2][(size_t) j * D + h * dk + c];
-                    require(fabs(output[(size_t) i * D + h * dk + c] - o) < 1e-4, "incorrect attention result");
+                    require(fabs(output[(size_t) i * D + h * dk + c] - o) < (flash ? 1e-2 : 1e-4), "incorrect attention result");
                 }
             }
             ggml_backend_sched_free(sched); ggml_free(ctx);

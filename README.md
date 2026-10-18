@@ -188,16 +188,14 @@ libraries or devices fail with an error. `--trace-schedule` prints each graph
 node's backend and rejection reason. All weights except the query embeddings
 have persistent HTP storage across segments, and the encoder and CTC head run
 on HTP as one graph split, within the backend's shape and FuSa operation-budget
-checks. For the HTP softmax, attention keys are padded to a multiple of 32 and
-masked. Audio preprocessing, query embeddings and optional VAD use the CPU.
+checks. Audio preprocessing, query embeddings and optional VAD use the CPU.
 F16 query embeddings are converted to float instead of being read as F32.
 
-Attention time grows with the square of the segment length; for 1024 frames
-the backend leaves its score matmuls to the CPU. A segment longer than 512
-frames (about 30 s of audio) is therefore computed on the CPU as a whole,
-with a message; use `--vad` (segments of at most `--vad-maxseg`, 30 s by
-default) for longer audio. On the CPU the graph and results are those of the
-upstream implementation.
+With HTP, attention uses flash attention with F16 keys and values: it releases
+VTCM between output blocks, so the segment length is not bounded by the FuSa
+self-test period, and the scores (segment length squared) are never stored.
+On the CPU (`--backend cpu`) the graph and results are those of the upstream
+implementation.
 
 The default flat package keeps SenseVoice and its ggml libraries in
 `sensevoice/`; `--split` puts executables in `bin/` and private libraries in
