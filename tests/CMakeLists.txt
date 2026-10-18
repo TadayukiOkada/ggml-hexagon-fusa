@@ -9,15 +9,18 @@ set(_dst ${CMAKE_CURRENT_BINARY_DIR}/test-backend-ops-hex.cpp)
 file(GLOB _patches ${CMAKE_CURRENT_SOURCE_DIR}/patches/*.patch)
 list(SORT _patches)
 
-# git apply works outside a repository, on paths relative to the working directory.
+# git apply works outside a repository, on paths relative to the working directory. Inside one
+# (a build directory in this checkout) it skips the paths and still succeeds, so the search for
+# a repository stops above the work directory, and a skipped patch is an error.
 file(REMOVE_RECURSE ${_tmp})
 file(MAKE_DIRECTORY ${_tmp}/tests)
 file(COPY_FILE ${_src} ${_tmp}/tests/test-backend-ops.cpp)
 foreach(_p IN LISTS _patches)
-    execute_process(COMMAND ${GIT_EXECUTABLE} apply --whitespace=nowarn ${_p}
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}
+            ${GIT_EXECUTABLE} apply --verbose --whitespace=nowarn ${_p}
         WORKING_DIRECTORY ${_tmp}
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-    if (NOT _rc EQUAL 0)
+    if (NOT _rc EQUAL 0 OR _out MATCHES "Skipped patch")
         message(FATAL_ERROR "tests: ${_p} does not apply to ${_src}:\n${_out}")
     endif()
 endforeach()
