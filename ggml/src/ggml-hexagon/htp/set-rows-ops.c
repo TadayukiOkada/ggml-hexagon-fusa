@@ -254,6 +254,29 @@ int op_set_rows(struct htp_ops_context * octx) {
          srctx.vtcm_layout.dst_bytes_per_thread  * n_threads,
          n_threads);
 
+#ifdef HTP_YIELD_IN_OPS
+    // The transposed V cache without flash attention takes one-element rows (a 512-token ubatch
+    // of 1024 values is 524288 rows, 42 ms on v73), so rows run in rounds of at most 32768 rows
+    // and about 8 MiB of output, and VTCM can be given away between rounds when a release is
+    // requested. Each round stages its own rows.
+    const size_t   row_bytes = MAX((size_t) htp_tensor_get_row_size(octx->dst->type, ne00) * ne02 * ne03, (size_t) 1);
+    const size_t   max_rows  = MAX((size_t) 1, MIN((size_t) 32768 / ((size_t) ne02 * ne03), (8u << 20) / row_bytes));
+    const uint32_t round     = MAX(n_threads, (uint32_t) MIN((size_t) tasks, max_rows) / n_threads * n_threads);
+    if (round < tasks) {
+        for (uint32_t done = 0; done < tasks;) {
+            const uint32_t n = MIN(round, tasks - done);
+            srctx.task_start       = task_start + done;
+            srctx.tasks            = n;
+            srctx.tasks_per_thread = fastdiv(n + n_threads - 1, &octx->n_threads_div);
+            work_queue_run(octx->ctx->work_queue, q_func, &srctx, n_threads);
+            done += n;
+            if (done < tasks && atomic_load(&octx->ctx->vtcm_needs_release)) {
+                htp_vtcm_yield(octx->ctx);
+            }
+        }
+        return HTP_STATUS_OK;
+    }
+#endif
     work_queue_run(octx->ctx->work_queue, q_func, &srctx, n_threads);
 
     return HTP_STATUS_OK;

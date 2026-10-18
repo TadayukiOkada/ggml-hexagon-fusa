@@ -66,6 +66,7 @@ if [ $long -eq 1 ]; then
         "attn32 MUL_MAT type_a=f32,type_b=f32,m=(512|1024|128),n=(504|1004)," \
         "attnact MUL_MAT type=f32,m=(512|1024)," \
         "softmax SOFT_MAX ne=\[(512,128,16,4|4096,512,16,1|8192,512,16,1)\]" \
+        "setrows SET_ROWS ne=\[1,(1048576|65536)," \
         "argsort ARGSORT ne=\[(151936|262144),1,1,1\]" \
         "repeat REPEAT ne=\[(1,4096,1,1|128,16,512,1)\]" \
         "fa FLASH_ATTN_EXT hsk=128,hsv=128,nh=8,nr23=\[2,1\],kv=(512|4096|8192|16384),nb=512,"
