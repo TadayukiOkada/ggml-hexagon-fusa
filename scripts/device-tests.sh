@@ -63,6 +63,8 @@ if [ $long -eq 1 ]; then
     for spec in \
         "cont CONT ne=\[(1024,(768|1152),1,1|32,32,(768|1152),1|128,8,(512,4|4096,1))\]" \
         "lmhead MUL_MAT m=(151936|262144)," \
+        "attn32 MUL_MAT type_a=f32,type_b=f32,m=(512|1024|128),n=(504|1004)," \
+        "attnact MUL_MAT type=f32,m=(512|1024)," \
         "softmax SOFT_MAX ne=\[(512,128,16,4|4096,512,16,1|8192,512,16,1)\]" \
         "argsort ARGSORT ne=\[(151936|262144),1,1,1\]" \
         "repeat REPEAT ne=\[(1,4096,1,1|128,16,512,1)\]" \

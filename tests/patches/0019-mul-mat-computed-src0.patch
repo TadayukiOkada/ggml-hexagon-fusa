@@ -1,0 +1,77 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f5b1b76..6b82498 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9829,6 +9829,44 @@ static const ggml_type other_types[] = {
+ #pragma optimize("", off)
+ #endif
+ 
++// MUL_MAT whose src0 is computed in the graph, as in attention without flash attention
++// (keys and values are activations, not weights): src0 is a converted to type.
++struct test_mul_mat_act : public test_case {
++    const ggml_type type;
++    const int64_t m;
++    const int64_t n;
++    const int64_t k;
++    const int64_t bs;
++
++    std::string vars() override {
++        return VARS_TO_STR5(type, m, n, k, bs);
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2 * m * n * k * bs;
++    }
++
++    test_mul_mat_act(ggml_type type = GGML_TYPE_F32, int64_t m = 64, int64_t n = 64, int64_t k = 128, int64_t bs = 4)
++        : type(type), m(m), n(n), k(k), bs(bs) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, bs);
++        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, bs);
++        ggml_set_name(a, "a");
++        ggml_set_name(b, "b");
++        ggml_tensor * a_act = ggml_cast(ctx, a, type);
++        ggml_set_name(a_act, "a_act");
++        ggml_tensor * out = ggml_mul_mat(ctx, a_act, b);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // Single ops that may run for tens of ms at model shapes.
+ // A backend that holds shared accelerator resources for a whole op can starve other clients.
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
+@@ -9865,6 +9903,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, kv, 512, 128, { 8, 1 }, { 2, 1 }));
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 512, kv, { 8, 1 }, { 2, 1 }));
+     }
++    // F32 attention of a speech encoder (SenseVoice: head 128, 4 heads), the keys padded to a
++    // multiple of 32: KQ and KQV with stored src0, and KQ with src0 computed in the graph, which
++    // the backend has to estimate as well
++    for (int64_t frames : { 504, 1004 }) {
++        const int64_t keys = (frames + 31) / 32 * 32;
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, keys, frames, 128, { 4, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, frames, keys, { 4, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat_act(GGML_TYPE_F32, keys, frames, 128, 4));
++    }
+ 
+     // concat outside the DMA paths, element-wise copy
+     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+@@ -12329,6 +12376,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // MUL_MAT with src0 computed in the graph (attention without flash attention)
++    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
++        test_cases.emplace_back(new test_mul_mat_act(type, 64, 70, 128, 4));
++    }
++
+     // FFN gate/up + GLU (fusable into the matmul): HMX row counts, a partial last chunk, both graph orders
+     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+         for (ggml_glu_op op : {GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU}) {

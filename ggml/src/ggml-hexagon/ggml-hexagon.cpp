@@ -7452,6 +7452,22 @@ static bool ggml_hexagon_tensor_is_non_host(const struct ggml_hexagon_session * 
     GGML_UNUSED(sess);
 }
 
+// Matmul FLOP per ms for the op budget when src0 is not a weight (attention keys and values),
+// about 0.7 of what the slowest shapes reach on v73 (QCS9075, GGML_HEXAGON_PROFILE): batched F16
+// HMX 0.86-1.5 TFLOP/s (0.86 for KQV with head 64), F16 and F32 HVX 29-94 GFLOP/s (29 for
+// attention scores with head 128).
+static double ggml_hexagon_mm_flop_per_ms(int kernel_type) {
+    switch (kernel_type) {
+        case HTP_MM_KERNEL_HMX_F16_BATCHED:
+            return 0.6e9;
+        case HTP_MM_KERNEL_HVX_F16_F16_VTCM:
+        case HTP_MM_KERNEL_HVX_F32_F32_VTCM:
+            return 20.0e6;
+        default:
+            return 5.0e9;
+    }
+}
+
 static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst, const char ** reason = nullptr) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -7534,22 +7550,31 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         HEX_REJECT(kparams.kernel_type == HTP_MM_KERNEL_UNSUPPORTED ? "unsupported_kernel" : "vtcm_limit");
     }
 
-    // The long matmuls are output projections over many tokens (perplexity, embeddings). The HMX
-    // 2D kernel releases VTCM between weight chunks when the skel is built with yield inside ops;
-    // the other kernels have no such point. Estimate from v73 (QCS9075): about 5 TFLOP/s on HMX
-    // and 45 GB/s of weights, whichever bounds it (lm_head 262144x1536 x 512 tokens: 71 ms).
-    // Only for weights with data: llama.cpp places weights by asking about a 512-token matmul
-    // with a zero-size placeholder buffer, and a refusal there would keep the weight, and every
-    // decode step, off the HTP. In a real graph a refused matmul runs on the CPU with the weight
-    // copied over. test-backend-ops asks before allocating, so it does not see this check.
+    // The long matmuls are output projections over many tokens (perplexity, embeddings) and
+    // attention without flash attention. The HMX 2D kernel releases VTCM between weight chunks
+    // when the skel is built with yield inside ops; the other kernels have no such point.
+    // Estimate from v73 (QCS9075), the FLOP rate or 45 GB/s of src0, whichever bounds it: about
+    // 5 TFLOP/s for weights (lm_head 262144x1536 x 512 tokens: 71 ms; a few decode rows on the HVX
+    // kernels are bounded by the bytes), the kernel's rate for other src0.
+    // Weights only with data: llama.cpp places weights by asking about a 512-token matmul with a
+    // zero-size placeholder buffer, and a refusal there would keep the weight, and every decode
+    // step, off the HTP. In a real graph a refused matmul runs on the CPU with the weight copied
+    // over. A src0 computed in the graph (keys or values of attention) is asked about before it is
+    // allocated, so it is estimated without data. test-backend-ops asks before allocating its
+    // inputs, so it does not see this check.
 #ifdef GGML_HEXAGON_HTP_YIELD_IN_OPS
     const bool mm_yields = kparams.kernel_type == HTP_MM_KERNEL_HMX_2D;
 #else
     const bool mm_yields = false;
 #endif
-    if (opt_op_budget_ms > 0 && src0->data != nullptr && !mm_yields) {
+    const struct ggml_tensor * src0_base = src0->view_src ? src0->view_src : src0;
+    const bool src0_computed = src0_base->op != GGML_OP_NONE;
+    const bool src0_weight   = src0_base->buffer &&
+                               ggml_backend_buffer_get_usage(src0_base->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    if (opt_op_budget_ms > 0 && (src0->data != nullptr || src0_computed) && !mm_yields) {
         const double flops = 2.0 * src0->ne[0] * src0->ne[1] * ggml_nrows(src1);
-        const double est   = (std::max)(flops / 5.0e9, (double) ggml_nbytes(src0) / 45.0e6);
+        const double rate  = src0_weight ? 5.0e9 : ggml_hexagon_mm_flop_per_ms(kparams.kernel_type);
+        const double est   = (std::max)(flops / rate, (double) ggml_nbytes(src0) / 45.0e6);
         if (est > opt_op_budget_ms) {
             HEX_VERBOSE("ggml-hex: %s MUL_MAT %s estimated %.1f ms > budget %.1f ms, left to the CPU\n", sess->c_name(),
                         dst->name, est, opt_op_budget_ms);

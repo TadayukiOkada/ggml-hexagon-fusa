@@ -113,7 +113,9 @@ Support reasons: `supported`, `explicit_opfilter` (`GGML_HEXAGON_OPFILTER`),
 `unsupported_params` (op parameters, such as a RoPE mode), `unsupported_sinks`,
 `unsupported_weight_layout` (repacked or viewed quantized weights),
 `unsupported_kernel` (no kernel configuration for the shape), `vtcm_limit`,
-`op_budget` (estimated time over the per-op budget, left to the CPU) and
+`op_budget` (estimated time over the per-op budget, left to the CPU; MUL_MAT,
+from the FLOP rate and src0 bytes, with the measured rate of the kernel when src0
+is not a weight, such as attention keys) and
 `unknown`. Reasons are recorded for MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, ROPE,
 SOFT_MAX, the binary and unary ops, GLU, GET_ROWS, SET_ROWS, CPY, CONT, ARGSORT
 and TOP_K; other ops report `unknown` when rejected.
@@ -189,9 +191,9 @@ checks. For the HTP softmax, attention keys are padded to a multiple of 32 and
 masked. Audio preprocessing, query embeddings and optional VAD use the CPU.
 F16 query embeddings are converted to float instead of being read as F32.
 
-Attention multiplies activations, which the backend's operation budget does not
-estimate, and its time grows with the square of the segment length. A segment
-longer than 512 frames (about 30 s of audio) is therefore computed on the CPU,
+Attention time grows with the square of the segment length, and its softmax
+has no operation-budget estimate. A segment longer than 512 frames (about 30 s
+of audio) is therefore computed on the CPU,
 with a message; use `--vad` (segments of at most `--vad-maxseg`, 30 s by
 default) for longer audio. On the CPU the graph and results are those of the
 upstream implementation.
