@@ -135,6 +135,7 @@ applies `asr/patches/*.patch`.
 | `0002-runtime-hexagon-backend` | loads `libggml-hexagon.so` explicitly (`--backend hexagon`, `--backend-lib`), per-role tensor storage, explicit CPU placement of named nodes, tensors bound outside the graph allocator kept valid across buffer resets (`ggml_backend_buffer_metadata_epoch`), and an optional schedule trace (`NEMO_SPEECH_SCHEDULE_TRACE`) with each node's backend and `ggml_backend_hexagon_support_reason` |
 | `0003-asr-backend-placement` | CLI and C API options for the backend, front end, position encoding and decoder placement |
 | `0004-asr-backend-tests` | `test_backend_storage` (storage roles, partial quantized uploads, graph reuse, support reasons) and an RNNT stage replay test |
+| `0005-asr-http-demo` | admission control and revision metadata for the optional HTTP/WebSocket server |
 
 NeMo is built as a separate CMake project with its own shared ggml (CPU backend
 linked in) from the same llama.cpp submodule, and SentencePiece is built from
@@ -226,6 +227,22 @@ CI builds the Android/Linux ARM64 integration and runs these CPU tests. HTP
 execution and real speech accuracy still require validation on the target:
 compare `--ids` output with CPU for the same model and audio, inspect
 `--trace-schedule`, and repeat with different segment lengths and `--vad`.
+
+## Busy-waiting response reads
+
+Some FastRPC kernel drivers (seen on the FuSa board's guest) leave a DSP signal
+that arrives before the host starts waiting in the signaled state. From then on
+every blocking `dspqueue_read()` on that queue spins on a CPU core until the
+response arrives, for the rest of the queue's life; results stay correct. The
+backend measures the thread CPU time of its blocking response reads and, once
+they turn out to be spinning, re-creates the session's dspqueue at the next
+point with no batches outstanding. The DSP side switches to the new queue and
+keeps VTCM, HMX, mappings and threads. `GGML_HEXAGON_QRECOVER=0` turns this off.
+
+`GGML_HEXAGON_OPPOLL=2` avoids blocking waits altogether: it polls without
+blocking, spins for up to 100 microseconds per batch response and then sleeps
+50 microseconds after each empty read. The sleep can add latency (about 2 ms
+per wait on the FuSa board's guest).
 
 ## Relation to upstream
 

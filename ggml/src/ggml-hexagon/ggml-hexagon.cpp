@@ -137,8 +137,9 @@ static int opt_opbatch  = 1280; // max number of ops in a batch
 static int opt_opbatch_first = 64; // ops after which the first batch of a graph is sent (0 = off)
 static int opt_opqueue  = 8;   // max number of pending batches
 static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
-static int opt_oppoll   = 0;    // polling for batch completions
+static int opt_oppoll   = 0;    // batch completions: 0 = blocking, 1 = spin, 2 = sleep between polls
 static int opt_opfusion = 1;    // enable/disable op fusion
+static int opt_qrecover = 1;    // re-create a dspqueue whose blocking reads busy-wait (0 = off, 2 = after every sync, for testing)
 
 enum ggml_hexagon_fusion_flags {
     GGML_HEXAGON_FUSE_ALLREDUCE_ADD = (1 << 1), // 2
@@ -573,6 +574,13 @@ struct ggml_hexagon_session {
     std::atomic<uint64_t> batch_rsp_seq{0};
     std::atomic<uint32_t> last_error{HTP_STATUS_OK};
 
+    // Time and thread CPU time spent in blocking response reads (see note_queue_wait)
+    uint64_t qwait_wall_ns = 0;
+    uint64_t qwait_cpu_ns  = 0;
+    bool     queue_stuck   = false;
+    bool     requeue_off   = false;
+    uint32_t n_requeue     = 0;
+
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
 
@@ -611,6 +619,8 @@ struct ggml_hexagon_session {
     void flush_batch(size_t min_ops = 1);
     void flush_peers();
     void flush_pending(bool all = true);
+    void note_queue_wait(uint64_t wall_ns, uint64_t cpu_ns);
+    void requeue();
 
     ggml_hexagon_shared_buffer * mmap_tensor(const ggml_tensor * t);
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
@@ -4769,6 +4779,82 @@ void ggml_hexagon_session::flush_async() {
     flush_batch();
 }
 
+// CPU time of the calling thread in nanoseconds (0 where unavailable)
+static uint64_t hex_thread_cpu_ns() {
+#ifdef _WIN32
+    return 0;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+#endif
+}
+
+// Some FastRPC drivers leave a DSP signal that arrived before the host started waiting
+// in the signaled state, and every later wait on it returns at once: a blocking
+// dspqueue_read() then spins on the CPU until the response arrives, for the rest of the
+// queue's life. A blocked read uses little CPU, so mark the queue once the reads that
+// lasted long enough to tell spent most of their time on the CPU.
+void ggml_hexagon_session::note_queue_wait(uint64_t wall_ns, uint64_t cpu_ns) {
+    if (wall_ns < 500000) {
+        return;
+    }
+    this->qwait_wall_ns += wall_ns;
+    this->qwait_cpu_ns  += cpu_ns;
+    if (this->qwait_wall_ns < 50000000) {
+        return;
+    }
+    if (this->qwait_cpu_ns * 2 > this->qwait_wall_ns) {
+        this->queue_stuck = true;
+    }
+    this->qwait_wall_ns = 0;
+    this->qwait_cpu_ns  = 0;
+}
+
+// Replace a queue whose reads busy-wait (see note_queue_wait). Only called with no
+// batches outstanding; the DSP switches over and closes its end of the old queue.
+void ggml_hexagon_session::requeue() {
+    this->queue_stuck = false;
+
+    const size_t req_q_size = (sizeof(htp_opbatch_req) * opt_opqueue * 2) + 1024;
+    const size_t rsp_q_size = (sizeof(htp_opbatch_rsp) * opt_opqueue * 2) + 1024;
+
+    dspqueue_t new_queue = nullptr;
+    uint64_t   new_id    = 0;
+
+    int err = dspqueue_create(this->domain_id, 0, req_q_size, rsp_q_size, nullptr, nullptr, (void *) this, &new_queue);
+    if (err == 0) {
+        err = dspqueue_export(new_queue, &new_id);
+    }
+    if (err == 0) {
+        err = htp_iface_requeue(this->handle, new_id);
+        if (err == AEE_EBADSTATE) {
+            // The DSP switched to the new queue but could not restart its main thread
+            GGML_ABORT("ggml-hex: %s lost the session while re-creating the dspqueue\n", this->c_name());
+        }
+    }
+    if (err != 0) {
+        GGML_LOG_WARN("ggml-hex: %s failed to re-create the busy-waiting dspqueue: 0x%08x\n", this->c_name(), (unsigned) err);
+        if (new_queue) {
+            dspqueue_close(new_queue);
+        }
+        this->requeue_off = true;
+        return;
+    }
+
+    err = dspqueue_close(this->queue);
+    if (err != 0) {
+        GGML_LOG_WARN("ggml-hex: %s failed to close the old dspqueue: 0x%08x\n", this->c_name(), (unsigned) err);
+    }
+    this->queue    = new_queue;
+    this->queue_id = new_id;
+    this->n_requeue++;
+    GGML_LOG_WARN("ggml-hex: %s re-created the dspqueue: blocking reads were busy-waiting (%u so far)\n",
+                  this->c_name(), this->n_requeue);
+}
+
 void ggml_hexagon_session::flush_pending(bool all) {
     for (auto & sub : this->mdev.sessions) {
         sub->flush_pending(all);
@@ -4777,6 +4863,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
     }
 
+    // Let very short DSP batches complete without paying a host wake-up delay.
+    auto poll_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
     while (this->batch_rsp_seq < this->batch_req_seq) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -4788,8 +4876,24 @@ void ggml_hexagon_session::flush_pending(bool all) {
         // Read response packet from queue
         const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
 
+        const bool timed = !opt_oppoll && opt_qrecover && !this->requeue_off;
+        uint64_t   cpu0  = timed ? hex_thread_cpu_ns() : 0;
+        auto       t0    = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
+
+        if (timed && cpu0) {
+            const uint64_t wall = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            note_queue_wait(wall, hex_thread_cpu_ns() - cpu0);
+        }
         if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+            // Some FastRPC drivers fail to consume an already-signaled notification:
+            // a blocking queue read can then busy-loop in FastRPC until the DSP responds.
+            // Nonblocking reads avoid that wait path. Sleep only after an empty read,
+            // so already-completed batches can still be drained without a delay.
+            if (opt_oppoll == 2 && std::chrono::steady_clock::now() >= poll_deadline) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
             continue;
         }
 
@@ -4818,6 +4922,12 @@ void ggml_hexagon_session::flush_pending(bool all) {
                             (uint64_t) rsp.seq, (unsigned) rsp.status);
 
         if (!all) break;
+        poll_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+    }
+
+    if ((this->queue_stuck || (opt_qrecover == 2 && all && !this->requeue_off)) &&
+        this->batch_rsp_seq == this->batch_req_seq) {
+        requeue();
     }
 }
 
@@ -10223,6 +10333,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
+    const char * str_qrecover = getenv("GGML_HEXAGON_QRECOVER");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -10285,6 +10396,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
+    opt_qrecover  = str_qrecover ? atoi(str_qrecover)                     : opt_qrecover;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
