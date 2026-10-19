@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ASR Studio · 音声認識比較</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main>
+<header><div><div class="eyebrow">LOCAL AUDIO LAB</div><h1>ASR Studio<span>音声を、並べて見る。</span></h1></div><span class="badge">PC MOCK</span></header>
+<div class="notice">モックモード · 表示する文章・感情・イベントは試験用の固定データです。入力音声の認識は行いません。</div>
+<section class="controls" aria-label="収録設定">
+<label>接続先<select id="profile"><option value="mock">PCモック</option disabled>EVK（準備中）</option><option disabled>SA8255P（準備中）</option></select></label>
+<label>エンジン<select id="engine"><option value="both">両方を比較</option><option value="nemo">NeMo</option><option value="sensevoice">SenseVoice</option></select></label>
+<label>マイク<select id="device"><option value="">システムの既定</option></select></label>
+<label>入力加工<select id="preset"><option value="speech">発話向け</option><option value="raw">環境音・感情向け（加工を抑える）</option></select></label>
+<label>故障シナリオ<select id="scenario"><option value="normal">正常</option><option value="slow">SenseVoice 遅延</option><option value="busy">SenseVoice 混雑</option><option value="disconnect">SenseVoice 切断</option><option value="malformed">SenseVoice 不正応答</option><option value="replacement">途中仮説の短縮</option><option value="late">取消中の遅延応答</option><option value="events">笑い・拍手（MOCK）</option><option value="unknown">未知タグ（MOCK）</option><option value="no-tags">タグなし（MOCK）</option></select></label>
+</section>
+<section class="transport"><div class="buttons"><button id="start" class="primary">● 収録を開始</button><button id="stop" disabled>停止して確定</button><button id="cancel" disabled>取り消し</button></div><div class="meter"><label for="level">入力レベル</label><progress id="level" max="1" value="0"></progress></div><output id="clock">0.00 / 30秒</output></section>
+<div class="statusbar"><span id="status" role="status" aria-live="polite">準備中</span><span id="recording">収録ID —</span></div>
+<section class="results" aria-label="認識結果">
+<article id="nemo"><div class="cardhead"><h2><span class="dot blue"></span>NeMo</h2><span class="engine-status">待機</span></div><p class="sub">ストリーミング認識 · 途中結果を全文置換</p><div class="partial"></div><div class="final"></div><div class="analysis"></div><pre class="metrics"></pre></article>
+<article id="sensevoice"><div class="cardhead"><h2><span class="dot green"></span>SenseVoice</h2><span class="engine-status">待機</span></div><p class="sub">区間認識 · 停止後に本文と追加情報を表示</p><div class="partial"></div><div class="final"></div><div class="analysis"></div><pre class="metrics"></pre></article>
+</section>
+<footer><label class="file">WAVで試す<input id="file" type="file" accept=".wav,audio/wav"></label><span>16kHz · mono · PCM16 / 最大30秒</span><div class="spacer"></div><button id="save">結果JSON</button><button id="save-audio" disabled>音声WAVを保存</button><button id="clear">画面を消去</button></footer>
+<details><summary>音声処理・接続の記録</summary><pre id="details">音声はメモリ内だけで扱います。保存する場合は「音声WAVを保存」を操作してください。</pre></details>
+</main><script type="module" src="/static/app.mjs"></script></body></html>

@@ -20,6 +20,8 @@ class PackageTests(unittest.TestCase):
                  'ggml/src/ggml-hexagon/libggml-htp-v73.so': 'fake skel'}
         if sensevoice:
             files.update({'sensevoice/sensevoice-build/bin/llama-funasr-sensevoice': MOCK,
+                          'sensevoice/sensevoice-build/bin/sensevoice-server': MOCK,
+                          'sensevoice/sensevoice-build/_deps/fusa_httplib-src/LICENSE': 'HTTP license',
                           'sensevoice/sensevoice-build/bin/test-sensevoice-backend': MOCK,
                           'sensevoice/sensevoice-build/bin/libggml-base.so': 'private SenseVoice ggml',
                           'sensevoice/sensevoice-build/bin/libggml-cpu.so': 'CPU linked'})
@@ -41,6 +43,11 @@ class PackageTests(unittest.TestCase):
                     result = subprocess.run(command, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertTrue((out/'licenses/SenseVoice-LICENSE').exists())
+                    self.assertTrue((out/'licenses/cpp-httplib-LICENSE').exists())
+                    self.assertTrue((out/'licenses/NeMo-Speech.cpp-LICENSE').exists())
+                    self.assertTrue((out/'demos/asr-web/static/index.html').exists())
+                    self.assertTrue((out/'demos/asr-web/gateway.py').exists())
+                    self.assertEqual(subprocess.run(['sh','-n',str(out/'run-asr-web.sh')]).returncode,0)
                     self.assertTrue((out/'licenses/miniaudio-LICENSE').exists())
                     self.assertIn('SenseVoice:', (out/'BUILD_INFO.txt').read_text())
                     for script in ('run.sh', 'run-sensevoice.sh'):
@@ -54,6 +61,9 @@ class PackageTests(unittest.TestCase):
                     self.assertIn('--threads', lines)
                     library = out/'lib/sensevoice' if mode=='split' else out/'sensevoice' if mode=='flat' else out
                     self.assertIn('LIB='+str(library)+':', reply.stdout)
+                    server = subprocess.run([str(out/'run.sh'),'sensevoice-server','--help'],capture_output=True,text=True)
+                    self.assertEqual(server.returncode,0,server.stderr)
+                    self.assertIn('LIB='+str(library)+':',server.stdout)
                     self.assertEqual(subprocess.run([str(out/'run.sh'),'llama-funasr-sensevoice','--help'],capture_output=True).returncode,0)
                     if mode=='sensevoice': self.assertFalse((out/'llama-cli').exists())
                     else: self.assertTrue((out/('bin/llama-cli' if mode=='split' else 'llama-cli')).exists())

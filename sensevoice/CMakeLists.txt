@@ -6,6 +6,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 get_filename_component(FUSA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(LLAMA_DIR "${FUSA_ROOT}/llama.cpp" CACHE PATH "Pinned llama.cpp checkout")
+option(GGML_HEXAGON_SENSEVOICE_HTTP "Build optional persistent SenseVoice HTTP/WebSocket server" OFF)
 include(ExternalProject)
 find_package(Git REQUIRED)
 set(_upstream "${FUSA_ROOT}/SenseVoice")
@@ -64,7 +65,8 @@ ExternalProject_Add(sensevoice-runtime
                "-DFUSA_SOURCE_ROOT=${FUSA_ROOT}" "-DFUSA_BINARY_ROOT=${CMAKE_BINARY_DIR}"
                "-DSENSEVOICE_SOURCE_DIR=${_src}/runtime/llama.cpp"
                "-DFUSA_SENSEVOICE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
-               "-DLLAMA_DIR=${LLAMA_DIR}" ${_target_args}
+               "-DLLAMA_DIR=${LLAMA_DIR}" "-DFUSA_ROOT=${FUSA_ROOT}"
+               "-DGGML_HEXAGON_SENSEVOICE_HTTP=${GGML_HEXAGON_SENSEVOICE_HTTP}" ${_target_args}
     BUILD_ALWAYS ON
     INSTALL_COMMAND "")
 add_custom_target(sensevoice ALL DEPENDS sensevoice-runtime)
