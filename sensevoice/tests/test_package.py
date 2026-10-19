@@ -11,9 +11,9 @@ MOCK = '#!/bin/sh\nprintf "%s\\n" "$@"\nprintf "LIB=%s\\n" "$LD_LIBRARY_PATH"\np
 
 
 class PackageTests(unittest.TestCase):
-    def build_fixture(self, base, sensevoice=True):
+    def build_fixture(self, base, sensevoice=True, cache=''):
         build = base / 'build'
-        files = {'CMakeCache.txt': 'CMAKE_STRIP:FILEPATH=/usr/bin/strip\n',
+        files = {'CMakeCache.txt': 'CMAKE_STRIP:FILEPATH=/usr/bin/strip\n' + cache,
                  'hexagon-build-id.txt': 'test-build-id\n',
                  'bin/llama-cli': MOCK, 'bin/libggml-base.so': 'main ggml',
                  'bin/libggml-hexagon.so': 'fake host module',
@@ -21,7 +21,6 @@ class PackageTests(unittest.TestCase):
         if sensevoice:
             files.update({'sensevoice/sensevoice-build/bin/llama-funasr-sensevoice': MOCK,
                           'sensevoice/sensevoice-build/bin/sensevoice-server': MOCK,
-                          'sensevoice/sensevoice-build/_deps/fusa_httplib-src/LICENSE': 'HTTP license',
                           'sensevoice/sensevoice-build/bin/test-sensevoice-backend': MOCK,
                           'sensevoice/sensevoice-build/bin/libggml-base.so': 'private SenseVoice ggml',
                           'sensevoice/sensevoice-build/bin/libggml-cpu.so': 'CPU linked'})
@@ -75,7 +74,27 @@ class PackageTests(unittest.TestCase):
             out = base/'flat'
             self.assertEqual(subprocess.run([str(ROOT/'scripts/package.sh'),str(build),str(out)],capture_output=True).returncode,0)
             self.assertFalse((out/'run-sensevoice.sh').exists())
+            self.assertFalse((out/'licenses/cpp-httplib-LICENSE').exists())
             self.assertEqual(subprocess.run([str(ROOT/'scripts/package.sh'),'--sensevoice',str(build),str(base/'missing')],capture_output=True).returncode,2)
+
+    def test_asr_http_cache_without_nemo(self):
+        # GGML_HEXAGON_ASR_HTTP=ON in the cache does not matter when no nemo-speech is packaged.
+        with tempfile.TemporaryDirectory(prefix='sensevoice-package-') as directory:
+            base = Path(directory)
+            build = self.build_fixture(base, cache='GGML_HEXAGON_ASR_HTTP:BOOL=ON\n')
+            for mode in ('flat', 'sensevoice'):
+                out = base/mode
+                result = subprocess.run([str(ROOT/'scripts/package.sh')] + ([] if mode == 'flat' else ['--'+mode]) + [str(build), str(out)],
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((out/'licenses/NeMo-Speech.cpp-MODIFIED').exists())
+                self.assertTrue((out/'licenses/cpp-httplib-LICENSE').exists())
+            (build/'sensevoice/sensevoice-build/bin/sensevoice-server').unlink()
+            out = base/'no-server'
+            result = subprocess.run([str(ROOT/'scripts/package.sh'), str(build), str(out)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((out/'licenses/cpp-httplib-LICENSE').exists())
+            self.assertFalse((out/'demos').exists())
 
 
 if __name__=='__main__':

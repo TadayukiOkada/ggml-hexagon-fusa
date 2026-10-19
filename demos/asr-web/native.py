@@ -16,7 +16,9 @@ class NativeEngine:
 
     async def start(self):
         self.client=ClientSession(timeout=ClientTimeout(total=None, sock_connect=5))
-        self.ws=await asyncio.wait_for(self.client.ws_connect(self.url+('/v1/audio/transcriptions/realtime' if self.engine=='nemo' else '/api/session'),max_msg_size=1024*1024,heartbeat=20),5)
+        # No heartbeat: the native servers infer inside the socket handler and cannot answer
+        # pings meanwhile. The queue limit and finish() bound the waits instead.
+        self.ws=await asyncio.wait_for(self.client.ws_connect(self.url+('/v1/audio/transcriptions/realtime' if self.engine=='nemo' else '/api/session'),max_msg_size=1024*1024),5)
         event=await asyncio.wait_for(self.ws.receive_json(),5)
         expected='session.created' if self.engine=='nemo' else 'session.ready'
         if event.get('type')!=expected:raise ValueError('native engine is busy or not ready')

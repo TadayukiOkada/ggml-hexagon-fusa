@@ -106,7 +106,6 @@ class Recording:
         if engine == 'sensevoice':
             fields['analysis'] = dict(language='ja', emotion='NEUTRAL', events=['Speech'],
                                      itn='withitn', raw_tags=['<|ja|>', '<|NEUTRAL|>', '<|Speech|>', '<|withitn|>'], confidence=None)
-        if engine == 'sensevoice':
             if self.scenario == 'events':
                 fields['analysis'].update(emotion='HAPPY', events=['Laughter','Applause'], raw_tags=['<|ja|>','<|HAPPY|>','<|Laughter|>','<|Applause|>','<|withitn|>'])
             if self.scenario in ('unknown','no-tags'):
@@ -222,7 +221,7 @@ async def transcribe(request):
 
 
 async def capabilities(request):
-    result = dict(profile='mock', is_mock=True, profiles=[dict(id='mock', ready=True), dict(id='evk', ready=False), dict(id='sa8255p', ready=False)],
+    result = dict(profile='mock', is_mock=True,
         engines={e: dict(ready=True, backend='mock', device=None, model='scripted', build_id=None, partial=e=='nemo', tags=e=='sensevoice') for e in ENGINES},
         limits=dict(sample_rate=16000, max_seconds=30, max_frame_bytes=3200, pending_seconds=2), scenarios=SCENARIOS)
     profiles=[dict(id="mock", ready=True, is_mock=True, engines=result['engines'])]
@@ -236,9 +235,10 @@ async def capabilities(request):
                                         model=info.get('model'), build_id=info.get('build_id'),
                                         partial=engine=='nemo', tags=engine=='sensevoice')
             except Exception: return engine, dict(ready=False)
-        for profile in ('cpu','evk','sa8255p'):
+        async def probe_profile(profile):  # all profiles at once: unreachable ones cost 2 s in total
             engines=dict(await asyncio.gather(*(probe(profile,e,u) for e,u in request.app[PROFILES].get(profile,{}).items())))
-            profiles.append(dict(id=profile, is_mock=False, configured=profile in request.app[PROFILES], ready=any(e['ready'] for e in engines.values()), engines=engines))
+            return dict(id=profile, is_mock=False, configured=profile in request.app[PROFILES], ready=any(e['ready'] for e in engines.values()), engines=engines)
+        profiles+=await asyncio.gather(*(probe_profile(p) for p in ('cpu','evk','sa8255p')))
     result['profiles']=profiles
     return web.json_response(result)
 

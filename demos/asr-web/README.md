@@ -39,8 +39,8 @@ cmake --preset arm64-oe-linux-v73-fusa -B <build> \
 cmake --build <build> -j 8
 ```
 
-cpp-httplibはNeMoのpinと同じcommitで取得します。初回はネットワークが必要です。
-submoduleの作業ツリーは変更しません。SenseVoiceサーバはCLIと同じfrontend、グラフ、scheduler、CTC、detokenizeを使用し、モデルを常駐させます。
+NeMoのサーバが使うcpp-httplibはNeMoのpinと同じcommitで取得します。初回はネットワークが必要です。SenseVoiceのサーバはSenseVoiceに同梱の`httplib.h`を使うため、取得は不要です。
+submoduleの作業ツリーは変更しません。SenseVoiceのCLIと常駐サーバは、`sensevoice/patches/0002-runtime-library-and-server.patch`でCLIから分けた共通runtime(frontend、グラフ、scheduler、CTC、detokenize)を使い、サーバはモデルを常駐させます。25 ms未満の録音は空の最終結果になります。
 SenseVoice CLIの従来の出力・`--ids`・`--keep-tags`を保持し、`--json`を追加しています。
 
 NeMoは下記のYAMLをローカル設定として用意します（`serve`専用）。

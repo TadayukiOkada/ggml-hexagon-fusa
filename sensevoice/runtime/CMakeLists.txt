@@ -27,13 +27,13 @@ set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 set(GGML_METAL OFF CACHE BOOL "" FORCE)
 add_subdirectory("${LLAMA_DIR}/ggml" ggml)
 find_package(Threads REQUIRED)
-add_library(sensevoice-core STATIC sensevoice_runtime.cpp)
-target_include_directories(sensevoice-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
+# The runtime, CLI and server sources come from sensevoice/patches (0002 splits the CLI).
+set(_sv "${SENSEVOICE_SOURCE_DIR}/funasr-sensevoice")
+add_library(sensevoice-core STATIC "${_sv}/sensevoice_runtime.cpp")
+target_include_directories(sensevoice-core PUBLIC "${_sv}"
     "${SENSEVOICE_SOURCE_DIR}/funasr-common" "${FUSA_SENSEVOICE_DIR}/include")
 target_link_libraries(sensevoice-core PUBLIC ggml Threads::Threads ${CMAKE_DL_LIBS})
-add_executable(llama-funasr-sensevoice sensevoice_cli.cpp)
-target_include_directories(llama-funasr-sensevoice PRIVATE
-    "${SENSEVOICE_SOURCE_DIR}/funasr-common" "${FUSA_SENSEVOICE_DIR}/include")
+add_executable(llama-funasr-sensevoice "${_sv}/funasr-sensevoice.cpp")
 target_link_libraries(llama-funasr-sensevoice PRIVATE sensevoice-core)
 enable_testing()
 add_executable(test-sensevoice-backend "${FUSA_SENSEVOICE_DIR}/tests/test_backend.cpp")
@@ -44,10 +44,9 @@ add_test(NAME sensevoice-help COMMAND llama-funasr-sensevoice --help)
 
 option(GGML_HEXAGON_SENSEVOICE_HTTP "Build persistent HTTP/WebSocket server" OFF)
 if(GGML_HEXAGON_SENSEVOICE_HTTP)
-    include("${FUSA_ROOT}/cmake/AsrHttpDependency.cmake")
-    fusa_http_dependency(_http_source)
-    add_executable(sensevoice-server sensevoice_server.cpp "${FUSA_ROOT}/NeMo-Speech.cpp/src/common/json.cpp")
-    target_include_directories(sensevoice-server PRIVATE "${_http_source}" "${FUSA_ROOT}/NeMo-Speech.cpp/src/common")
+    # httplib.h is the copy SenseVoice bundles in funasr-common (no download).
+    add_executable(sensevoice-server "${_sv}/sensevoice_server.cpp" "${FUSA_ROOT}/NeMo-Speech.cpp/src/common/json.cpp")
+    target_include_directories(sensevoice-server PRIVATE "${FUSA_ROOT}/NeMo-Speech.cpp/src/common")
     target_link_libraries(sensevoice-server PRIVATE sensevoice-core)
 endif()
 add_executable(test-sensevoice-json "${FUSA_SENSEVOICE_DIR}/tests/test_json.cpp")

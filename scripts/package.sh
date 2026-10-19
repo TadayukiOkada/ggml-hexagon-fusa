@@ -234,12 +234,16 @@ if [ $with_asr -eq 1 ]; then
     fi
 fi
 
-if [ -x "$sv/sensevoice-server" ] || [ "$(sed -n 's/^GGML_HEXAGON_ASR_HTTP:BOOL=//p' "$cache")" = ON ]; then
-    http_license=$build/asr/nemo-src/third_party/cpp-httplib/LICENSE
-    [ -f "$http_license" ] || http_license=$build/sensevoice/sensevoice-build/_deps/fusa_httplib-src/LICENSE
-    if [ ! -f "$http_license" ]; then echo "package: missing cpp-httplib license" >&2; exit 2; fi
-    cp "$http_license" "$lic/cpp-httplib-LICENSE"
-    # SenseVoice transport uses NeMo's standalone JSON parser (no NeMo ggml).
+# The HTTP servers of what is packaged: nemo-speech built with GGML_HEXAGON_ASR_HTTP,
+# sensevoice-server. Both use cpp-httplib (MIT, the LICENSE llama.cpp vendors).
+asr_http=0 sv_http=0
+[ $with_asr -eq 1 ] && [ "$(sed -n 's/^GGML_HEXAGON_ASR_HTTP:BOOL=//p' "$cache")" = ON ] && asr_http=1
+[ $with_sensevoice -eq 1 ] && [ -x "$sv/sensevoice-server" ] && sv_http=1
+if [ $asr_http -eq 1 ] || [ $sv_http -eq 1 ]; then
+    cp "$top/llama.cpp/vendor/cpp-httplib/LICENSE" "$lic/cpp-httplib-LICENSE"
+fi
+if [ $sv_http -eq 1 ]; then
+    # sensevoice-server uses NeMo's standalone JSON parser (no NeMo ggml).
     for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md; do cp "$top/NeMo-Speech.cpp/$f" "$lic/NeMo-Speech.cpp-$f"; done
 fi
 
@@ -247,11 +251,11 @@ if [ $with_sensevoice -eq 1 ]; then
     cp "$top/SenseVoice/LICENSE" "$lic/SenseVoice-LICENSE"
     sed -n '/^This software is available as a choice/,$p' \
         "$top/SenseVoice/runtime/llama.cpp/funasr-common/miniaudio.h" > "$lic/miniaudio-LICENSE"
-    echo "SenseVoice runtime is built with sensevoice/patches, sensevoice/include and sensevoice/runtime of ggml-hexagon-fusa." > "$lic/SenseVoice-MODIFIED"
+    echo "SenseVoice runtime is built with sensevoice/patches and sensevoice/include of ggml-hexagon-fusa." > "$lic/SenseVoice-MODIFIED"
 fi
 
 # The gateway runs on the browser's host PC; keep it separate from target tools.
-if { [ $with_asr -eq 1 ] && [ "$(sed -n 's/^GGML_HEXAGON_ASR_HTTP:BOOL=//p' "$cache")" = ON ]; } || { [ $with_sensevoice -eq 1 ] && [ -x "$sv/sensevoice-server" ]; }; then
+if [ $asr_http -eq 1 ] || [ $sv_http -eq 1 ]; then
     demo=$out/demos/asr-web
     mkdir -p "$demo/static"
     for f in gateway.py native.py requirements.txt profiles.example.json README.md; do
@@ -277,7 +281,7 @@ fi
     fi
     if [ $with_sensevoice -eq 1 ]; then
         echo "SenseVoice: $(git -C "$top/SenseVoice" rev-parse HEAD) + sensevoice/patches"
-        (cd "$top" && sha256sum sensevoice/patches/*.patch sensevoice/include/*.h sensevoice/runtime/CMakeLists.txt sensevoice/runtime/*.cpp sensevoice/runtime/*.h)
+        (cd "$top" && sha256sum sensevoice/patches/*.patch sensevoice/include/*.h sensevoice/runtime/CMakeLists.txt)
     fi
     for v in GGML_HEXAGON_SENSEVOICE_HTTP GGML_HEXAGON_ASR_HTTP GGML_HEXAGON_SENSEVOICE GGML_HEXAGON_ASR GGML_HEXAGON_FUSA GGML_HEXAGON_HTP_ARCHS GGML_HEXAGON_TOOLV GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY GGML_HEXAGON_HTP_YIELD_IN_OPS; do
         printf '%-36s %s\n' "$v" "$(sed -n "s/^$v:[A-Z]*=//p" "$cache")"
