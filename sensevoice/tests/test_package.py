@@ -11,15 +11,16 @@ MOCK = '#!/bin/sh\nprintf "%s\\n" "$@"\nprintf "LIB=%s\\n" "$LD_LIBRARY_PATH"\np
 
 
 class PackageTests(unittest.TestCase):
-    def build_fixture(self, base, sensevoice=True):
+    def build_fixture(self, base, sensevoice=True, cache=''):
         build = base / 'build'
-        files = {'CMakeCache.txt': 'CMAKE_STRIP:FILEPATH=/usr/bin/strip\n',
+        files = {'CMakeCache.txt': 'CMAKE_STRIP:FILEPATH=/usr/bin/strip\n' + cache,
                  'hexagon-build-id.txt': 'test-build-id\n',
                  'bin/llama-cli': MOCK, 'bin/libggml-base.so': 'main ggml',
                  'bin/libggml-hexagon.so': 'fake host module',
                  'ggml/src/ggml-hexagon/libggml-htp-v73.so': 'fake skel'}
         if sensevoice:
             files.update({'sensevoice/sensevoice-build/bin/llama-funasr-sensevoice': MOCK,
+                          'sensevoice/sensevoice-build/bin/sensevoice-server': MOCK,
                           'sensevoice/sensevoice-build/bin/test-sensevoice-backend': MOCK,
                           'sensevoice/sensevoice-build/bin/libggml-base.so': 'private SenseVoice ggml',
                           'sensevoice/sensevoice-build/bin/libggml-cpu.so': 'CPU linked'})
@@ -41,6 +42,11 @@ class PackageTests(unittest.TestCase):
                     result = subprocess.run(command, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertTrue((out/'licenses/SenseVoice-LICENSE').exists())
+                    self.assertTrue((out/'licenses/cpp-httplib-LICENSE').exists())
+                    self.assertTrue((out/'licenses/NeMo-Speech.cpp-LICENSE').exists())
+                    self.assertTrue((out/'demos/asr-web/static/index.html').exists())
+                    self.assertTrue((out/'demos/asr-web/gateway.py').exists())
+                    self.assertEqual(subprocess.run(['sh','-n',str(out/'run-asr-web.sh')]).returncode,0)
                     self.assertTrue((out/'licenses/miniaudio-LICENSE').exists())
                     self.assertIn('SenseVoice:', (out/'BUILD_INFO.txt').read_text())
                     for script in ('run.sh', 'run-sensevoice.sh'):
@@ -54,6 +60,9 @@ class PackageTests(unittest.TestCase):
                     self.assertIn('--threads', lines)
                     library = out/'lib/sensevoice' if mode=='split' else out/'sensevoice' if mode=='flat' else out
                     self.assertIn('LIB='+str(library)+':', reply.stdout)
+                    server = subprocess.run([str(out/'run.sh'),'sensevoice-server','--help'],capture_output=True,text=True)
+                    self.assertEqual(server.returncode,0,server.stderr)
+                    self.assertIn('LIB='+str(library)+':',server.stdout)
                     self.assertEqual(subprocess.run([str(out/'run.sh'),'llama-funasr-sensevoice','--help'],capture_output=True).returncode,0)
                     if mode=='sensevoice': self.assertFalse((out/'llama-cli').exists())
                     else: self.assertTrue((out/('bin/llama-cli' if mode=='split' else 'llama-cli')).exists())
@@ -65,7 +74,27 @@ class PackageTests(unittest.TestCase):
             out = base/'flat'
             self.assertEqual(subprocess.run([str(ROOT/'scripts/package.sh'),str(build),str(out)],capture_output=True).returncode,0)
             self.assertFalse((out/'run-sensevoice.sh').exists())
+            self.assertFalse((out/'licenses/cpp-httplib-LICENSE').exists())
             self.assertEqual(subprocess.run([str(ROOT/'scripts/package.sh'),'--sensevoice',str(build),str(base/'missing')],capture_output=True).returncode,2)
+
+    def test_asr_http_cache_without_nemo(self):
+        # GGML_HEXAGON_ASR_HTTP=ON in the cache does not matter when no nemo-speech is packaged.
+        with tempfile.TemporaryDirectory(prefix='sensevoice-package-') as directory:
+            base = Path(directory)
+            build = self.build_fixture(base, cache='GGML_HEXAGON_ASR_HTTP:BOOL=ON\n')
+            for mode in ('flat', 'sensevoice'):
+                out = base/mode
+                result = subprocess.run([str(ROOT/'scripts/package.sh')] + ([] if mode == 'flat' else ['--'+mode]) + [str(build), str(out)],
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((out/'licenses/NeMo-Speech.cpp-MODIFIED').exists())
+                self.assertTrue((out/'licenses/cpp-httplib-LICENSE').exists())
+            (build/'sensevoice/sensevoice-build/bin/sensevoice-server').unlink()
+            out = base/'no-server'
+            result = subprocess.run([str(ROOT/'scripts/package.sh'), str(build), str(out)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((out/'licenses/cpp-httplib-LICENSE').exists())
+            self.assertFalse((out/'demos').exists())
 
 
 if __name__=='__main__':

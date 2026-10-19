@@ -62,7 +62,7 @@ if [ $sensevoice_only -eq 1 ] && [ $with_sensevoice -eq 0 ]; then
     echo "package: no SenseVoice runtime (configure with GGML_HEXAGON_SENSEVOICE=ON)" >&2; exit 2
 fi
 copy_sensevoice() {  # <executables> <private ggml libraries>
-    for f in "$sv"/llama-funasr-sensevoice "$sv"/test-sensevoice-backend; do [ -f "$f" ] && cp -L "$f" "$1/"; done
+    for f in "$sv"/llama-funasr-sensevoice "$sv"/test-sensevoice-backend "$sv"/sensevoice-server; do [ -f "$f" ] && cp -L "$f" "$1/"; done
     for f in "$sv"/lib*.so*; do [ -f "$f" ] && cp -L "$f" "$2/"; done
     strip_dir "$1"; strip_dir "$2"
 }
@@ -123,7 +123,7 @@ tool=$1; shift
 lib=$d/lib
 case $tool in
     nemo-speech|test_backend_storage) lib=$d/lib/nemo-speech:$d/lib ;;
-    llama-funasr-sensevoice|test-sensevoice-backend) lib=$d/lib/sensevoice:$d/lib ;;
+    llama-funasr-sensevoice|test-sensevoice-backend|sensevoice-server) lib=$d/lib/sensevoice:$d/lib ;;
 esac
 ADSP_LIBRARY_PATH="$d/lib;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
 LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/bin/$tool" "$@"
@@ -144,7 +144,7 @@ tool=$1; shift
 exe=$d lib=$d
 case $tool in
     nemo-speech|test_backend_storage) exe=$d/nemo-speech lib=$d/nemo-speech:$d ;;
-    llama-funasr-sensevoice|test-sensevoice-backend)
+    llama-funasr-sensevoice|test-sensevoice-backend|sensevoice-server)
         if [ -d "$d/sensevoice" ]; then exe=$d/sensevoice lib=$d/sensevoice:$d; fi ;;
 esac
 ADSP_LIBRARY_PATH="$d;${ADSP_LIBRARY_PATH:-/usr/lib/rfsa/adsp;/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;/dsp}" \
@@ -234,11 +234,42 @@ if [ $with_asr -eq 1 ]; then
     fi
 fi
 
+# The HTTP servers of what is packaged: nemo-speech built with GGML_HEXAGON_ASR_HTTP,
+# sensevoice-server. Both use cpp-httplib (MIT, the LICENSE llama.cpp vendors).
+asr_http=0 sv_http=0
+[ $with_asr -eq 1 ] && [ "$(sed -n 's/^GGML_HEXAGON_ASR_HTTP:BOOL=//p' "$cache")" = ON ] && asr_http=1
+[ $with_sensevoice -eq 1 ] && [ -x "$sv/sensevoice-server" ] && sv_http=1
+if [ $asr_http -eq 1 ] || [ $sv_http -eq 1 ]; then
+    cp "$top/llama.cpp/vendor/cpp-httplib/LICENSE" "$lic/cpp-httplib-LICENSE"
+fi
+if [ $sv_http -eq 1 ]; then
+    # sensevoice-server uses NeMo's standalone JSON parser (no NeMo ggml).
+    for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md; do cp "$top/NeMo-Speech.cpp/$f" "$lic/NeMo-Speech.cpp-$f"; done
+fi
+
 if [ $with_sensevoice -eq 1 ]; then
     cp "$top/SenseVoice/LICENSE" "$lic/SenseVoice-LICENSE"
     sed -n '/^This software is available as a choice/,$p' \
         "$top/SenseVoice/runtime/llama.cpp/funasr-common/miniaudio.h" > "$lic/miniaudio-LICENSE"
     echo "SenseVoice runtime is built with sensevoice/patches and sensevoice/include of ggml-hexagon-fusa." > "$lic/SenseVoice-MODIFIED"
+fi
+
+# The gateway runs on the browser's host PC; keep it separate from target tools.
+if [ $asr_http -eq 1 ] || [ $sv_http -eq 1 ]; then
+    demo=$out/demos/asr-web
+    mkdir -p "$demo/static"
+    for f in gateway.py native.py requirements.txt profiles.example.json README.md; do
+        cp "$top/demos/asr-web/$f" "$demo/"
+    done
+    cp "$top"/demos/asr-web/static/* "$demo/static/"
+    cat > "$out/run-asr-web.sh" <<'EOF'
+#!/bin/sh
+# Run on the host PC with the Python dependencies installed.
+set -eu
+base=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${PYTHON:-python3}" "$base/demos/asr-web/gateway.py" "$@"
+EOF
+    chmod +x "$out/run-asr-web.sh"
 fi
 
 {
@@ -252,7 +283,7 @@ fi
         echo "SenseVoice: $(git -C "$top/SenseVoice" rev-parse HEAD) + sensevoice/patches"
         (cd "$top" && sha256sum sensevoice/patches/*.patch sensevoice/include/*.h sensevoice/runtime/CMakeLists.txt)
     fi
-    for v in GGML_HEXAGON_SENSEVOICE GGML_HEXAGON_ASR GGML_HEXAGON_FUSA GGML_HEXAGON_HTP_ARCHS GGML_HEXAGON_TOOLV GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY GGML_HEXAGON_HTP_YIELD_IN_OPS; do
+    for v in GGML_HEXAGON_SENSEVOICE_HTTP GGML_HEXAGON_ASR_HTTP GGML_HEXAGON_SENSEVOICE GGML_HEXAGON_ASR GGML_HEXAGON_FUSA GGML_HEXAGON_HTP_ARCHS GGML_HEXAGON_TOOLV GGML_HEXAGON_HTP_YIELD_BETWEEN_OPS GGML_HEXAGON_HTP_YIELD_IN_CPY GGML_HEXAGON_HTP_YIELD_IN_OPS; do
         printf '%-36s %s\n' "$v" "$(sed -n "s/^$v:[A-Z]*=//p" "$cache")"
     done
     echo

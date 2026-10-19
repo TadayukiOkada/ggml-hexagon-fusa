@@ -1,0 +1,551 @@
+diff --git a/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp b/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
+index b7cc09a..ac63ca6 100644
+--- a/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
++++ b/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
+@@ -1,109 +1,15 @@
+-// funasr-sensevoice: SenseVoiceSmall (SAN-M encoder + CTC) on ggml.
+-//   fbank.bin (T x 560) -> CMVN -> prepend 4 query tokens -> SAN-M encoder ->
+-//   CTC head -> greedy CTC decode -> token ids (stdout).
+-// The encoder is the same SAN-M arch as Fun-ASR-Nano (shared forward).
+-// Detokenize the printed ids with the SentencePiece bpe model (Python side for now).
+-
+-#include "ggml.h"
+-#include "ggml-cpu.h"
+-#include "ggml-alloc.h"
+-#include "ggml-backend.h"
+-#include "gguf.h"
+-#include "funasr_backend.h"
+-
+-#include <cmath>
+-#include <cstdint>
+-#include <cstdio>
+-#include <cstring>
+-#include <map>
+-#include <string>
+-#include <vector>
+-
+-static const float LN_EPS = 1e-5f;
+-
+-// ---- audio loader: any wav/mp3/flac, any rate/channels -> 16k mono (miniaudio) ----
++#include "sensevoice_runtime.h"
++#include "sensevoice_json.h"
+ #define FUNASR_AUDIO_IMPLEMENTATION
+ #include "funasr_audio.h"
+-#include "funasr_vad.h"     // built-in FSMN-VAD front end (--vad segmentation)
+-#include <utility>
+-static const int FS=16000,WINLEN=400,SHIFT=160,NFFT=512,NMEL=80,LFR_M=7,LFR_N=6;
+-static const float PREEMPH=0.97f,LOWF=20.0f,HIGHF=8000.0f;
+-static inline float melf(float f){return 1127.0f*logf(1.0f+f/700.0f);}
+-static void fftc(std::vector<float>&re,std::vector<float>&im,int n){
+-  for(int i=1,j=0;i<n;i++){int b=n>>1;for(;j&b;b>>=1)j^=b;j^=b;if(i<j){std::swap(re[i],re[j]);std::swap(im[i],im[j]);}}
+-  for(int len=2;len<=n;len<<=1){double a=-2.0*M_PI/len;float wr=cosf(a),wi=sinf(a);
+-    for(int i=0;i<n;i+=len){float cr=1,ci=0;for(int k=0;k<len/2;k++){float ur=re[i+k],ui=im[i+k];
+-      float vr=re[i+k+len/2]*cr-im[i+k+len/2]*ci,vi=re[i+k+len/2]*ci+im[i+k+len/2]*cr;
+-      re[i+k]=ur+vr;im[i+k]=ui+vi;re[i+k+len/2]=ur-vr;im[i+k+len/2]=ui-vi;float nc=cr*wr-ci*wi;ci=cr*wi+ci*wr;cr=nc;}}}
+-}
+-static std::vector<float> compute_fbank(std::vector<float> wav,int&T_out){
+-  for(auto&v:wav)v*=32768.0f; std::vector<float> win(WINLEN);
+-  for(int i=0;i<WINLEN;i++)win[i]=0.54f-0.46f*cosf(2.0f*M_PI*i/(WINLEN-1));
+-  const int NBIN=NFFT/2+1; float bw=(float)FS/NFFT,ml=melf(LOWF),mh=melf(HIGHF),dm=(mh-ml)/(NMEL+1);
+-  std::vector<std::vector<float>> fb(NMEL,std::vector<float>(NBIN,0.0f));
+-  for(int m=0;m<NMEL;m++){float L=ml+m*dm,C=ml+(m+1)*dm,R=ml+(m+2)*dm;
+-    for(int k=0;k<NBIN;k++){float mf=melf(bw*k); if(mf>L&&mf<R)fb[m][k]=mf<=C?(mf-L)/(C-L):(R-mf)/(R-C);}}
+-  if(wav.size()<WINLEN){T_out=0;return {};}
+-  int N=wav.size(),T=(N-WINLEN)/SHIFT+1; std::vector<std::vector<float>> feat(T,std::vector<float>(NMEL));
+-  std::vector<float> re(NFFT),im(NFFT),fr(WINLEN); const float fl=1.1920929e-07f;
+-  for(int t=0;t<T;t++){const float*s=wav.data()+t*SHIFT; double mn=0; for(int i=0;i<WINLEN;i++)mn+=s[i]; mn/=WINLEN;
+-    for(int i=0;i<WINLEN;i++)fr[i]=s[i]-(float)mn; for(int i=WINLEN-1;i>0;i--)fr[i]-=PREEMPH*fr[i-1]; fr[0]-=PREEMPH*fr[0];
+-    for(int i=0;i<NFFT;i++){re[i]=i<WINLEN?fr[i]*win[i]:0.0f;im[i]=0.0f;} fftc(re,im,NFFT);
+-    for(int m=0;m<NMEL;m++){float e=0;for(int k=0;k<NBIN;k++)if(fb[m][k]>0)e+=fb[m][k]*(re[k]*re[k]+im[k]*im[k]); feat[t][m]=logf(e>fl?e:fl);}}
+-  const int pad=(LFR_M-1)/2; int Tl=(T+LFR_N-1)/LFR_N; std::vector<std::vector<float>> pd; pd.reserve(T+pad+LFR_M);
+-  for(int i=0;i<pad;i++)pd.push_back(feat[0]); for(int t=0;t<T;t++)pd.push_back(feat[t]);
+-  while((int)pd.size()<(Tl-1)*LFR_N+LFR_M)pd.push_back(feat[T-1]);
+-  int D=LFR_M*NMEL; std::vector<float> out((size_t)Tl*D);
+-  for(int i=0;i<Tl;i++)for(int j=0;j<LFR_M;j++)memcpy(&out[(size_t)i*D+j*NMEL],pd[i*LFR_N+j].data(),NMEL*sizeof(float));
+-  T_out=Tl; return out;
+-}
+-
+-struct cfg { int d_model=512,n_head=4,num_blocks=50,tp_blocks=20,kernel=11,vocab=25055,blank=0; };
+-struct model { cfg c; ggml_context*ctx_w=nullptr; std::map<std::string,ggml_tensor*> t;
+-  ggml_tensor* g(const std::string&n){auto it=t.find(n);if(it==t.end()){fprintf(stderr,"missing %s\n",n.c_str());exit(1);}return it->second;} };
+-
+-static ggml_tensor* lin(ggml_context*c,ggml_tensor*w,ggml_tensor*b,ggml_tensor*x){auto y=ggml_mul_mat(c,w,x);return b?ggml_add(c,y,b):y;}
+-static ggml_tensor* lnorm(ggml_context*c,ggml_tensor*x,ggml_tensor*g,ggml_tensor*b){return ggml_add(c,ggml_mul(c,ggml_norm(c,x,LN_EPS),g),b);}
+-static ggml_tensor* sanm_attn(ggml_context*c,model&m,const std::string&p,ggml_tensor*x,int T,bool flash){
+-  const int D=m.c.d_model,H=m.c.n_head,K=m.c.kernel;
+-  ggml_tensor*qkv=lin(c,m.g(p+"linear_q_k_v.weight"),m.g(p+"linear_q_k_v.bias"),x); size_t nb1=qkv->nb[1];
+-  ggml_tensor*q=ggml_cont(c,ggml_view_2d(c,qkv,D,T,nb1,0));
+-  ggml_tensor*k=ggml_cont(c,ggml_view_2d(c,qkv,D,T,nb1,(size_t)D*sizeof(float)));
+-  ggml_tensor*v=ggml_cont(c,ggml_view_2d(c,qkv,D,T,nb1,(size_t)2*D*sizeof(float)));
+-  const int pad=(K-1)/2; ggml_tensor*fk=m.g(p+"fsmn_block.weight");
+-  ggml_tensor*vp=ggml_pad_ext(c,v,0,0,pad,pad,0,0,0,0); ggml_tensor*fsmn=v;
+-  for(int j=0;j<K;j++){auto sl=ggml_view_2d(c,vp,D,T,vp->nb[1],(size_t)j*vp->nb[1]);
+-    auto wj=ggml_view_1d(c,fk,D,(size_t)j*fk->nb[1]); fsmn=ggml_add(c,fsmn,ggml_mul(c,sl,wj));}  // vp rows are contiguous: sl needs no copy
+-  ggml_tensor*o=funasr::attention(c,q,k,v,H,flash);  // flash attention on the HTP
+-  return ggml_add(c,lin(c,m.g(p+"linear_out.weight"),m.g(p+"linear_out.bias"),o),fsmn);
+-}
+-static ggml_tensor* sanm_layer(ggml_context*c,model&m,const std::string&p,ggml_tensor*x,int T,bool res,bool flash){
+-  auto r=x; auto h=lnorm(c,x,m.g(p+"norm1.weight"),m.g(p+"norm1.bias"));
+-  auto sa=sanm_attn(c,m,p+"self_attn.",h,T,flash); x=res?ggml_add(c,r,sa):sa; r=x;
+-  h=lnorm(c,x,m.g(p+"norm2.weight"),m.g(p+"norm2.bias"));
+-  h=lin(c,m.g(p+"feed_forward.w_1.weight"),m.g(p+"feed_forward.w_1.bias"),h); h=ggml_relu(c,h);
+-  h=lin(c,m.g(p+"feed_forward.w_2.weight"),m.g(p+"feed_forward.w_2.bias"),h); return ggml_add(c,r,h);
+-}
+-static void add_posenc(std::vector<float>&x,int T,int depth){
+-  double inc=log(10000.0)/(depth/2.0-1.0);
+-  for(int t=0;t<T;t++){double pos=t+1;for(int i=0;i<depth/2;i++){double its=exp(i*-inc),st=pos*its;
+-    x[(size_t)t*depth+i]+=(float)sin(st);x[(size_t)t*depth+depth/2+i]+=(float)cos(st);}}
+-}
+-
+-// SenseVoice detok: sentencepiece pieces (no byte-fallback in this vocab) -> join,
+-// "▁"(U+2581)->space; meta tokens <|lang|>/<|emo|>/<|event|>/<|itn|> dropped unless --keep-tags.
+-static std::string sv_trim(const std::string&s){size_t a=s.find_first_not_of(' ');if(a==std::string::npos)return "";size_t b=s.find_last_not_of(' ');return s.substr(a,b-a+1);}
+-static std::string detok_sv(const std::vector<int>&ids,const std::vector<std::string>&vocab,bool keep_tags){
+-  std::string s; for(int id:ids){ if(id<0||id>=(int)vocab.size())continue; const std::string&p=vocab[id];
+-    if(!keep_tags && p.size()>=2 && p[0]=='<' && p[1]=='|') continue;   // skip <|...|> meta
+-    s+=p; }
+-  const std::string lb="\xe2\x96\x81"; size_t pp; while((pp=s.find(lb))!=std::string::npos)s.replace(pp,3," ");
+-  return sv_trim(s);
+-}
+-
++#include "funasr_vad.h"
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++static const int WINLEN=400;
+ static int sensevoice_main(int argc,char**argv){
+   funasr::backend_options backend_options;
+-  std::string gguf_path,fbank_path,wav_path,vad_path; int vad_maxseg=30000; bool ids_mode=false,keep_tags=false;
++  std::string gguf_path,fbank_path,wav_path,vad_path; int vad_maxseg=30000; bool ids_mode=false,keep_tags=false,json_mode=false;
+   for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-m")&&i+1<argc)gguf_path=argv[++i];
+     else if(!strcmp(argv[i],"-f")&&i+1<argc)fbank_path=argv[++i];
+     else if(!strcmp(argv[i],"-a")&&i+1<argc)wav_path=argv[++i];
+@@ -114,70 +20,22 @@ static int sensevoice_main(int argc,char**argv){
+     else if(!strcmp(argv[i],"--device")&&i+1<argc)backend_options.device=argv[++i];
+     else if(!strcmp(argv[i],"--threads")&&i+1<argc){std::string value=argv[++i];size_t end=0;backend_options.threads=std::stoi(value,&end);if(end!=value.size())throw std::runtime_error("invalid --threads");}
+     else if(!strcmp(argv[i],"--trace-schedule"))backend_options.trace=true;
+-    else if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){fprintf(stdout,"usage: %s -m model.gguf (-a audio.wav | -f fbank.bin) [--backend cpu|hexagon] [--backend-lib path] [--device HTP0] [--threads N] [--trace-schedule] [--vad fsmn-vad.gguf [--vad-maxseg ms]] [--ids] [--keep-tags]\n",argv[0]);return 0;}
++    else if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){fprintf(stdout,"usage: %s -m model.gguf (-a audio.wav | -f fbank.bin) [--backend cpu|hexagon] [--backend-lib path] [--device HTP0] [--threads N] [--trace-schedule] [--vad fsmn-vad.gguf [--vad-maxseg ms]] [--ids] [--keep-tags] [--json]\n",argv[0]);return 0;}
++    else if(!strcmp(argv[i],"--json"))json_mode=true;
+     else if(!strcmp(argv[i],"--ids"))ids_mode=true;
+     else if(!strcmp(argv[i],"--keep-tags"))keep_tags=true;
+-    else {fprintf(stderr,"usage: %s -m model.gguf (-a audio.wav | -f fbank.bin) [--backend cpu|hexagon] [--backend-lib path] [--device HTP0] [--threads N] [--trace-schedule] [--vad fsmn-vad.gguf [--vad-maxseg ms]] [--ids] [--keep-tags]\n",argv[0]);return 1;} }
++    else {fprintf(stderr,"usage: %s -m model.gguf (-a audio.wav | -f fbank.bin) [--backend cpu|hexagon] [--backend-lib path] [--device HTP0] [--threads N] [--trace-schedule] [--vad fsmn-vad.gguf [--vad-maxseg ms]] [--ids] [--keep-tags] [--json]\n",argv[0]);return 1;} }
+   if(gguf_path.empty()||(fbank_path.empty()&&wav_path.empty())){fprintf(stderr,"missing args\n");return 1;}
+ 
+-  funasr::backend runtime(backend_options);
+-  // load model
+-  model m; gguf_init_params gp={false,&m.ctx_w}; gguf_context*gg=gguf_init_from_file(gguf_path.c_str(),gp);
+-  if(!gg){fprintf(stderr,"load gguf failed\n");return 1;}
+-  auto rd=[&](const char*k,int d){int i=gguf_find_key(gg,k);return i<0?d:(int)gguf_get_val_u32(gg,i);};
+-  m.c.d_model=rd("sv.output_size",512); m.c.n_head=rd("sv.attention_heads",4);
+-  m.c.num_blocks=rd("sv.num_blocks",50); m.c.tp_blocks=rd("sv.tp_blocks",20);
+-  m.c.kernel=rd("sv.kernel_size",11); m.c.vocab=rd("sv.vocab_size",25055); m.c.blank=rd("sv.blank_id",0);
+-  int qi=gguf_find_key(gg,"sv.query_tokens"); int nq=qi<0?0:(int)gguf_get_arr_n(gg,qi);
+-  std::vector<int> qtok(nq); for(int i=0;i<nq;i++) qtok[i]=((const int32_t*)gguf_get_arr_data(gg,qi))[i];
+-  std::vector<std::string> vocab; {int ki=gguf_find_key(gg,"sv.vocab"); if(ki>=0){int nv=gguf_get_arr_n(gg,ki); vocab.resize(nv); for(int i=0;i<nv;i++){const char*s=gguf_get_arr_str(gg,ki,i); vocab[i]=s?s:"";}}}
+-  for(int i=0;i<gguf_get_n_tensors(gg);i++){const char*nm=gguf_get_tensor_name(gg,i);m.t[nm]=ggml_get_tensor(m.ctx_w,nm);}
+-  gguf_free(gg);
+-  runtime.prepare_weights(m.ctx_w,m.t);
+-  const int F=560, D=m.c.d_model, V=m.c.vocab;
+-  bool emit_ids = ids_mode || vocab.empty();   // fall back to ids if the gguf has no vocab
+-
+-  // NOTE: SenseVoiceSmall inference() feeds the RAW log-mel fbank to the encoder;
+-  // it does NOT apply am.mvn CMVN (that path is unused at inference). Applying it
+-  // makes the encoder predict <|nospeech|>. So no CMVN here.
+-  const auto *emb=m.g("embed.weight");
+-  // Run encoder+CTC on one fbank window [T,F]; prints greedy-CTC token IDs (no newline).
+-  auto run_seg=[&](const std::vector<float>& fb,int T){
+-    if(T<1 || fb.size()!=(size_t)T*F)throw std::runtime_error("invalid or empty fbank");
+-    int N=nq+T; std::vector<float> inp((size_t)N*F);
+-    for(int i=0;i<nq;i++) funasr::embedding_row(emb,qtok[i],F,&inp[(size_t)i*F]);
+-    memcpy(&inp[(size_t)nq*F], fb.data(), (size_t)T*F*sizeof(float));
+-    float sc=sqrtf((float)D); for(auto&v:inp)v*=sc; add_posenc(inp,N,F);
+-    ggml_init_params cp={(size_t)64*1024*1024,nullptr,true}; ggml_context*c=ggml_init(cp);
+-    ggml_tensor*x=ggml_new_tensor_2d(c,GGML_TYPE_F32,F,N); ggml_set_input(x);
+-    const bool flash=runtime.accelerated();  // CPU-only runs keep the upstream graph
+-    ggml_tensor*h=sanm_layer(c,m,"encoder.encoders0.0.",x,N,false,flash);
+-    for(int i=0;i<m.c.num_blocks-1;i++) h=sanm_layer(c,m,"encoder.encoders."+std::to_string(i)+".",h,N,true,flash);
+-    h=lnorm(c,h,m.g("encoder.after_norm.weight"),m.g("encoder.after_norm.bias"));
+-    for(int i=0;i<m.c.tp_blocks;i++) h=sanm_layer(c,m,"encoder.tp_encoders."+std::to_string(i)+".",h,N,true,flash);
+-    h=lnorm(c,h,m.g("encoder.tp_norm.weight"),m.g("encoder.tp_norm.bias"));
+-    ggml_cgraph*gf=ggml_new_graph_custom(c,32768,false);
+-    ggml_tensor*logits=nullptr; std::vector<ggml_tensor*> best;
+-    if(flash){ best=funasr::chunked_argmax(c,m.g("ctc.ctc_lo.weight"),m.g("ctc.ctc_lo.bias"),h);  // no [V, N] logits
+-      for(auto t:best) ggml_build_forward_expand(gf,t); }
+-    else { logits=lin(c,m.g("ctc.ctc_lo.weight"),m.g("ctc.ctc_lo.bias"),h);  // [V, N]
+-      ggml_set_output(logits); ggml_build_forward_expand(gf,logits); }
+-    auto sched=runtime.allocate_graph(gf);
+-    ggml_backend_tensor_set(x,inp.data(),0,ggml_nbytes(x));
+-    if(ggml_backend_sched_graph_compute(sched,gf)!=GGML_STATUS_SUCCESS){ggml_backend_sched_free(sched);ggml_free(c);throw std::runtime_error("compute failed");}
+-    std::vector<int> frame_ids;   // greedy CTC: argmax per frame -> collapse -> drop blank
+-    if(flash) frame_ids=funasr::read_argmax(best);
+-    else { std::vector<float> lg((size_t)V*N); ggml_backend_tensor_get(logits,lg.data(),0,ggml_nbytes(logits));
+-      for(int n=0;n<N;n++){ const float*col=&lg[(size_t)n*V]; int am=0; float bv=col[0];
+-        for(int v=1;v<V;v++) if(col[v]>bv){bv=col[v];am=v;}
+-        frame_ids.push_back(am); } }
+-    std::vector<int> seg_ids; int prev=-1;
+-    for(int am:frame_ids){ if(am!=prev && am!=m.c.blank) seg_ids.push_back(am); prev=am; }
+-    if(emit_ids){ for(int id:seg_ids) printf("%d ",id); }
+-    else { std::string t=detok_sv(seg_ids,vocab,keep_tags); printf("%s",t.c_str()); }
+-    ggml_backend_sched_free(sched); ggml_free(c);
++  funasr::sensevoice_runtime runtime(gguf_path,backend_options);
++  const int F=560;
++  auto emit=[&](const funasr::recognition &result){
++    if(json_mode){printf("%s\n",funasr::recognition_json(result).c_str());}
++    else if(ids_mode || !runtime.has_vocab()){for(int id:result.ids) printf("%d ",id);}
++    else {
++      printf("%s",(keep_tags?result.tagged_text:result.text).c_str());
++    }
+   };
+-
+   int64_t t0=ggml_time_us();
+   if(!vad_path.empty()){
+     std::vector<float> wav; if(!funasr_load_audio_16k_mono(wav_path.c_str(),wav)){fprintf(stderr,"read audio failed\n");return 1;}
+@@ -185,20 +43,20 @@ static int sensevoice_main(int argc,char**argv){
+     if(!funasr_vad_segments(vad_path,wav,vad_maxseg,segs,backend_options.threads)){fprintf(stderr,"vad failed\n");return 1;}
+     for(auto&s:segs){ int off=(int)((int64_t)s.first*16000/1000), end=(int)((int64_t)s.second*16000/1000);
+       if(end>(int)wav.size())end=wav.size(); if(end-off<WINLEN)continue;
+-      std::vector<float> seg(wav.begin()+off,wav.begin()+end); int t=0; auto fb=compute_fbank(seg,t); run_seg(fb,t); }
++      std::vector<float> seg(wav.begin()+off,wav.begin()+end); emit(runtime.audio(seg)); }
+     fprintf(stderr,"[sensevoice] %zu vad segments\n",segs.size());
+   } else {
+     int32_t T=0,Fc=F; std::vector<float> fb;
+     if(!wav_path.empty()){
+       std::vector<float> wav; if(!funasr_load_audio_16k_mono(wav_path.c_str(),wav)){fprintf(stderr,"read audio failed\n");return 1;}
+-      int t=0; fb=compute_fbank(wav,t); T=t;
++      emit(runtime.audio(wav));
+     } else {
+       FILE*f=fopen(fbank_path.c_str(),"rb"); if(!f){fprintf(stderr,"open fbank\n");return 1;}
+       if(fread(&T,4,1,f)!=1||fread(&Fc,4,1,f)!=1){fclose(f);return 1;}
+       if(T<1 || Fc!=F){fclose(f);throw std::runtime_error("fbank must have positive frames and 560 features");}
+       fb.resize((size_t)T*Fc); if((int)fread(fb.data(),4,fb.size(),f)!=(int)fb.size()){fclose(f);return 1;} fclose(f);
+     }
+-    run_seg(fb,T);
++    if(wav_path.empty())emit(runtime.features(fb,T));
+   }
+   printf("\n");
+   fprintf(stderr,"[sensevoice] done %.2fs\n",(ggml_time_us()-t0)/1e6);
+diff --git a/runtime/llama.cpp/funasr-sensevoice/sensevoice_json.h b/runtime/llama.cpp/funasr-sensevoice/sensevoice_json.h
+new file mode 100644
+index 0000000..4d1ee93
+--- /dev/null
++++ b/runtime/llama.cpp/funasr-sensevoice/sensevoice_json.h
+@@ -0,0 +1,29 @@
++#pragma once
++#include "sensevoice_runtime.h"
++#include <sstream>
++#include <iomanip>
++namespace funasr {
++inline std::string json_string(const std::string &s){
++    std::ostringstream o; o << '"';
++    for(unsigned char c:s){switch(c){case '"':o<<"\\\"";break;case '\\':o<<"\\\\";break;case '\n':o<<"\\n";break;case '\r':o<<"\\r";break;case '\t':o<<"\\t";break;
++        default:if(c<32)o<<"\\u"<<std::hex<<std::setw(4)<<std::setfill('0')<<(int)c<<std::dec;else o<<c;}}
++    o << '"';return o.str();
++}
++inline std::string recognition_json(const recognition &r){
++    std::string language,emotion,itn;std::vector<std::string> events;
++    const std::vector<std::string> languages={"zh","en","yue","ja","ko","nospeech"};
++    const std::vector<std::string> emotions={"NEUTRAL","HAPPY","SAD","ANGRY","FEARFUL","DISGUSTED","SURPRISED","EMO_UNKNOWN"};
++    const std::vector<std::string> event_names={"Speech","BGM","Applause","Laughter","Cry","Sneeze","Breath","Cough","Sing","Speech_Noise"};
++    for(const auto &tag:r.raw_tags){
++        if(tag.size()<4)continue;auto v=tag.substr(2,tag.size()-4);
++        if(std::find(languages.begin(),languages.end(),v)!=languages.end())language=v;
++        else if(std::find(emotions.begin(),emotions.end(),v)!=emotions.end())emotion=v;
++        else if(v=="withitn"||v=="woitn")itn=v;
++        else if(std::find(event_names.begin(),event_names.end(),v)!=event_names.end())events.push_back(v);
++    }
++    auto nullable=[](const std::string &s){return s.empty()?std::string("null"):json_string(s);};
++    auto array=[](const std::vector<std::string>&v){std::string s="[";for(size_t i=0;i<v.size();i++){if(i)s+=",";s+=json_string(v[i]);}return s+"]";};
++    std::string ids="[";for(size_t i=0;i<r.ids.size();i++){if(i)ids+=",";ids+=std::to_string(r.ids[i]);}ids+="]";
++    return "{\"text\":"+json_string(r.text)+",\"tagged_text\":"+json_string(r.tagged_text)+",\"ids\":"+ids+",\"analysis\":{\"language\":"+nullable(language)+",\"emotion\":"+nullable(emotion)+",\"events\":"+array(events)+",\"itn\":"+nullable(itn)+",\"raw_tags\":"+array(r.raw_tags)+",\"confidence\":null}}";
++}
++}
+diff --git a/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp b/runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.cpp
+similarity index 61%
+copy from runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
+copy to runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.cpp
+index b7cc09a..f622940 100644
+--- a/runtime/llama.cpp/funasr-sensevoice/funasr-sensevoice.cpp
++++ b/runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.cpp
+@@ -1,8 +1,8 @@
+-// funasr-sensevoice: SenseVoiceSmall (SAN-M encoder + CTC) on ggml.
+-//   fbank.bin (T x 560) -> CMVN -> prepend 4 query tokens -> SAN-M encoder ->
+-//   CTC head -> greedy CTC decode -> token ids (stdout).
++// funasr-sensevoice runtime: SenseVoiceSmall (SAN-M encoder + CTC) on ggml.
++//   16 kHz samples or fbank (T x 560) -> prepend 4 query tokens -> SAN-M encoder ->
++//   CTC head -> greedy CTC decode -> token ids and text.
+ // The encoder is the same SAN-M arch as Fun-ASR-Nano (shared forward).
+-// Detokenize the printed ids with the SentencePiece bpe model (Python side for now).
++// Shared by the CLI (funasr-sensevoice.cpp) and the persistent sensevoice_server.cpp.
+ 
+ #include "ggml.h"
+ #include "ggml-cpu.h"
+@@ -16,15 +16,14 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <map>
++#include <memory>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
+ static const float LN_EPS = 1e-5f;
+ 
+-// ---- audio loader: any wav/mp3/flac, any rate/channels -> 16k mono (miniaudio) ----
+-#define FUNASR_AUDIO_IMPLEMENTATION
+-#include "funasr_audio.h"
+-#include "funasr_vad.h"     // built-in FSMN-VAD front end (--vad segmentation)
++// Frontend accepts 16kHz mono float samples; file decoding/VAD stay in the CLI.
+ #include <utility>
+ static const int FS=16000,WINLEN=400,SHIFT=160,NFFT=512,NMEL=80,LFR_M=7,LFR_N=6;
+ static const float PREEMPH=0.97f,LOWF=20.0f,HIGHF=8000.0f;
+@@ -60,7 +59,7 @@ static std::vector<float> compute_fbank(std::vector<float> wav,int&T_out){
+ 
+ struct cfg { int d_model=512,n_head=4,num_blocks=50,tp_blocks=20,kernel=11,vocab=25055,blank=0; };
+ struct model { cfg c; ggml_context*ctx_w=nullptr; std::map<std::string,ggml_tensor*> t;
+-  ggml_tensor* g(const std::string&n){auto it=t.find(n);if(it==t.end()){fprintf(stderr,"missing %s\n",n.c_str());exit(1);}return it->second;} };
++  ggml_tensor* g(const std::string&n){auto it=t.find(n);if(it==t.end())throw std::runtime_error("missing tensor "+n);return it->second;} };  // a server must survive a bad model
+ 
+ static ggml_tensor* lin(ggml_context*c,ggml_tensor*w,ggml_tensor*b,ggml_tensor*x){auto y=ggml_mul_mat(c,w,x);return b?ggml_add(c,y,b):y;}
+ static ggml_tensor* lnorm(ggml_context*c,ggml_tensor*x,ggml_tensor*g,ggml_tensor*b){return ggml_add(c,ggml_mul(c,ggml_norm(c,x,LN_EPS),g),b);}
+@@ -101,54 +100,40 @@ static std::string detok_sv(const std::vector<int>&ids,const std::vector<std::st
+   return sv_trim(s);
+ }
+ 
+-static int sensevoice_main(int argc,char**argv){
+-  funasr::backend_options backend_options;
+-  std::string gguf_path,fbank_path,wav_path,vad_path; int vad_maxseg=30000; bool ids_mode=false,keep_tags=false;
+-  for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-m")&&i+1<argc)gguf_path=argv[++i];
+-    else if(!strcmp(argv[i],"-f")&&i+1<argc)fbank_path=argv[++i];
+-    else if(!strcmp(argv[i],"-a")&&i+1<argc)wav_path=argv[++i];
+-    else if(!strcmp(argv[i],"--vad")&&i+1<argc)vad_path=argv[++i];
+-    else if(!strcmp(argv[i],"--vad-maxseg")&&i+1<argc)vad_maxseg=atoi(argv[++i]);
+-    else if(!strcmp(argv[i],"--backend")&&i+1<argc)backend_options.backend=argv[++i];
+-    else if(!strcmp(argv[i],"--backend-lib")&&i+1<argc)backend_options.library=argv[++i];
+-    else if(!strcmp(argv[i],"--device")&&i+1<argc)backend_options.device=argv[++i];
+-    else if(!strcmp(argv[i],"--threads")&&i+1<argc){std::string value=argv[++i];size_t end=0;backend_options.threads=std::stoi(value,&end);if(end!=value.size())throw std::runtime_error("invalid --threads");}
+-    else if(!strcmp(argv[i],"--trace-schedule"))backend_options.trace=true;
+-    else if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){fprintf(stdout,"usage: %s -m model.gguf (-a audio.wav | -f fbank.bin) [--backend cpu|hexagon] [--backend-lib path] [--device HTP0] [--threads N] [--trace-schedule] [--vad fsmn-vad.gguf [--vad-maxseg ms]] [--ids] [--keep-tags]\n",argv[0]);return 0;}
+-    else if(!strcmp(argv[i],"--ids"))ids_mode=true;
+-    else if(!strcmp(argv[i],"--keep-tags"))keep_tags=true;
+-    else {fprintf(stderr,"usage: %s -m model.gguf (-a audio.wav | -f fbank.bin) [--backend cpu|hexagon] [--backend-lib path] [--device HTP0] [--threads N] [--trace-schedule] [--vad fsmn-vad.gguf [--vad-maxseg ms]] [--ids] [--keep-tags]\n",argv[0]);return 1;} }
+-  if(gguf_path.empty()||(fbank_path.empty()&&wav_path.empty())){fprintf(stderr,"missing args\n");return 1;}
+ 
+-  funasr::backend runtime(backend_options);
++#include "sensevoice_runtime.h"
++namespace funasr {
++struct sensevoice_runtime::impl {
++  backend runtime;
++  model m;
++  std::vector<int> qtok;
++  std::vector<std::string> vocab;
++  impl(const std::string &path, const backend_options &options): runtime(options) {
+   // load model
+-  model m; gguf_init_params gp={false,&m.ctx_w}; gguf_context*gg=gguf_init_from_file(gguf_path.c_str(),gp);
+-  if(!gg){fprintf(stderr,"load gguf failed\n");return 1;}
++  gguf_init_params gp={false,&m.ctx_w}; gguf_context*gg=gguf_init_from_file(path.c_str(),gp);
++  if(!gg)throw std::runtime_error("load gguf failed");
+   auto rd=[&](const char*k,int d){int i=gguf_find_key(gg,k);return i<0?d:(int)gguf_get_val_u32(gg,i);};
+   m.c.d_model=rd("sv.output_size",512); m.c.n_head=rd("sv.attention_heads",4);
+   m.c.num_blocks=rd("sv.num_blocks",50); m.c.tp_blocks=rd("sv.tp_blocks",20);
+   m.c.kernel=rd("sv.kernel_size",11); m.c.vocab=rd("sv.vocab_size",25055); m.c.blank=rd("sv.blank_id",0);
+   int qi=gguf_find_key(gg,"sv.query_tokens"); int nq=qi<0?0:(int)gguf_get_arr_n(gg,qi);
+-  std::vector<int> qtok(nq); for(int i=0;i<nq;i++) qtok[i]=((const int32_t*)gguf_get_arr_data(gg,qi))[i];
+-  std::vector<std::string> vocab; {int ki=gguf_find_key(gg,"sv.vocab"); if(ki>=0){int nv=gguf_get_arr_n(gg,ki); vocab.resize(nv); for(int i=0;i<nv;i++){const char*s=gguf_get_arr_str(gg,ki,i); vocab[i]=s?s:"";}}}
++  qtok.resize(nq); for(int i=0;i<nq;i++) qtok[i]=((const int32_t*)gguf_get_arr_data(gg,qi))[i];
++   {int ki=gguf_find_key(gg,"sv.vocab"); if(ki>=0){int nv=gguf_get_arr_n(gg,ki); vocab.resize(nv); for(int i=0;i<nv;i++){const char*s=gguf_get_arr_str(gg,ki,i); vocab[i]=s?s:"";}}}
+   for(int i=0;i<gguf_get_n_tensors(gg);i++){const char*nm=gguf_get_tensor_name(gg,i);m.t[nm]=ggml_get_tensor(m.ctx_w,nm);}
+   gguf_free(gg);
+   runtime.prepare_weights(m.ctx_w,m.t);
+-  const int F=560, D=m.c.d_model, V=m.c.vocab;
+-  bool emit_ids = ids_mode || vocab.empty();   // fall back to ids if the gguf has no vocab
+ 
+-  // NOTE: SenseVoiceSmall inference() feeds the RAW log-mel fbank to the encoder;
+-  // it does NOT apply am.mvn CMVN (that path is unused at inference). Applying it
+-  // makes the encoder predict <|nospeech|>. So no CMVN here.
+-  const auto *emb=m.g("embed.weight");
+-  // Run encoder+CTC on one fbank window [T,F]; prints greedy-CTC token IDs (no newline).
+-  auto run_seg=[&](const std::vector<float>& fb,int T){
++  }
++  recognition features(const std::vector<float> &fb,int T) {
++    const int F=560,D=m.c.d_model,V=m.c.vocab,nq=qtok.size();
++    const auto *emb=m.g("embed.weight");
+     if(T<1 || fb.size()!=(size_t)T*F)throw std::runtime_error("invalid or empty fbank");
+     int N=nq+T; std::vector<float> inp((size_t)N*F);
+     for(int i=0;i<nq;i++) funasr::embedding_row(emb,qtok[i],F,&inp[(size_t)i*F]);
+     memcpy(&inp[(size_t)nq*F], fb.data(), (size_t)T*F*sizeof(float));
+     float sc=sqrtf((float)D); for(auto&v:inp)v*=sc; add_posenc(inp,N,F);
+     ggml_init_params cp={(size_t)64*1024*1024,nullptr,true}; ggml_context*c=ggml_init(cp);
++    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx_owner(c,ggml_free);  // freed when g() throws
+     ggml_tensor*x=ggml_new_tensor_2d(c,GGML_TYPE_F32,F,N); ggml_set_input(x);
+     const bool flash=runtime.accelerated();  // CPU-only runs keep the upstream graph
+     ggml_tensor*h=sanm_layer(c,m,"encoder.encoders0.0.",x,N,false,flash);
+@@ -163,8 +148,9 @@ static int sensevoice_main(int argc,char**argv){
+     else { logits=lin(c,m.g("ctc.ctc_lo.weight"),m.g("ctc.ctc_lo.bias"),h);  // [V, N]
+       ggml_set_output(logits); ggml_build_forward_expand(gf,logits); }
+     auto sched=runtime.allocate_graph(gf);
++    std::unique_ptr<ggml_backend_sched,decltype(&ggml_backend_sched_free)> sched_owner(sched,ggml_backend_sched_free);
+     ggml_backend_tensor_set(x,inp.data(),0,ggml_nbytes(x));
+-    if(ggml_backend_sched_graph_compute(sched,gf)!=GGML_STATUS_SUCCESS){ggml_backend_sched_free(sched);ggml_free(c);throw std::runtime_error("compute failed");}
++    if(ggml_backend_sched_graph_compute(sched,gf)!=GGML_STATUS_SUCCESS)throw std::runtime_error("compute failed");
+     std::vector<int> frame_ids;   // greedy CTC: argmax per frame -> collapse -> drop blank
+     if(flash) frame_ids=funasr::read_argmax(best);
+     else { std::vector<float> lg((size_t)V*N); ggml_backend_tensor_get(logits,lg.data(),0,ggml_nbytes(logits));
+@@ -173,40 +159,24 @@ static int sensevoice_main(int argc,char**argv){
+         frame_ids.push_back(am); } }
+     std::vector<int> seg_ids; int prev=-1;
+     for(int am:frame_ids){ if(am!=prev && am!=m.c.blank) seg_ids.push_back(am); prev=am; }
+-    if(emit_ids){ for(int id:seg_ids) printf("%d ",id); }
+-    else { std::string t=detok_sv(seg_ids,vocab,keep_tags); printf("%s",t.c_str()); }
+-    ggml_backend_sched_free(sched); ggml_free(c);
+-  };
+ 
+-  int64_t t0=ggml_time_us();
+-  if(!vad_path.empty()){
+-    std::vector<float> wav; if(!funasr_load_audio_16k_mono(wav_path.c_str(),wav)){fprintf(stderr,"read audio failed\n");return 1;}
+-    std::vector<std::pair<int,int>> segs;
+-    if(!funasr_vad_segments(vad_path,wav,vad_maxseg,segs,backend_options.threads)){fprintf(stderr,"vad failed\n");return 1;}
+-    for(auto&s:segs){ int off=(int)((int64_t)s.first*16000/1000), end=(int)((int64_t)s.second*16000/1000);
+-      if(end>(int)wav.size())end=wav.size(); if(end-off<WINLEN)continue;
+-      std::vector<float> seg(wav.begin()+off,wav.begin()+end); int t=0; auto fb=compute_fbank(seg,t); run_seg(fb,t); }
+-    fprintf(stderr,"[sensevoice] %zu vad segments\n",segs.size());
+-  } else {
+-    int32_t T=0,Fc=F; std::vector<float> fb;
+-    if(!wav_path.empty()){
+-      std::vector<float> wav; if(!funasr_load_audio_16k_mono(wav_path.c_str(),wav)){fprintf(stderr,"read audio failed\n");return 1;}
+-      int t=0; fb=compute_fbank(wav,t); T=t;
+-    } else {
+-      FILE*f=fopen(fbank_path.c_str(),"rb"); if(!f){fprintf(stderr,"open fbank\n");return 1;}
+-      if(fread(&T,4,1,f)!=1||fread(&Fc,4,1,f)!=1){fclose(f);return 1;}
+-      if(T<1 || Fc!=F){fclose(f);throw std::runtime_error("fbank must have positive frames and 560 features");}
+-      fb.resize((size_t)T*Fc); if((int)fread(fb.data(),4,fb.size(),f)!=(int)fb.size()){fclose(f);return 1;} fclose(f);
++    recognition result; result.ids=std::move(seg_ids);
++    result.text=detok_sv(result.ids,vocab,false);
++    result.tagged_text=detok_sv(result.ids,vocab,true);
++    for(int id:result.ids) if(id>=0 && id<(int)vocab.size()) {
++      const auto &piece=vocab[id];
++      if(piece.rfind("<|",0)==0) result.raw_tags.push_back(piece);
+     }
+-    run_seg(fb,T);
++    return result;
+   }
+-  printf("\n");
+-  fprintf(stderr,"[sensevoice] done %.2fs\n",(ggml_time_us()-t0)/1e6);
+-  // Weight contexts/buffers are owned by runtime.
+-  return 0;
++};
++sensevoice_runtime::sensevoice_runtime(const std::string &path,const backend_options &options):state(new impl(path,options)){}
++sensevoice_runtime::~sensevoice_runtime()=default;
++recognition sensevoice_runtime::features(const std::vector<float> &fb,int frames){return state->features(fb,frames);}
++recognition sensevoice_runtime::audio(const std::vector<float> &samples){
++  int frames=0;auto fb=compute_fbank(samples,frames);
++  if(frames==0)return {};  // shorter than one 25 ms window: nothing to recognise, as an empty utterance
++  return features(fb,frames);
+ }
+-
+-int main(int argc,char **argv){
+-  try { return sensevoice_main(argc,argv); }
+-  catch(const std::exception &error){fprintf(stderr,"sensevoice: %s\n",error.what());return 1;}
++bool sensevoice_runtime::has_vocab()const{return !state->vocab.empty();}
+ }
+diff --git a/runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.h b/runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.h
+new file mode 100644
+index 0000000..7b7fc87
+--- /dev/null
++++ b/runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.h
+@@ -0,0 +1,16 @@
++// Shared SenseVoice frontend, SAN-M scheduler and greedy CTC runtime.
++#pragma once
++#include "funasr_backend.h"
++#include <memory>
++namespace funasr {
++struct recognition { std::vector<int> ids; std::string text; std::string tagged_text; std::vector<std::string> raw_tags; };
++class sensevoice_runtime {
++    struct impl; std::unique_ptr<impl> state;
++public:
++    sensevoice_runtime(const std::string &model_path, const backend_options &options);
++    ~sensevoice_runtime();
++    recognition features(const std::vector<float> &fbank, int frames);
++    recognition audio(const std::vector<float> &samples);
++    bool has_vocab() const;
++};
++}
+diff --git a/runtime/llama.cpp/funasr-sensevoice/sensevoice_server.cpp b/runtime/llama.cpp/funasr-sensevoice/sensevoice_server.cpp
+new file mode 100644
+index 0000000..fe57f86
+--- /dev/null
++++ b/runtime/llama.cpp/funasr-sensevoice/sensevoice_server.cpp
+@@ -0,0 +1,72 @@
++// Local persistent server; shares all inference with the CLI.
++#include "sensevoice_runtime.h"
++#include "sensevoice_json.h"
++#include "json.h"
++#include <httplib.h>
++#include <atomic>
++#include <chrono>
++#include <mutex>
++using nemo_speech::json::Value;
++static const size_t MAX_BYTES=16000*2*30;
++static std::vector<float> samples(const std::string &pcm){
++    if(pcm.size()%2||pcm.size()>MAX_BYTES)throw std::invalid_argument("16k mono PCM16, maximum 30s required");
++    std::vector<float> v(pcm.size()/2);
++    for(size_t i=0;i<v.size();i++){uint16_t u=(uint8_t)pcm[2*i]|((uint16_t)(uint8_t)pcm[2*i+1]<<8);v[i]=(int16_t)u/32768.f;}
++    return v;
++}
++int main(int argc,char **argv){try{
++    std::string path;int port=8767;funasr::backend_options options;
++    for(int i=1;i<argc;i++){
++        std::string arg=argv[i];
++        if(arg=="--help"){printf("sensevoice-server -m MODEL [--port N] [--backend cpu|hexagon] [--backend-lib PATH] [--device HTP1] [--threads N]\n");return 0;}
++        if(i+1==argc)throw std::invalid_argument("missing option value");
++        std::string value=argv[++i];
++        if(arg=="-m")path=value;else if(arg=="--port")port=std::stoi(value);
++        else if(arg=="--backend")options.backend=value;else if(arg=="--backend-lib")options.library=value;
++        else if(arg=="--device")options.device=value;else if(arg=="--threads")options.threads=std::stoi(value);
++        else throw std::invalid_argument("unknown option: "+arg);
++    }
++    if(path.empty()||port<1||port>65535)throw std::invalid_argument("model and valid port required");
++    funasr::sensevoice_runtime runtime(path,options);
++    std::mutex slot;httplib::Server server;server.new_task_queue=[] { return new httplib::ThreadPool(4); };server.set_payload_max_length(MAX_BYTES+4096);
++    server.set_read_timeout(40);server.set_write_timeout(40);
++    server.Get("/ready",[&](const httplib::Request&,httplib::Response &res){
++        Value root(Value::Object{});root["ready"]=true;root["backend"]=options.backend;root["device"]=options.backend=="cpu"?"CPU":options.device;root["model"]=path;root["is_mock"]=false;
++        res.set_content(root.dump(),"application/json");
++    });
++    auto infer=[&](const std::string &pcm){
++        auto begin=std::chrono::steady_clock::now();auto result=runtime.audio(samples(pcm));
++        auto response=Value::parse(funasr::recognition_json(result));
++        response["compute_ms"]=(double)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-begin).count();
++        response["samples"]=(double)(pcm.size()/2);response["is_mock"]=false;return response;
++    };
++    server.Post("/api/transcribe",[&](const httplib::Request &req,httplib::Response &res){
++        std::unique_lock<std::mutex> lock(slot,std::try_to_lock);
++        if(!lock.owns_lock()){res.status=503;res.set_content("{\"error\":\"busy\"}","application/json");return;}
++        try{res.set_content(infer(req.body).dump(),"application/json");}
++        catch(const std::exception &e){res.status=400;res.set_content("{\"error\":"+funasr::json_string(e.what())+"}","application/json");}
++    });
++    server.WebSocket("/api/session",[&](const httplib::Request&,httplib::ws::WebSocket &socket){
++        std::unique_lock<std::mutex> lock(slot,std::try_to_lock);
++        if(!lock.owns_lock()){socket.send("{\"type\":\"error\",\"code\":\"busy\"}");return;}
++        socket.send("{\"type\":\"session.ready\",\"sample_rate\":16000,\"is_mock\":false}");
++        std::string pcm,message;
++        while(true){const auto kind=socket.read(message);if(kind==httplib::ws::ReadResult::Fail)break;
++            try{
++                if(kind==httplib::ws::ReadResult::Binary){
++                    if(message.size()%2||message.size()>3200||message.size()>MAX_BYTES-pcm.size())throw std::invalid_argument("PCM size limit");
++                    pcm+=message;continue;
++                }
++                const auto event=Value::parse(message);const auto type=event.string_or("type");
++                if(type=="cancel"){pcm.clear();socket.send("{\"type\":\"session.cancelled\"}");break;}
++                if(type!="stop")throw std::invalid_argument("unsupported control");
++                auto result=infer(pcm);result["type"]="result.final";result["segment_id"]=1;result["revision"]=1;
++                if(!socket.send(result.dump()))break;
++                socket.send("{\"type\":\"session.done\"}");break;
++            }catch(const std::exception &e){socket.send("{\"type\":\"error\",\"message\":"+funasr::json_string(e.what())+"}");break;}
++        }
++    });
++    fprintf(stderr,"SenseVoice ready at http://127.0.0.1:%d\n",port);
++    if(!server.listen("127.0.0.1",port))throw std::runtime_error("listen failed");
++    return 0;
++}catch(const std::exception &e){fprintf(stderr,"sensevoice-server: %s\n",e.what());return 1;}}

@@ -1,0 +1,52 @@
+--- a/server/http/http_server.cpp
++++ b/server/http/http_server.cpp
+@@ -375,6 +375,7 @@
+ };
+ 
+ struct Server::Impl {
++    std::mutex asr_admission;  // One compute/stream slot across REST and WebSocket.
+     EngineRegistry& models;
+     ServerConfig config;
+     std::unique_ptr<httplib::Server> server;
+@@ -688,6 +689,8 @@
+                     options.speech_contexts.push_back({{prompt}, 10.0f});
+                 apply_speech_contexts(
+                     form_value(request, "speech_contexts"), options.speech_contexts);
++                std::unique_lock<std::mutex> admission(this->asr_admission, std::try_to_lock);
++                if (!admission.owns_lock()) { fail(response, 503, "ASR busy"); return; }
+                 auto recognizer = this->models.asr();
+                 const auto result = recognizer->recognize(
+                     audio.samples.data(), audio.samples.size(), options, language,
+@@ -1023,6 +1026,12 @@
+                     return;
+                 }
+             }
++            std::unique_lock<std::mutex> admission(this->asr_admission, std::try_to_lock);
++            if (!admission.owns_lock()) {
++                socket.send("{\"type\":\"error\",\"error\":{\"message\":\"ASR busy\",\"code\":\"busy\"}}");
++                socket.close(httplib::ws::CloseStatus::PolicyViolation, "ASR busy");
++                return;
++            }
+             auto recognizer = this->models.asr();
+             asr::AsrRequestOptions options;
+             options.enable_automatic_punctuation = true;
+@@ -1030,6 +1039,7 @@
+             std::unique_ptr<asr::RecognitionStream> stream;
+             std::string partial_transcript;
+             size_t audio_bytes = 0;
++            int segment_id = 1, revision = 0;
+             auto ensure_stream = [&] {
+                 if (!stream)
+                     stream = recognizer->streaming_recognize(
+@@ -1059,6 +1069,11 @@
+                                          : alternative.transcript;
+                     partial_transcript = alternative.transcript;
+                 }
++                event["transcript"] = alternative.transcript;
++                event["segment_id"] = segment_id;
++                event["revision"] = ++revision;
++                event["hypothesis_mode"] = "replace";
++                if (result.is_final) { ++segment_id; revision = 0; }
+                 event["audio_processed"] = result.audio_processed;
+                 if (result.is_final && options.needs_word_timings()) {
+                     Value::Array words;

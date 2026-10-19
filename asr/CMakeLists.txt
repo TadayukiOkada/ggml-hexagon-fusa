@@ -7,6 +7,7 @@
 # ggml, with the CPU backend linked in, from the same llama.cpp submodule, and
 # loads libggml-hexagon.so from this build at run time. scripts/package.sh --asr
 # collects the two.
+option(GGML_HEXAGON_ASR_HTTP "Build the optional ASR-only NeMo HTTP/WebSocket server" OFF)
 include(ExternalProject)
 find_package(Git REQUIRED)
 
@@ -57,6 +58,15 @@ file(REMOVE_RECURSE ${_tmp})
 execute_process(COMMAND ${GIT_EXECUTABLE} -C ${NEMO_DIR} rev-parse --path-format=absolute --git-path HEAD
     OUTPUT_VARIABLE _head OUTPUT_STRIP_TRAILING_WHITESPACE)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_patches} ${_head})
+
+if(GGML_HEXAGON_ASR_HTTP)
+    include(${CMAKE_SOURCE_DIR}/cmake/AsrHttpDependency.cmake)
+    fusa_http_dependency(_http_source)
+    # git archive omits nested submodules. Copy the pinned dependency and license
+    # into the exported source, never into the pristine NeMo worktree.
+    file(COPY "${_http_source}/" DESTINATION "${_src}/third_party/cpp-httplib"
+        PATTERN ".git" EXCLUDE)
+endif()
 
 # Both subprojects use this toolchain plus the path mapping of the main build, so
 # no build-machine path ends up in the binaries (scripts/package.sh checks).
@@ -127,7 +137,7 @@ ExternalProject_Add(nemo-speech
                     -DNEMO_SPEECH_BUILD_TTS=OFF
                     -DNEMO_SPEECH_BUILD_NMT=OFF
                     -DNEMO_SPEECH_BUILD_S2S=OFF
-                    -DNEMO_SPEECH_BUILD_HTTP=OFF
+                    -DNEMO_SPEECH_BUILD_HTTP=${GGML_HEXAGON_ASR_HTTP}
                     -DNEMO_SPEECH_BUILD_GRPC=OFF
                     -DNEMO_SPEECH_BUILD_MIC_CAPTURE=OFF
                     -DNEMO_SPEECH_BUILD_TESTS=ON
