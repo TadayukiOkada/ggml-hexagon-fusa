@@ -408,6 +408,32 @@ static void htp_main_thread(void * context);
 static void htp_packet_callback(dspqueue_t queue, int error, void * context);
 static void htp_error_callback(dspqueue_t queue, int error, void * context);
 
+static int htp_start_main_thread(struct htp_context * ctx) {
+    qurt_thread_attr_t attr;
+    qurt_thread_attr_init(&attr);
+    qurt_thread_attr_set_stack_addr(&attr, ctx->main_stack);
+    qurt_thread_attr_set_stack_size(&attr, MAIN_THREAD_STACK_SIZE);
+    qurt_thread_attr_set_priority(&attr, ctx->thread_prio);
+    qurt_thread_attr_set_name(&attr, "htp-main");
+
+    atomic_store(&ctx->killed, false);
+    int err = qurt_thread_create(&ctx->main_thread, &attr, htp_main_thread, ctx);
+    if (err) {
+        FARF(ERROR, "Unable to create htp main thread: %d", err);
+        ctx->main_thread = 0;
+    }
+    return err;
+}
+
+static void htp_stop_main_thread(struct htp_context * ctx) {
+    if (ctx->main_thread) {
+        atomic_store(&ctx->killed, true);
+        int status;
+        (void) qurt_thread_join(ctx->main_thread, &status);
+        ctx->main_thread = 0;
+    }
+}
+
 AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
     struct htp_handle * h = (struct htp_handle *) handle;
     if (!h) {
@@ -650,16 +676,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         // Start main compute thread
         ctx->main_stack = (void *) ((uintptr_t) block + offset_main_stack);
 
-        qurt_thread_attr_t attr;
-        qurt_thread_attr_init(&attr);
-        qurt_thread_attr_set_stack_addr(&attr, ctx->main_stack);
-        qurt_thread_attr_set_stack_size(&attr, size_main_stack);
-        qurt_thread_attr_set_priority(&attr, main_prio);
-        qurt_thread_attr_set_name(&attr, "htp-main");
-
-        int err_thread = qurt_thread_create(&ctx->main_thread, &attr, htp_main_thread, ctx);
-        if (err_thread) {
-            FARF(ERROR, "Unable to create htp main thread: %d", err_thread);
+        if (htp_start_main_thread(ctx)) {
             htp_iface_stop(handle);
             return AEE_ENOMEMORY;
         }
@@ -678,12 +695,7 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
     }
     struct htp_context * ctx = h->ctx;
 
-    if (ctx->main_thread) {
-        atomic_store(&ctx->killed, true);
-        int status;
-        (void) qurt_thread_join(ctx->main_thread, &status);
-        ctx->main_thread = 0;
-    }
+    htp_stop_main_thread(ctx);
 
     int err = dspqueue_close(ctx->dsp_queue); ctx->dsp_queue = NULL;
     if (err != 0) {
@@ -718,6 +730,45 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
     free(ctx);
     h->ctx = NULL;
 
+    return AEE_SUCCESS;
+}
+
+// Switch the session to a new dspqueue created by the host. VTCM, HMX, the mappings and the
+// worker threads stay as they are. Some FastRPC drivers leave a signal that arrived before
+// the host started waiting in the signaled state, after which every blocking read of that
+// queue on the host busy-waits; new signals start clean. The host calls this only while no
+// batches are outstanding.
+AEEResult htp_iface_requeue(remote_handle64 handle, uint64_t dsp_queue_id) {
+    struct htp_handle * h = (struct htp_handle *) handle;
+    if (!h || !h->ctx) {
+        return AEE_EBADPARM;
+    }
+    struct htp_context * ctx = h->ctx;
+
+    // Callbacks could still run on the old queue while the new one is imported
+    if (!ctx->main_stack) {
+        return AEE_EUNSUPPORTED;
+    }
+
+    dspqueue_t dsp_queue = NULL;
+    int err = dspqueue_import(dsp_queue_id, NULL, NULL, (void *) h, &dsp_queue);
+    if (err) {
+        FARF(ERROR, "Queue import failed with 0x%08x", (unsigned) err);
+        return err == AEE_EBADSTATE ? AEE_EFAILED : err;
+    }
+
+    htp_stop_main_thread(ctx);
+
+    err = dspqueue_close(ctx->dsp_queue);
+    if (err != 0) {
+        FARF(ERROR, "Queue close failed with 0x%08x", (unsigned) err);
+    }
+    ctx->dsp_queue = dsp_queue;
+
+    // AEE_EBADSTATE tells the host that the session is lost
+    if (htp_start_main_thread(ctx)) {
+        return AEE_EBADSTATE;
+    }
     return AEE_SUCCESS;
 }
 
