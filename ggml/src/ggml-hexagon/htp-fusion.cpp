@@ -157,6 +157,37 @@ static bool fuse_rms_norm_mul(const ggml_hexagon_session * sess, htp_opnode & pr
     return true;
 }
 
+// ROPE of an RMS_NORM+MUL output (the Q/K norms of gemma, Qwen3 and others): the rope op loads the
+// norm input and normalizes each row in VTCM, with the norm op's kernel, before rotating it
+static bool fuse_rms_norm_mul_rope(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (prev.opcode != HTP_OP_RMS_NORM_MUL || prev.inputs.size() != 2 || prev.outputs.size() != 1) return false;
+
+    const ggml_tensor * nout = prev.dst();
+    const ggml_tensor * x    = prev.inputs[0];
+    const ggml_tensor * w    = prev.inputs[1];
+    const ggml_tensor * rope = cur.node;
+    if (rope->src[0] != nout || !htp_tensor_is_fuseable(nout)) return false;
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || ggml_nrows(w) != 1 || w->ne[0] != x->ne[0]) return false;
+    if (!ggml_are_same_shape(x, nout) || x->nb[0] != sizeof(float) || !ggml_is_contiguous(w)) return false;
+    if (prev.fused.size() + 1 > HTP_OP_MAX_FUSED) return false;
+
+    struct htp_rope_kernel_params kparams = *cur.kparams<htp_rope_kernel_params>();
+    kparams.norm          = 1;
+    memcpy(&kparams.norm_eps,   &prev.params[0], sizeof(float));
+    memcpy(&kparams.norm_scale, &prev.params[1], sizeof(float));
+    kparams.norm_w_offset = hex_round_up(kparams.vtcm_size, 128);
+    kparams.vtcm_size     = kparams.norm_w_offset + hex_round_up(x->ne[0] * sizeof(float), 256);
+    if ((size_t) kparams.vtcm_size > htp_session_vtcm_size(sess)) return false;
+
+    prev.opcode  = HTP_OP_ROPE;
+    memcpy(prev.params, cur.params, sizeof(prev.params));
+    prev.inputs  = { x, rope->src[1], rope->src[2], w };  // freq factors may be null
+    prev.outputs = { cur.dst() };
+    prev.fused.push_back(rope);
+    prev.set_kparams(kparams);
+    return true;
+}
+
 static bool fuse_rms_norm_scale(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
     GGML_UNUSED(sess);
     if (prev.opcode != HTP_OP_RMS_NORM && prev.opcode != HTP_OP_RMS_NORM_MUL) return false;
@@ -775,6 +806,8 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
         case HTP_OP_GLU_GEGLU:
         case HTP_OP_GLU_SWIGLU:
             return htp_fusion_enabled(HTP_FUSE_MUL_MAT_NX_GLU) && fuse_mul_mat_nx_glu(sess, prev, cur);
+        case HTP_OP_ROPE:
+            return htp_fusion_enabled(HTP_FUSE_RMS_NORM_ROPE) && fuse_rms_norm_mul_rope(sess, prev, cur);
         default:
             return false;
     }

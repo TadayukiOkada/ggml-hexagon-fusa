@@ -87,7 +87,18 @@ struct htp_rope_context {
     struct fastdiv_values div_ne1;
 
     const float * freq_factors;
+    const uint8_t * norm_w;   // RMS_NORM+MUL weight in VTCM: rows are normalized before the rotation
+    float           norm_eps;
+    float           norm_scale;
 };
+
+// rms_norm(row) * w in place, as the RMS_NORM+MUL op computes it
+static inline void rope_norm_rows(const struct htp_rope_context * rctx, uint8_t * src, uint32_t nr, uint32_t ne0) {
+    for (uint32_t i = 0; i < nr; i++) {
+        uint8_t * s = src + i * rctx->src0_row_size_aligned;
+        hvx_fast_rms_norm_mul_f32(s, rctx->norm_w, s, ne0, rctx->norm_eps, rctx->norm_scale);
+    }
+}
 
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
     const float y = (i0 / 2 - low) / MAX(0.001f, high - low);
@@ -653,6 +664,9 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                     uint8_t * cur_spad = (uint8_t *) dma_queue_pop(dma_q).dst;
 
                     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, cur_ir);
+                    if (rctx->norm_w) {
+                        rope_norm_rows(rctx, cur_spad, cnr, ne0);
+                    }
                     if (is_neox || is_vision) {
                         rope_neox_f32_inplace(rctx, cur_spad, cnr, ne, theta_cache);
                     } else {
@@ -756,6 +770,18 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
                        layout.freq_factors_size_aligned, 0, ff_size, 1);
         dma_queue_pop(dma_q);
         rctx.freq_factors = vtcm_freq_factors;
+    }
+
+    if (kparams->norm) {
+        const struct htp_tensor * w = octx->src[3];
+        dma_queue * dma_q = octx->ctx->dma[0];
+        uint8_t * vtcm_w = (uint8_t *) octx->ctx->vtcm_base + kparams->norm_w_offset;
+        dma_queue_push(dma_q, dma_make_data(vtcm_w, w->data), hex_round_up(w->ne[0] * sizeof(float), 128), 0,
+                       w->ne[0] * sizeof(float), 1);
+        dma_queue_pop(dma_q);
+        rctx.norm_w     = vtcm_w;
+        rctx.norm_eps   = kparams->norm_eps;
+        rctx.norm_scale = kparams->norm_scale;
     }
 
     const int32_t * op_params = &octx->op_params[0];

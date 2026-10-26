@@ -12,6 +12,10 @@
 struct htp_rope_kernel_params {
     uint32_t n_threads;
     uint32_t vtcm_size;
+    uint32_t norm;                // RMS_NORM+MUL first, with the weight src[3] (Q/K norm before RoPE)
+    float    norm_eps;            // the RMS_NORM_MUL op params: epsilon and scale (0 = none)
+    float    norm_scale;
+    uint32_t norm_w_offset;       // VTCM offset of the norm weight (after the layout)
 
     struct fastdiv_values div_ne2_ne1;
     struct fastdiv_values div_ne1;
