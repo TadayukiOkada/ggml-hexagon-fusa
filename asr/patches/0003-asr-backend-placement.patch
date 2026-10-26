@@ -146,7 +146,7 @@ index dc49f03..7f8050f 100644
          first = last;
      }
 diff --git a/src/asr/encoder/fastconformer.cpp b/src/asr/encoder/fastconformer.cpp
-index 08e9497..db840e6 100644
+index 2906397..2310873 100644
 --- a/src/asr/encoder/fastconformer.cpp
 +++ b/src/asr/encoder/fastconformer.cpp
 @@ -10,10 +10,19 @@ using namespace nemo_speech::asr;
@@ -393,7 +393,7 @@ index 08e9497..db840e6 100644
          }
      }
  }
-@@ -1589,7 +1620,7 @@ FastConformerEncoder::set_data(ggml_runtime::Session* session) {
+@@ -1595,7 +1626,7 @@ FastConformerEncoder::set_data(ggml_runtime::Session* session) {
          for (int l = 0; l < cfg_.n_layers; ++l) {
              for (const auto& name : {kv_cache_name(l), conv_cache_name(l)}) {
                  auto t = session->model_tensor_container->get_tensor_by_name(name);
@@ -403,7 +403,7 @@ index 08e9497..db840e6 100644
          }
      }
 diff --git a/src/asr/encoder/rel_pos_attention.cpp b/src/asr/encoder/rel_pos_attention.cpp
-index ada27be..1fe4888 100644
+index 2e8d2d1..d984d57 100644
 --- a/src/asr/encoder/rel_pos_attention.cpp
 +++ b/src/asr/encoder/rel_pos_attention.cpp
 @@ -21,7 +21,7 @@ namespace ggml_runtime {
@@ -424,7 +424,7 @@ index ada27be..1fe4888 100644
          bf_ctx.ctx, cos_grid_interleave_1_compact_tensor, sin_grid_interleave_2_compact_tensor);
  
      auto pe_bf_tensor = ggml_bf_tensor(pe_tensor, bf_ctx.buft);
-@@ -192,7 +192,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
+@@ -193,7 +193,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
              qkv = session->params.use_gpu && qkv_weight.tensor->type == GGML_TYPE_BF16 &&
                            input_tensor.tensor->ne[2] * input_tensor.tensor->ne[3] > 1
                        ? ggml_add(bf_ctx.ctx, qkv, bias.tensor)
@@ -433,7 +433,7 @@ index ada27be..1fe4888 100644
          }
          const size_t es = ggml_element_size(qkv);
          auto slice = [&](int idx) {
-@@ -300,7 +300,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
+@@ -301,7 +301,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
              matrix_bd->nb[3], 0);
          matrix_bd = ggml_cont(bf_ctx.ctx, matrix_bd);
  
@@ -442,7 +442,7 @@ index ada27be..1fe4888 100644
              bf_ctx.ctx, ggml_add(bf_ctx.ctx, matrix_ac, matrix_bd), scale_factor);
  
          // Optional attention mask: caller passes an additive mask shaped to
-@@ -312,7 +312,11 @@ RelPositionMultiHeadAttention::build_graph_masked(
+@@ -313,7 +313,11 @@ RelPositionMultiHeadAttention::build_graph_masked(
              scores = ggml_add(bf_ctx.ctx, scores, attn_mask);
          }
  
@@ -455,7 +455,7 @@ index ada27be..1fe4888 100644
          auto vtk = ggml_cont(bf_ctx.ctx, ggml_permute(bf_ctx.ctx, vh, 1, 0, 2, 3));
          auto ctxh = ggml_mul_mat(bf_ctx.ctx, vtk, soft);    // [dk,T,H,B]
          attn = ggml_permute(bf_ctx.ctx, ctxh, 0, 2, 1, 3);  // [dk,H,T,B]
-@@ -346,6 +350,8 @@ RelPositionMultiHeadAttention::set_data(Session* session) {
+@@ -347,6 +351,8 @@ RelPositionMultiHeadAttention::set_data(Session* session) {
      // all three quant planes before all three scale planes instead.
      {
          ggml_bf_tensor w = session->model_tensor_container->get_tensor_by_name(qkv_weight_name);
@@ -616,7 +616,7 @@ index 9f7aa8c..d3ebd55 100644
      std::unique_ptr<DecoderBatchers> decoder_batchers_;
      int decoder_arena_slots_ = 0;
 diff --git a/src/asr/recognizer.cpp b/src/asr/recognizer.cpp
-index abaf38d..28f1668 100644
+index ce9bdb2..5e50e33 100644
 --- a/src/asr/recognizer.cpp
 +++ b/src/asr/recognizer.cpp
 @@ -15,6 +15,7 @@

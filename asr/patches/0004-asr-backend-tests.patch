@@ -1,8 +1,8 @@
 diff --git a/tests/cpp/asr/CMakeLists.txt b/tests/cpp/asr/CMakeLists.txt
-index a922ed3..cda1b60 100644
+index 4f07284..5e07dee 100644
 --- a/tests/cpp/asr/CMakeLists.txt
 +++ b/tests/cpp/asr/CMakeLists.txt
-@@ -95,3 +95,10 @@ if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
+@@ -107,3 +107,10 @@ if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
      add_test(NAME skinny_q8_dispatch COMMAND test_skinny_q8_dispatch)
      set_tests_properties(skinny_q8_dispatch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
  endif()
