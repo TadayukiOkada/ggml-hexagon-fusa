@@ -621,7 +621,7 @@ inline void ggml_hexagon_session::free_fence(void * ptr, uint32_t n_slots) {
 }
 
 inline ggml_tensor ggml_hexagon_session::make_fence_tensor(const volatile void * slot, uint32_t n_slots) const {
-    static htp_tensor_extra fence_extra { {}, 0, HTP_TENSOR_FENCE };
+    static htp_tensor_extra fence_extra { {}, {}, false, HTP_TENSOR_FENCE };
 
     ggml_tensor t {};
     t.buffer = &this->fence_buf->backend_buffer;
@@ -666,6 +666,53 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
     return GGML_STATUS_SUCCESS;
 }
 
+// Multipart uploads of a tiled weight track the covered ranges rather than a byte count:
+// overlapping writes must not publish an incomplete tiled tensor. A partial write after the
+// tensor was tiled reads the standard blocks back first, so untouched rows survive re-tiling.
+static void htp_update_repack_shadow(ggml_tensor * tensor, const void * data, size_t offset, size_t size,
+                                     size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    auto extra = (htp_tensor_extra *) tensor->extra;
+    const size_t total = ggml_nbytes(tensor);
+    if (size == 0 || n_copies == 0) {
+        return;
+    }
+    if (extra->shadow_buf.empty()) {
+        extra->shadow_buf.resize(total);
+        if (extra->repack_initialized) {
+            htp_unpack_tensor_tiled(extra->shadow_buf.data(), tensor, 0, total);
+        }
+    }
+    for (size_t i = 0; i < n_copies; ++i) {
+        const size_t begin = offset + i * stride_tensor;
+        GGML_ASSERT(begin <= total && size <= total - begin);
+        memcpy(extra->shadow_buf.data() + begin, (const uint8_t *) data + i * stride_data, size);
+        if (!extra->repack_initialized) {
+            extra->shadow_ranges.emplace_back(begin, begin + size);
+        }
+    }
+    bool complete = extra->repack_initialized;
+    if (!complete) {
+        std::sort(extra->shadow_ranges.begin(), extra->shadow_ranges.end());
+        std::vector<std::pair<size_t, size_t>> merged;
+        for (const auto & range : extra->shadow_ranges) {
+            if (!merged.empty() && range.first <= merged.back().second) {
+                merged.back().second = (std::max)(merged.back().second, range.second);
+            } else {
+                merged.push_back(range);
+            }
+        }
+        extra->shadow_ranges.swap(merged);
+        complete = extra->shadow_ranges.size() == 1 && extra->shadow_ranges[0].first == 0 &&
+                   extra->shadow_ranges[0].second == total;
+    }
+    if (complete) {
+        htp_repack_tensor_tiled(tensor, extra->shadow_buf.data(), total);
+        extra->repack_initialized = true;
+        std::vector<uint8_t>().swap(extra->shadow_buf);
+        std::vector<std::pair<size_t, size_t>>().swap(extra->shadow_ranges);
+    }
+}
+
 static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                    ggml_tensor *         tensor,
                                                    const void *          data,
@@ -690,23 +737,14 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         return;
     }
 
-    if (offset == 0 && size == ggml_nbytes(tensor) && extra->shadow_buf.empty()) {
+    if (offset == 0 && size == ggml_nbytes(tensor)) {
         htp_repack_tensor_tiled(tensor, data, size);
+        extra->repack_initialized = true;
+        std::vector<uint8_t>().swap(extra->shadow_buf);
+        std::vector<std::pair<size_t, size_t>>().swap(extra->shadow_ranges);
         return;
     }
-
-    if (extra->shadow_buf.size() < ggml_nbytes(tensor)) {
-        extra->shadow_buf.resize(ggml_nbytes(tensor));
-    }
-    memcpy(extra->shadow_buf.data() + offset, data, size);
-    extra->shadow_size += size;
-
-    if (extra->shadow_size >= ggml_nbytes(tensor)) {
-        htp_repack_tensor_tiled(tensor, extra->shadow_buf.data(), extra->shadow_buf.size());
-        extra->shadow_buf.clear();
-        extra->shadow_buf.shrink_to_fit();
-        extra->shadow_size = 0;
-    }
+    htp_update_repack_shadow(tensor, data, offset, size, 1, 0, 0);
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -769,20 +807,7 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
         return;
     }
 
-    if (extra->shadow_buf.size() < ggml_nbytes(tensor)) {
-        extra->shadow_buf.resize(ggml_nbytes(tensor));
-    }
-    for (size_t i = 0; i < n_copies; i++) {
-        memcpy(extra->shadow_buf.data() + offset + i * stride_tensor, (const uint8_t *) data + i * stride_data, size);
-    }
-    extra->shadow_size += n_copies * size;
-
-    if (extra->shadow_size >= ggml_nbytes(tensor)) {
-        htp_repack_tensor_tiled(tensor, extra->shadow_buf.data(), extra->shadow_buf.size());
-        extra->shadow_buf.clear();
-        extra->shadow_buf.shrink_to_fit();
-        extra->shadow_size = 0;
-    }
+    htp_update_repack_shadow(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
@@ -2408,6 +2433,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     htp_repack_tensor_tiled(src0, raw.data(), raw.size());
                     auto * extra = (htp_tensor_extra *) src0->extra;
                     extra->flags |= HTP_TENSOR_TILED;
+                    extra->repack_initialized = true;
                 }
             }
 
@@ -2729,6 +2755,9 @@ static bool ggml_backend_hexagon_cpy_tensor_async(ggml_backend_t backend_src, gg
     auto * dst_extra = static_cast<htp_tensor_extra *>(dst->extra);
     const auto * src_extra = static_cast<const htp_tensor_extra *>(src->extra);
     dst_extra->flags = src_extra->flags & ~HTP_TENSOR_FUSEABLE;
+    dst_extra->repack_initialized = src_extra->repack_initialized;
+    dst_extra->shadow_buf.clear();
+    dst_extra->shadow_ranges.clear();
 
     auto sess_src = static_cast<ggml_hexagon_session *>(backend_src->context);
     auto sess_dst = static_cast<ggml_hexagon_session *>(backend_dst->context);

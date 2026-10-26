@@ -5,9 +5,10 @@
 #include "htp-repack.h"
 
 struct htp_tensor_extra {
-    std::vector<uint8_t> shadow_buf;
-    size_t               shadow_size { 0 };
-    uint32_t             flags { 0 };
+    std::vector<uint8_t>                   shadow_buf;
+    std::vector<std::pair<size_t, size_t>> shadow_ranges;              // parts of a tiled weight uploaded so far
+    bool                                   repack_initialized { false }; // the tiled weight holds all rows
+    uint32_t                               flags { 0 };
 };
 
 extern int    opt_arch;
