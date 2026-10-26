@@ -215,6 +215,31 @@ static bool fuse_rms_norm_mul_add(const ggml_hexagon_session * sess, htp_opnode 
     return true;
 }
 
+// MUL of an RMS_NORM+MUL+ADD output by one value (gemma's per-layer output scale): the norm op scales
+// the rows after adding the residual, as the scalar MUL computes it
+static bool fuse_rms_norm_mul_add_scale(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    GGML_UNUSED(sess);
+    if (prev.opcode != HTP_OP_RMS_NORM_MUL || prev.inputs.size() != 3) return false;
+    if (prev.kparams<htp_unary_kernel_params>()->mul_src3) return false;
+
+    const ggml_tensor * scale = nullptr;
+    if (!htp_match_consumer(prev, cur, /*commutative=*/ true, &scale)) return false;
+
+    const ggml_tensor * out = cur.dst();
+    if (scale->type != GGML_TYPE_F32 || ggml_nelements(scale) != 1) return false;
+    if (out->type != GGML_TYPE_F32 || !ggml_are_same_shape(out, prev.dst()) || !ggml_is_contiguous(out)) return false;
+    if (htp_inputs_overlap_unsafe(prev, out, scale)) return false;
+
+    struct htp_unary_kernel_params kparams = *prev.kparams<htp_unary_kernel_params>();
+    kparams.mul_src3 = 1;
+
+    prev.inputs.push_back(scale);
+    prev.outputs = { out };
+    prev.fused.push_back(cur.node);
+    prev.set_kparams(kparams);
+    return true;
+}
+
 static bool fuse_rms_norm_scale(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
     GGML_UNUSED(sess);
     if (prev.opcode != HTP_OP_RMS_NORM && prev.opcode != HTP_OP_RMS_NORM_MUL) return false;
@@ -814,6 +839,7 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
                    (htp_fusion_enabled(HTP_FUSE_BINARY_NX)     && fuse_binary_nx(sess, prev, cur));
         case HTP_OP_MUL:
             return (htp_fusion_enabled(HTP_FUSE_RMS_NORM_MUL)   && fuse_rms_norm_mul(sess, prev, cur))   ||
+                   (htp_fusion_enabled(HTP_FUSE_RMS_NORM_ADD_MUL) && fuse_rms_norm_mul_add_scale(sess, prev, cur)) ||
                    (htp_fusion_enabled(HTP_FUSE_UNARY_MUL_GLU)  && fuse_unary_mul_glu(sess, prev, cur))  ||
                    (htp_fusion_enabled(HTP_FUSE_MUL_MUL_SCALAR) && fuse_mul_mul_scalar(sess, prev, cur)) ||
                    (htp_fusion_enabled(HTP_FUSE_BINARY_NX)      && fuse_binary_nx(sess, prev, cur));
