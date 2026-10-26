@@ -162,10 +162,10 @@ index c407b14..41e33c2 100644
      output_tensors.add_tensor(ggml_bf_tensor(x, bf_ctx.buft));
      return output_tensors;
 diff --git a/src/runtime/ggml/runtime.h b/src/runtime/ggml/runtime.h
-index fe736c8..e564ed6 100644
+index 26504f9..ea66ef7 100644
 --- a/src/runtime/ggml/runtime.h
 +++ b/src/runtime/ggml/runtime.h
-@@ -171,6 +171,7 @@ class TensorBag {
+@@ -187,6 +187,7 @@ class TensorBag {
  };
  
  class Session;
@@ -173,7 +173,7 @@ index fe736c8..e564ed6 100644
  class TensorContainer;
  
  class Module {
-@@ -200,12 +201,36 @@ void keep_cuda_graphs_resident();
+@@ -216,12 +217,36 @@ void keep_cuda_graphs_resident();
  void keep_skinny_q8_weights_separate();
  
  struct Params {
@@ -210,7 +210,7 @@ index fe736c8..e564ed6 100644
  // Owns ggml backend handles shared by one or more Sessions.
  class BackendManager {
     public:
-@@ -245,6 +270,11 @@ class BackendManager {
+@@ -261,6 +286,11 @@ class BackendManager {
      std::mutex compute_mu_;
  };
  
@@ -222,7 +222,7 @@ index fe736c8..e564ed6 100644
  class TensorContainer {
     public:
      // Arena sizes for metadata and buffer-type-specific graph contexts.
-@@ -254,6 +284,7 @@ class TensorContainer {
+@@ -270,6 +300,7 @@ class TensorContainer {
          std::map<ggml_backend_buffer_type_t, size_t> per_buft;
          // Leave unnamed intermediates to the scheduler's liveness allocator.
          bool sched_managed = false;
@@ -230,7 +230,7 @@ index fe736c8..e564ed6 100644
      };
  
      TensorContainer(buft_list_t buft_list, ArenaSizes sizes);
-@@ -269,11 +300,14 @@ class TensorContainer {
+@@ -285,9 +316,10 @@ class TensorContainer {
      size_t total_backend_buffer_bytes() const;
  
      void dump_largest_tensors(size_t top_n) const;
@@ -241,12 +241,17 @@ index fe736c8..e564ed6 100644
 +    ggml_bf_context get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft, TensorRole role = TensorRole::Activation);
      void allocate_tensors_on_backend_buffers();
      void free_temp_ctx();
+ 
+@@ -297,6 +329,8 @@ class TensorContainer {
+     // Non-null once allocate_tensors_on_backend_buffers() built a
+     // zero-copy buffer for this buft.
+     ggml_backend_buffer_t mmap_buffer_for(ggml_backend_buffer_type_t buft) const;
 +    // Refresh backend-private metadata only when its owning epoch changes.
 +    void bind_external_storage(ggml_tensor* tensor, ggml_backend_buffer_t buffer, void* data);
      ggml_bf_tensor get_tensor_by_name(const std::string& name);
      bool has_tensor_by_name(const std::string& name);
      void cache_tensor(std::string name, ggml_bf_tensor tensor);
-@@ -283,13 +317,13 @@ class TensorContainer {
+@@ -306,13 +340,13 @@ class TensorContainer {
      ggml_bf_tensor import_tensor(std::string name, ggml_tensor* tensor);
  
      // Declares tensors on the primary device's main buffer type.
@@ -264,14 +269,21 @@ index fe736c8..e564ed6 100644
  
     private:
      ArenaSizes sizes_;
-@@ -300,11 +334,13 @@ class TensorContainer {
+@@ -323,7 +357,7 @@ class TensorContainer {
      // built in get_ctx_of_buffer_type(). ctx_map below holds raw views
      // (the ggml_bf_context.ctx field) into these contexts.
      std::vector<ggml_context_ptr> owned_ctxs_;
 -    buft_ctx_map_t ctx_map;
 +    std::map<std::pair<ggml_backend_buffer_type_t, TensorRole>, ggml_bf_context> ctx_map;
+     // Outlives backend_buffers (declared first) so mmap-backed buffers stay valid.
+     std::shared_ptr<void> mmap_keepalive_;
      std::vector<ggml_backend_buffer_ptr> backend_buffers;
-     std::map<std::string, ggml_bf_tensor> tensor_lookup;
+@@ -331,9 +365,12 @@ class TensorContainer {
+     // Non-owning, used only while allocating; see set_mmap_loader(). Null unless opted in.
+     GGUFLoader* mmap_loader_ = nullptr;
+     // Non-owning views into backend_buffers, keyed by buft; see mmap_buffer_for().
++    // Only StaticWeight contexts are bound, so there is at most one per buft.
+     std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_t> mmap_bufs_;
 +    struct ExternalBinding { ggml_backend_buffer_t buffer = nullptr; uint64_t epoch = 0; };
 +    std::unordered_map<ggml_tensor*, ExternalBinding> external_bindings_;
  
@@ -280,7 +292,7 @@ index fe736c8..e564ed6 100644
  };
  
  // Per-stream device storage for a Session's state tensors. The state must
-@@ -411,6 +447,8 @@ class Session {
+@@ -444,6 +481,8 @@ class Session {
  
     private:
      void init_schedule();
@@ -289,7 +301,7 @@ index fe736c8..e564ed6 100644
  
      WeightLoadHook weight_load_hook_;
  
-@@ -433,8 +471,13 @@ class Session {
+@@ -466,8 +505,13 @@ class Session {
          const std::function<TensorBag(Session*, TensorContainer*)>& define_input_tensors,
          const std::function<bool(Session*, TensorContainer*)>& set_input_data,
          const std::function<bool(Session*, TensorBag, TensorContainer*)>& return_output,
@@ -304,7 +316,7 @@ index fe736c8..e564ed6 100644
      BackendManager* backend_manager_;
      Module* root_module;
      buft_list_t buft_list;
-@@ -458,8 +501,15 @@ class Session {
+@@ -491,8 +535,15 @@ class Session {
          std::vector<uint8_t> sched_meta;  // backing for gf
          ggml_cgraph* gf;
          std::vector<NodeAssignment> schedule;
@@ -472,7 +484,7 @@ index 0000000..1d47cb5
 +}
 +} // namespace ggml_runtime
 diff --git a/src/runtime/ggml/session.cpp b/src/runtime/ggml/session.cpp
-index 5a33f48..18db572 100644
+index 3be0c57..e2bc828 100644
 --- a/src/runtime/ggml/session.cpp
 +++ b/src/runtime/ggml/session.cpp
 @@ -8,14 +8,223 @@
@@ -713,16 +725,19 @@ index 5a33f48..18db572 100644
      // A re-setup() replaces the scheduler and model tensors; cached runs
      // reference the old ones, and the fresh sched's pools start at 0 so the
      // size tracker would never flag a change.
-@@ -288,6 +502,8 @@ Session::dump_schedule(std::ostream& out, const std::string& session_label) cons
+@@ -303,6 +517,11 @@ Session::bind_or_copy_tensor(ggml_bf_tensor t, const std::string& gguf_key) {
  void
  Session::load_weight(const std::string& gguf_key) {
      ggml_bf_tensor t = model_tensor_container->get_tensor_by_name(gguf_key);
-+    if (ggml_backend_buffer_get_usage(t.tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
++    // A zero-copy weight has no buffer until bind_or_copy_tensor binds it.
++    ggml_backend_buffer_t storage = t.tensor->buffer ? t.tensor->buffer
++        : model_tensor_container->mmap_buffer_for(t.buft);
++    if (!storage || ggml_backend_buffer_get_usage(storage) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
 +        throw std::runtime_error("GGUF weight uploaded into non-weight storage: " + gguf_key);
      const ggml_type mem = t.tensor->type;
      const ggml_type disk = gguf_loader->get_tensor_type(gguf_key);
      const size_t mem_bytes = ggml_nbytes(t.tensor);
-@@ -337,8 +553,10 @@ Session::setup() {
+@@ -351,8 +570,10 @@ Session::setup() {
  
      // Weight declarations mutate modules, so this container cannot use the
      // two-pass sizing used for activation graphs.
@@ -731,10 +746,10 @@ index 5a33f48..18db572 100644
      model_tensor_container =
 -        std::make_unique<TensorContainer>(buft_list, TensorContainer::ArenaSizes{});
 +        std::make_unique<TensorContainer>(buft_list, model_sizes);
+     model_tensor_container->set_mmap_loader(gguf_loader);
      // State tensors (declared via create_state_tensor_*) live in this sibling
      // container, which is deliberately NEVER allocate_tensors_on_backend_buffers()'d:
-     // each per-stream SessionState supplies their device backing per run. The
-@@ -367,26 +585,8 @@ Session::setup() {
+@@ -382,26 +603,8 @@ Session::setup() {
  
  namespace {
  
@@ -763,7 +778,7 @@ index 5a33f48..18db572 100644
      if (in.device_tensor != nullptr) {
          const DeviceTensor& source = *in.device_tensor;
          if (in.persistent || in.upload) {
-@@ -411,9 +611,32 @@ create_input_tensor(TensorContainer* tc, const Session::Input& in) {
+@@ -426,9 +629,32 @@ create_input_tensor(TensorContainer* tc, const Session::Input& in) {
                  "Session::Input '%s': device buffer type does not match session placement",
                  in.name.c_str()));
          }
@@ -798,7 +813,7 @@ index 5a33f48..18db572 100644
      return result;
  }
  
-@@ -477,6 +700,7 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
+@@ -492,6 +718,7 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
              bool transferred_host_data = false;
              for (const auto& in : inputs) {
                  if (in.device_tensor != nullptr) {
@@ -806,7 +821,7 @@ index 5a33f48..18db572 100644
                      continue;
                  }
                  if (!in.upload) {
-@@ -494,6 +718,7 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
+@@ -509,6 +736,7 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
                          "Session::Input '%s': host size %zu != declared tensor size %zu",
                          in.name.c_str(), have, want));
                  }
@@ -814,7 +829,7 @@ index 5a33f48..18db572 100644
                  ggml_backend_t backend = backend_for_tensor(s->backends, t.tensor);
                  if (backend != nullptr && !in.synchronous_upload) {
                      ggml_backend_tensor_set_async(backend, t.tensor, in.host_data, 0, have);
-@@ -530,6 +755,7 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
+@@ -545,6 +773,7 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
                              "Session::Output buffer too small for tensor (have %zu, need %zu)",
                              out.nbytes, want));
                      }
@@ -822,7 +837,7 @@ index 5a33f48..18db572 100644
                      ggml_backend_t backend = backend_for_tensor(s->backends, t.tensor);
                      if (backend != nullptr) {
                          ggml_backend_tensor_get_async(backend, t.tensor, out.host_buffer, 0, want);
-@@ -545,7 +771,9 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
+@@ -560,7 +789,9 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
              }
              return transferred_host_data;
          },
@@ -833,7 +848,7 @@ index 5a33f48..18db572 100644
  }
  
  ggml_bf_tensor
-@@ -589,7 +817,7 @@ Session::make_session_state() {
+@@ -604,7 +835,7 @@ Session::make_session_state() {
      tc->allocate_tensors_on_backend_buffers();
      for (const auto& s : state_specs_) {
          ggml_tensor* t = tc->get_tensor_by_name(s.name).tensor;
@@ -842,7 +857,7 @@ index 5a33f48..18db572 100644
      }
      return SessionState(std::move(tc));
  }
-@@ -602,7 +830,7 @@ Session::reset_session_state(SessionState& state) {
+@@ -617,7 +848,7 @@ Session::reset_session_state(SessionState& state) {
      TensorContainer* tc = state.container();
      for (const auto& s : state_specs_) {
          ggml_tensor* t = tc->get_tensor_by_name(s.name).tensor;
@@ -851,7 +866,7 @@ index 5a33f48..18db572 100644
      }
  }
  
-@@ -663,10 +891,24 @@ Session::run_impl(
+@@ -678,10 +909,24 @@ Session::run_impl(
      uint64_t key, const std::function<TensorBag(Session*, TensorContainer*)>& define_input_tensors,
      const std::function<bool(Session*, TensorContainer*)>& set_input_data,
      const std::function<bool(Session*, TensorBag, TensorContainer*)>& return_output,
@@ -877,7 +892,7 @@ index 5a33f48..18db572 100644
      // Bind shared state-tensor objects to this stream for the duration of the run.
      bind_state(state);
  
-@@ -738,6 +980,41 @@ Session::run_impl(
+@@ -753,6 +998,41 @@ Session::run_impl(
          cr.gf = build_graph_into(
              root_module, cr.input_tensors, cr.output_tensors, sched_meta, cr.sched_meta);
          collect_state_views(cr.gf, cr.state_views);
@@ -919,7 +934,7 @@ index 5a33f48..18db572 100644
  
          const int actual_nodes = ggml_graph_n_nodes(cr.gf);
          if (actual_nodes > static_cast<int>(kSchedGraphErrorFrac * kSchedGraphSize)) {
-@@ -778,21 +1055,86 @@ Session::run_impl(
+@@ -793,21 +1073,86 @@ Session::run_impl(
      }
  
      CachedRun& cr = it->second;
@@ -1009,7 +1024,7 @@ index 5a33f48..18db572 100644
      // Transactional: an entry that has never completed a run is evicted on
      // failure rather than retried as a cache hit; a deterministic failure
      // (bad graph, undersized output) would otherwise never rebuild.
-@@ -801,20 +1143,39 @@ Session::run_impl(
+@@ -816,20 +1161,39 @@ Session::run_impl(
          auto _t1 = _clk::now();
  
          // Valid single-backend placements can bypass scheduler allocation.
@@ -1050,7 +1065,7 @@ index 5a33f48..18db572 100644
              if (t_log) {
                  auto ms = [](auto a, auto b) {
                      return std::chrono::duration<double, std::milli>(b - a).count();
-@@ -842,6 +1203,69 @@ Session::run_impl(
+@@ -857,6 +1221,69 @@ Session::run_impl(
          }
  
          sched_guard.s = sched.get();
@@ -1120,7 +1135,7 @@ index 5a33f48..18db572 100644
          if (!ggml_backend_sched_alloc_graph(sched.get(), cr.gf)) {
              GGMLF_LOG_ERROR("Failed to allocate graph\n");
              throw std::runtime_error("failed to allocate graph");
-@@ -907,6 +1331,7 @@ Session::run_impl(
+@@ -922,6 +1349,7 @@ Session::run_impl(
              }
          }
  
@@ -1128,7 +1143,7 @@ index 5a33f48..18db572 100644
          auto _t2 = _clk::now();
          if (!ggml_graph_compute_helper_async(
                  sched.get(), cr.gf, backend_manager_->get_params().n_threads)) {
-@@ -915,6 +1340,11 @@ Session::run_impl(
+@@ -930,6 +1358,11 @@ Session::run_impl(
          }
          auto _t3 = _clk::now();
  
@@ -1140,7 +1155,7 @@ index 5a33f48..18db572 100644
          // Outputs are read before the guard resets the scheduler: in
          // sched_managed mode non-named output tensors live in the scheduler's
          // allocator.
-@@ -924,6 +1354,7 @@ Session::run_impl(
+@@ -939,6 +1372,7 @@ Session::run_impl(
          // direct path above.
          ggml_backend_sched_synchronize(sched.get());
          auto _t4 = _clk::now();
@@ -1148,7 +1163,7 @@ index 5a33f48..18db572 100644
          if (t_log) {
              auto ms = [](auto a, auto b) {
                  return std::chrono::duration<double, std::milli>(b - a).count();
-@@ -941,6 +1372,7 @@ Session::run_impl(
+@@ -956,6 +1390,7 @@ Session::run_impl(
          }
      }
      catch (...) {
@@ -1157,7 +1172,7 @@ index 5a33f48..18db572 100644
              auto lru_it = std::find(run_cache_lru_.begin(), run_cache_lru_.end(), key);
              if (lru_it != run_cache_lru_.end())
 diff --git a/src/runtime/ggml/tensor_container.cpp b/src/runtime/ggml/tensor_container.cpp
-index d6bb5ea..e5bf3bf 100644
+index 7f30ff2..849177f 100644
 --- a/src/runtime/ggml/tensor_container.cpp
 +++ b/src/runtime/ggml/tensor_container.cpp
 @@ -8,9 +8,66 @@
@@ -1227,7 +1242,7 @@ index d6bb5ea..e5bf3bf 100644
  // Persistent tensors use the first accelerator's main buffer, falling back to
  // CPU. The scheduler inserts copies for operations assigned elsewhere.
  static ggml_backend_buffer_type_t
-@@ -85,7 +142,7 @@ TensorContainer::measure() const {
+@@ -141,7 +198,7 @@ TensorContainer::measure() const {
      Measurement m{};
      m.temp_ctx_bytes = temp_ctx ? ggml_used_mem(temp_ctx.get()) : 0;
      for (const auto& kv : ctx_map) {
@@ -1236,7 +1251,7 @@ index d6bb5ea..e5bf3bf 100644
      }
      return m;
  }
-@@ -104,7 +161,8 @@ TensorContainer::has_tensor_by_name(const std::string& name) {
+@@ -160,7 +217,8 @@ TensorContainer::has_tensor_by_name(const std::string& name) {
  }
  
  ggml_bf_tensor
@@ -1246,7 +1261,7 @@ index d6bb5ea..e5bf3bf 100644
      ggml_backend_buffer_type_t buft = device_main_buft(buft_list);
      // Optional placement diagnostic. NEMO_SPEECH_LOG_PLACEMENT=1 prints
      // `name -> buft` for every tensor created here.
-@@ -119,7 +177,7 @@ TensorContainer::m_create_tensor(ggml_tensor* meta, std::string& name) {
+@@ -175,7 +233,7 @@ TensorContainer::m_create_tensor(ggml_tensor* meta, std::string& name) {
              buft_name ? buft_name : "<unknown>");
      }
  
@@ -1255,7 +1270,7 @@ index d6bb5ea..e5bf3bf 100644
      ggml_tensor* tensor = ggml_dup_tensor(bf_ctx.ctx, meta);
      ggml_set_name(tensor, name.c_str());
      auto bf_tensor = ggml_bf_tensor(tensor, buft);
-@@ -160,34 +218,35 @@ TensorContainer::import_tensor(std::string name, ggml_tensor* tensor) {
+@@ -216,34 +274,35 @@ TensorContainer::import_tensor(std::string name, ggml_tensor* tensor) {
  }
  
  ggml_bf_tensor
@@ -1301,7 +1316,7 @@ index d6bb5ea..e5bf3bf 100644
      if (it == ctx_map.end()) {
          auto override_it = sizes_.per_buft.find(buft);
          const size_t bytes =
-@@ -206,7 +265,7 @@ TensorContainer::get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft) {
+@@ -262,7 +321,7 @@ TensorContainer::get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft) {
          // alive until this TensorContainer destructs.
          ggml_bf_context bf_ctx(ctx_owned.get(), buft);
          owned_ctxs_.push_back(std::move(ctx_owned));
@@ -1310,34 +1325,107 @@ index d6bb5ea..e5bf3bf 100644
  
          return bf_ctx;
      }
-@@ -258,7 +317,7 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
+@@ -293,14 +352,24 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
          return;
      }
      for (auto& p : ctx_map) {
 -        ggml_backend_buffer_type_t buft = p.first;
 +        ggml_backend_buffer_type_t buft = p.first.first;
++        const TensorRole role = p.first.second;
          ggml_bf_context bf_ctx = p.second;
-         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(bf_ctx.ctx, buft);
-         if (!buf) {
-@@ -267,6 +326,21 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
-                 std::string("failed to allocate backend buffer for buffer type ") +
-                 (buft_name ? buft_name : "<unknown>") + " (out of device memory?)");
++        const auto usage = role == TensorRole::StaticWeight
++            ? GGML_BACKEND_BUFFER_USAGE_WEIGHTS : GGML_BACKEND_BUFFER_USAGE_COMPUTE;
++        auto keep = [&](ggml_backend_buffer_t buf) {
++            ggml_backend_buffer_set_usage(buf, usage);
++            GGMLF_LOG_INFO("Tensor storage: role=%d buffer=%s bytes=%zu\n",
++                           int(role), ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf));
++            backend_buffers.emplace_back(buf);
++        };
+ 
+         // Split into GGUF-backed zero-copy candidates vs. everything else
+         // (e.g. RNNT decoder state tensors sharing this buft, no on-disk form).
++        // Only static weights are bound: other roles are written after loading.
+         std::vector<ggml_tensor*> mmap_tensors;
+         std::vector<ggml_tensor*> other_tensors;
+-        const bool try_mmap =
++        const bool try_mmap = role == TensorRole::StaticWeight &&
+             mmap_loader_ && mmap_loader_->is_mmapped() && buft_supports_mmap_zero_copy(buft);
+         for (ggml_tensor* t = ggml_get_first_tensor(bf_ctx.ctx); t != nullptr;
+              t = ggml_get_next_tensor(bf_ctx.ctx, t)) {
+@@ -324,36 +393,47 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
+                     std::string("failed to allocate backend buffer for buffer type ") +
+                     (buft_name ? buft_name : "<unknown>") + " (out of device memory?)");
+             }
+-            backend_buffers.emplace_back(buf);
+-            continue;
+-        }
+-
+-        uint64_t first = UINT64_MAX;
+-        uint64_t last = 0;
+-        for (ggml_tensor* t : mmap_tensors) {
+-            const uint64_t off = mmap_loader_->get_tensor_offset(t->name);
+-            first = std::min(first, off);
+-            last = std::max(last, off + ggml_nbytes(t));
+-        }
+-        ggml_backend_dev_t dev = buft_device_or_cpu(buft);
+-        void* base = mmap_loader_->mapped_base();
+-        const size_t max_tensor_size = ggml_get_max_tensor_size(bf_ctx.ctx);
+-        ggml_backend_buffer_t mmap_buf = ggml_backend_dev_buffer_from_host_ptr(
+-            dev, static_cast<char*>(base) + first, last - first, max_tensor_size);
+-        if (!mmap_buf) {
+-            throw std::runtime_error(
+-                std::string("failed to create mmap-backed buffer for buffer type ") +
+-                ggml_backend_buft_name(buft));
++            keep(buf);
++        } else {
++            uint64_t first = UINT64_MAX;
++            uint64_t last = 0;
++            for (ggml_tensor* t : mmap_tensors) {
++                const uint64_t off = mmap_loader_->get_tensor_offset(t->name);
++                first = std::min(first, off);
++                last = std::max(last, off + ggml_nbytes(t));
++            }
++            ggml_backend_dev_t dev = buft_device_or_cpu(buft);
++            void* base = mmap_loader_->mapped_base();
++            const size_t max_tensor_size = ggml_get_max_tensor_size(bf_ctx.ctx);
++            ggml_backend_buffer_t mmap_buf = ggml_backend_dev_buffer_from_host_ptr(
++                dev, static_cast<char*>(base) + first, last - first, max_tensor_size);
++            if (!mmap_buf) {
++                throw std::runtime_error(
++                    std::string("failed to create mmap-backed buffer for buffer type ") +
++                    ggml_backend_buft_name(buft));
++            }
++            keep(mmap_buf);
++            mmap_bufs_[buft] = mmap_buf;
++            mmap_keepalive_ = mmap_loader_->mapping_handle();
++            // mmap_tensors are left with data == nullptr; Session::load_weight
++            // binds each one via ggml_backend_tensor_alloc.
++
++            ggml_backend_buffer_t other_buf = alloc_tensor_subset(buft, other_tensors);
++            if (other_buf) {
++                keep(other_buf);
++            }
          }
-+        ggml_backend_buffer_set_usage(buf, p.first.second == TensorRole::StaticWeight
-+            ? GGML_BACKEND_BUFFER_USAGE_WEIGHTS : GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-+        GGMLF_LOG_INFO("Tensor storage: role=%d buffer=%s bytes=%zu\n",
-+                       int(p.first.second), ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(buf));
+-        backend_buffers.emplace_back(mmap_buf);
+-        mmap_bufs_[buft] = mmap_buf;
+-        mmap_keepalive_ = mmap_loader_->mapping_handle();
+-        // mmap_tensors are left with data == nullptr; Session::load_weight
+-        // binds each one via ggml_backend_tensor_alloc.
+-
+-        ggml_backend_buffer_t other_buf = alloc_tensor_subset(buft, other_tensors);
+-        if (other_buf) {
+-            backend_buffers.emplace_back(other_buf);
 +        if (const char* inventory = std::getenv("NEMO_SPEECH_TENSOR_INVENTORY")) {
 +            if (inventory[0] == '1') {
 +                for (auto* t = ggml_get_first_tensor(bf_ctx.ctx); t; t = ggml_get_next_tensor(bf_ctx.ctx, t)) {
++                    // Zero-copy tensors get their buffer when the weight is bound.
 +                    GGMLF_LOG_INFO("tensor-storage name=%s role=%d dtype=%s ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu usage=%d padded=%zu buffer=%p\n",
-+                        t->name, int(p.first.second), ggml_type_name(t->type),
++                        t->name, int(role), ggml_type_name(t->type),
 +                        (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
-+                        t->nb[0], t->nb[1], t->nb[2], t->nb[3], int(ggml_backend_buffer_get_usage(t->buffer)),
++                        t->nb[0], t->nb[1], t->nb[2], t->nb[3], t->buffer ? int(ggml_backend_buffer_get_usage(t->buffer)) : int(usage),
 +                        ggml_backend_buft_get_alloc_size(buft, t), (void*)t->buffer);
 +                }
 +            }
-+        }
-         backend_buffers.emplace_back(buf);
+         }
      }
  }

@@ -132,7 +132,7 @@ applies `asr/patches/*.patch`.
 | Patch | Changes |
 |---|---|
 | `0001-hexagon-asr-build` | `NEMO_SPEECH_HEXAGON_ASR`: shared libraries, the pristine ggml of an external llama.cpp, no in-tree Hexagon backend |
-| `0002-runtime-hexagon-backend` | loads `libggml-hexagon.so` explicitly (`--backend hexagon`, `--backend-lib`), per-role tensor storage, explicit CPU placement of named nodes, tensors bound outside the graph allocator kept valid across buffer resets (`ggml_backend_buffer_metadata_epoch`), and an optional schedule trace (`NEMO_SPEECH_SCHEDULE_TRACE`) with each node's backend and `ggml_backend_hexagon_support_reason` |
+| `0002-runtime-hexagon-backend` | loads `libggml-hexagon.so` explicitly (`--backend hexagon`, `--backend-lib`), per-role tensor storage (upstream's zero-copy mmap binding only for static weights, on buffer types that accept host memory, so not on the HTP), explicit CPU placement of named nodes, tensors bound outside the graph allocator kept valid across buffer resets (`ggml_backend_buffer_metadata_epoch`), and an optional schedule trace (`NEMO_SPEECH_SCHEDULE_TRACE`) with each node's backend and `ggml_backend_hexagon_support_reason` |
 | `0003-asr-backend-placement` | CLI and C API options for the backend, front end, position encoding and decoder placement |
 | `0004-asr-backend-tests` | `test_backend_storage` (storage roles, partial quantized uploads, graph reuse, support reasons) and an RNNT stage replay test |
 | `0005-asr-http-demo` | admission control and revision metadata for the optional HTTP/WebSocket server |
