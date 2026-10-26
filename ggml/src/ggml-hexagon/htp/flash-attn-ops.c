@@ -1231,6 +1231,17 @@ typedef struct {
     struct fastdiv_values     thread_div;
 } fa_softmax_args_t;
 
+// acc (qf32) += the 64 fp16 values of p, as 32 pairwise sums
+static inline HVX_Vector fa_rowsum_acc(HVX_Vector acc, HVX_Vector p, HVX_Vector one_hf) {
+#if __HVX_ARCH__ >= 79
+    const HVX_VectorPair w = hvx_vec_f16_to_f32_shuff(p);
+    return Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(w), Q6_V_hi_W(w)));
+#else
+    const HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(p, one_hf);
+    return Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(w), Q6_V_hi_W(w)));
+#endif
+}
+
 static inline void fa_softmax_impl(
     unsigned int n, unsigned int i, void * data,
     const bool has_mask,
@@ -1483,8 +1494,10 @@ static inline void fa_softmax_impl(
                 rowmax_acc_v           = Q6_V_vmux_QVV(p_lane1, v_dup_m1, rowmax_acc_v);
             }
 
-            // Compute P = exp(S - m_new)
+            // Compute P = exp(S - m_new). The row sums widen P to qf32 and add it there, without
+            // converting the products (P * 1.0, exact) to sf first.
             const HVX_Vector v_zero      = Q6_V_vzero();
+            const HVX_Vector v_one_hf    = hvx_vec_splat_f16(1.0);
             HVX_Vector       v_p_rowsum0 = v_zero;
             HVX_Vector       v_p_rowsum1 = v_zero;
 
@@ -1518,15 +1531,10 @@ static inline void fa_softmax_impl(
                 *pv_p_out0_1               = Q6_V_lo_W(vp_p_dual1);
                 *pv_p_out1_1               = Q6_V_hi_W(vp_p_dual1);
 
-                HVX_VectorPair vp_p0_0 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf_0);
-                HVX_VectorPair vp_p1_0 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf_0);
-                HVX_VectorPair vp_p0_1 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf_1);
-                HVX_VectorPair vp_p1_1 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf_1);
-
-                v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0_0), Q6_V_hi_W(vp_p0_0)));
-                v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0_1), Q6_V_hi_W(vp_p0_1)));
-                v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1_0), Q6_V_hi_W(vp_p1_0)));
-                v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1_1), Q6_V_hi_W(vp_p1_1)));
+                v_p_rowsum0 = fa_rowsum_acc(v_p_rowsum0, v_p_row0_hf_0, v_one_hf);
+                v_p_rowsum1 = fa_rowsum_acc(v_p_rowsum1, v_p_row1_hf_0, v_one_hf);
+                v_p_rowsum0 = fa_rowsum_acc(v_p_rowsum0, v_p_row0_hf_1, v_one_hf);
+                v_p_rowsum1 = fa_rowsum_acc(v_p_rowsum1, v_p_row1_hf_1, v_one_hf);
             }
             for (size_t c_rem = c; c_rem < kv_rows; c_rem += 64) {
                 size_t     ci           = c_rem / 64;
@@ -1543,11 +1551,8 @@ static inline void fa_softmax_impl(
                 *pv_p_out0               = Q6_V_lo_W(vp_p_dual);
                 *pv_p_out1               = Q6_V_hi_W(vp_p_dual);
 
-                HVX_VectorPair vp_p0 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf);
-                HVX_VectorPair vp_p1 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf);
-
-                v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0), Q6_V_hi_W(vp_p0)));
-                v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1), Q6_V_hi_W(vp_p1)));
+                v_p_rowsum0 = fa_rowsum_acc(v_p_rowsum0, v_p_row0_hf, v_one_hf);
+                v_p_rowsum1 = fa_rowsum_acc(v_p_rowsum1, v_p_row1_hf, v_one_hf);
             }
 
             HVX_Vector rowsum0_sf = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(v_p_rowsum0));
