@@ -89,10 +89,12 @@ struct htp_mm_kernel_params {
     int32_t  act_row_size;       // Row size for activation scratchpad
     int32_t  vtcm_size;          // Total required scratchpad size in VTCM
     int32_t  vtcm_bias_size;     // bias scratchpad size in VTCM (fused only)
-    int32_t  norm;               // NX: the activation is RMS-normalized and scaled by src[n_weights + 1] first
+    uint8_t  norm;               // NX: the activation is RMS-normalized and scaled by src[n_weights + 1] first
+    uint8_t  post;               // matvec epilogue: 1 = scale, 2 = scale, tanh, 3 = scale, tanh, scale
+    uint8_t  src2_stream;        // HMX 2-D: a full-matrix src2 streams through per-thread VTCM row blocks
+    uint8_t  reserved;
     float    norm_eps;           // the RMS_NORM_MUL op params: epsilon and scale (0 = none)
     float    norm_scale;
-    int32_t  post;               // matvec epilogue: 1 = scale, 2 = scale, tanh, 3 = scale, tanh, scale
     float    post_scale[2];      // SCALE ops of the epilogue: x * scale + bias
     float    post_bias[2];
 
@@ -441,6 +443,9 @@ static inline void htp_mm_hmx_vtcm_layout_build(
 static inline size_t htp_mm_hvx_glu_vtcm_size(uint32_t act_nrows, uint32_t ne01, uint32_t n_threads) {
     return (size_t) n_threads * 64 * sizeof(float) + (size_t) act_nrows * hex_round_up(ne01, 32) * sizeof(float);
 }
+
+// VTCM per thread for streaming a full-matrix src2 (the residual) into the HMX output store
+#define HTP_MM_SRC2_STREAM_BYTES (64 * 1024)
 
 static inline void htp_mm_hvx_vtcm_layout_build(
     struct htp_mm_hvx_vtcm_layout * L,

@@ -1051,6 +1051,28 @@ bool htp_matmul_add_can_collapse(
            htp_rows_stride(src2->ne, src2->nb, &s2);
 }
 
+// A full-matrix src2 (the residual) on the 2-D HMX kernel stays in DDR: the output store streams its
+// rows through a small VTCM area per thread, so the matmul keeps its chunk sizes. Other kernels take
+// src2 into VTCM.
+static bool htp_kparams_solve_matmul_add_stream(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * dst,
+    const struct ggml_tensor * src2,
+    struct htp_mm_kernel_params * kparams
+) {
+    const size_t stage = (size_t) HTP_MM_SRC2_STREAM_BYTES * htp_session_n_threads(sess);
+    if (!htp_kparams_solve_matmul_impl(sess, src0, src1, dst, src2->nb[1], stage, kparams)) {
+        return false;
+    }
+    if (!kparams->n_hmx || kparams->kernel_type != HTP_MM_KERNEL_HMX_2D) {
+        return false;
+    }
+    kparams->src2_stream = 1;
+    return true;
+}
+
 bool htp_kparams_solve_matmul_add(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0,
@@ -1066,8 +1088,14 @@ bool htp_kparams_solve_matmul_add(
                                            ? htp_tensor_collapse_rows(src2)
                                            : (src2 ? *src2 : ggml_tensor{});
         const struct ggml_tensor * p_src2 = src2 ? &src2_collapsed : nullptr;
+        if (p_src2 && p_src2->ne[1] > 1 && htp_kparams_solve_matmul_add_stream(sess, src0, &src1_collapsed, &dst_collapsed, p_src2, kparams)) {
+            return true;
+        }
         const size_t src2_size = p_src2 ? hex_round_up(ggml_nbytes(p_src2), 128) : 0;
         return htp_kparams_solve_matmul_impl(sess, src0, &src1_collapsed, &dst_collapsed, p_src2 ? p_src2->nb[1] : 0, src2_size, kparams);
+    }
+    if (src2 && src2->ne[1] * src2->ne[2] * src2->ne[3] > 1 && htp_kparams_solve_matmul_add_stream(sess, src0, src1, dst, src2, kparams)) {
+        return true;
     }
     const size_t src2_size = src2 ? hex_round_up(ggml_nbytes(src2), 128) : 0;
     return htp_kparams_solve_matmul_impl(sess, src0, src1, dst, src2 ? src2->nb[1] : 0, src2_size, kparams);
@@ -3436,6 +3464,10 @@ bool htp_kparams_solve(
     }
     if (node.opcode == HTP_OP_MUL_MAT_ADD) {
         const ggml_tensor * src2 = node.inputs.size() > 2 ? node.inputs[2] : nullptr;
+        if (src2 && src2->ne[1] * src2->ne[2] * src2->ne[3] > 1 &&
+            htp_kparams_solve_matmul_add_stream(sess, src0, src1, dst, src2, node.kparams<htp_mm_kernel_params>())) {
+            return true;
+        }
         const size_t src2_size = src2 ? hex_round_up(ggml_nbytes(src2), 128) : 0;
         return htp_kparams_solve_matmul_impl(sess, src0, src1, dst, src2 ? src2->nb[1] : 0, src2_size, node.kparams<htp_mm_kernel_params>());
     }
