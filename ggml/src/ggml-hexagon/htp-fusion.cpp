@@ -240,6 +240,42 @@ static bool fuse_rms_norm_mul_add_scale(const ggml_hexagon_session * sess, htp_o
     return true;
 }
 
+// SCALE, TANH, SCALE on the output of a matrix-vector product (the final logit softcap) run in the
+// epilogue of the tiled HVX matvec, one step at a time (kparams.post).
+static bool fuse_mul_mat_post(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    GGML_UNUSED(sess);
+    if (prev.opcode != HTP_OP_MUL_MAT || prev.inputs.size() != 2 || prev.outputs.size() != 1) return false;
+
+    const auto * kp       = prev.kparams<htp_mm_kernel_params>();
+    const int    post     = kp->post;
+    const bool   is_scale = cur.opcode == HTP_OP_SCALE;
+    const bool   is_tanh  = cur.opcode == HTP_OP_UNARY_TANH;
+    if (!((post == 0 && is_scale) || (post == 1 && is_tanh) || (post == 2 && is_scale))) return false;
+
+    const ggml_tensor * w   = prev.inputs[0];
+    const ggml_tensor * x   = prev.inputs[1];
+    const ggml_tensor * mo  = prev.dst();
+    const ggml_tensor * out = cur.dst();
+    if (kp->n_hmx || kp->kernel_type != HTP_MM_KERNEL_HVX_QUANT_ROW || !htp_is_tiled_weight_tensor(w)) return false;
+    if (ggml_nrows(x) != 1 || w->ne[2] * w->ne[3] != 1) return false;
+    if (cur.node->src[0] != mo || !htp_tensor_is_fuseable(mo)) return false;
+    if (out->type != GGML_TYPE_F32 || mo->type != GGML_TYPE_F32 || !ggml_are_same_shape(out, mo) ||
+        !ggml_is_contiguous(out)) return false;
+
+    struct htp_mm_kernel_params kparams = *kp;
+    if (is_scale) {
+        const int i = post == 0 ? 0 : 1;
+        memcpy(&kparams.post_scale[i], &cur.params[0], sizeof(float));
+        memcpy(&kparams.post_bias[i],  &cur.params[1], sizeof(float));
+    }
+    kparams.post = post + 1;
+
+    prev.outputs = { out };
+    prev.fused.push_back(cur.node);
+    prev.set_kparams(kparams);
+    return true;
+}
+
 static bool fuse_rms_norm_scale(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
     GGML_UNUSED(sess);
     if (prev.opcode != HTP_OP_RMS_NORM && prev.opcode != HTP_OP_RMS_NORM_MUL) return false;
@@ -847,7 +883,10 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
         case HTP_OP_DIV:
             return htp_fusion_enabled(HTP_FUSE_BINARY_NX) && fuse_binary_nx(sess, prev, cur);
         case HTP_OP_SCALE:
-            return htp_fusion_enabled(HTP_FUSE_RMS_NORM_SCALE) && fuse_rms_norm_scale(sess, prev, cur);
+            return (htp_fusion_enabled(HTP_FUSE_RMS_NORM_SCALE) && fuse_rms_norm_scale(sess, prev, cur)) ||
+                   (htp_fusion_enabled(HTP_FUSE_MUL_MAT_POST)   && fuse_mul_mat_post(sess, prev, cur));
+        case HTP_OP_UNARY_TANH:
+            return htp_fusion_enabled(HTP_FUSE_MUL_MAT_POST) && fuse_mul_mat_post(sess, prev, cur);
         case HTP_OP_UNARY_SILU:
             return htp_fusion_enabled(HTP_FUSE_SSM_CONV_SILU) && fuse_ssm_conv_silu(sess, prev, cur);
         case HTP_OP_GET_ROWS:

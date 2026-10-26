@@ -92,6 +92,9 @@ struct htp_mm_kernel_params {
     int32_t  norm;               // NX: the activation is RMS-normalized and scaled by src[n_weights + 1] first
     float    norm_eps;           // the RMS_NORM_MUL op params: epsilon and scale (0 = none)
     float    norm_scale;
+    int32_t  post;               // matvec epilogue: 1 = scale, 2 = scale, tanh, 3 = scale, tanh, scale
+    float    post_scale[2];      // SCALE ops of the epilogue: x * scale + bias
+    float    post_bias[2];
 
     // Precomputed division values
     struct fastdiv_values div_ne12_ne1;
