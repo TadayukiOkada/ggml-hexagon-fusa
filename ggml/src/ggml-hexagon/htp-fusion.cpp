@@ -281,7 +281,9 @@ static bool fuse_mul_mat_nx(const ggml_hexagon_session * sess, htp_opnode & prev
 // act(gate) * up; the HVX kernel (a few rows) keeps the gate outputs in VTCM and writes
 // act(gate) * up with each up tile.
 static bool fuse_mul_mat_nx_glu(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
-    if (prev.opcode != HTP_OP_MUL_MAT_NX || prev.outputs.size() != 2 || prev.inputs.size() != 3) return false;
+    if (prev.opcode != HTP_OP_MUL_MAT_NX || prev.outputs.size() != 2) return false;
+    const bool has_norm = prev.kparams<htp_mm_kernel_params>()->norm != 0;
+    if (prev.inputs.size() != (has_norm ? 4u : 3u)) return false;
 
     const ggml_tensor * glu = cur.node;
     const ggml_tensor * a   = glu->src[0];
@@ -324,10 +326,14 @@ static bool fuse_mul_mat_nx_glu(const ggml_hexagon_session * sess, htp_opnode & 
     const ggml_tensor * w_gate = prev.inputs[gate];
     const ggml_tensor * w_up   = prev.inputs[1 - gate];
     const ggml_tensor * x      = prev.inputs[2];
+    const ggml_tensor * norm_w = has_norm ? prev.inputs[3] : nullptr;  // absorbed RMS_NORM+MUL
     // the NX outputs are row-collapsed copies when its activation was collapsed
     const bool collapsed = d0 != a && d0 != b;
 
-    prev.inputs  = { w_gate, w_up, x };
+    prev.inputs = { w_gate, w_up, x };
+    if (norm_w) {
+        prev.inputs.push_back(norm_w);
+    }
     prev.outputs = { collapsed ? prev.add_dummy(htp_tensor_collapse_rows(glu)) : glu };
     prev.fused.push_back(cur.node);
     prev.set_kparams(kparams);
@@ -654,6 +660,29 @@ int htp_fusion_max(const struct ggml_cgraph * graph, int idx) {
     return f;
 }
 
+// Number of matmuls taking node i as their activation when those are all its uses, else 0.
+static uint32_t htp_count_mm_uses(const struct ggml_cgraph * graph, int i) {
+    const ggml_tensor * t = graph->nodes[i];
+    if (t->view_src || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    uint32_t n = 0;
+    for (int j = i + 1; j < graph->n_nodes; j++) {
+        const ggml_tensor * c = graph->nodes[j];
+        if (c->view_src == t) {
+            return 0;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (c->src[s] != t) continue;
+            if (c->op != GGML_OP_MUL_MAT || s != 1) {
+                return 0;
+            }
+            n++;
+        }
+    }
+    return n == (uint32_t) ggml_node_get_use_count(graph, i) ? n : 0;
+}
+
 void htp_fusion_tag_graph(struct ggml_cgraph * graph) {
     for (int i = 0; i < graph->n_nodes; i++) {
         auto * extra = (htp_tensor_extra *) graph->nodes[i]->extra;
@@ -670,7 +699,49 @@ void htp_fusion_tag_graph(struct ggml_cgraph * graph) {
             ggml_node_has_n_uses(graph, i, 1)) {
             extra->flags |= HTP_TENSOR_FUSEABLE;
         }
+
+        extra->n_mm_uses = 0;
+        if (op == GGML_OP_MUL && i > 0 && graph->nodes[i - 1]->op == GGML_OP_RMS_NORM) {
+            extra->n_mm_uses = htp_count_mm_uses(graph, i);
+        }
     }
+}
+
+// An RMS_NORM+MUL right before a MUL_MAT_NX that takes all uses of its output: the NX op
+// normalizes its activation rows itself (kparams.norm), with the norm op's kernel, and the
+// caller drops the norm op.
+bool htp_fusion_try_absorb_norm(const struct htp_opnode & norm, struct htp_opnode & nx) {
+    if (!opt_opfusion || !htp_fusion_enabled(HTP_FUSE_NORM_MUL_MAT_NX)) return false;
+    if (nx.opcode != HTP_OP_MUL_MAT_NX || norm.opcode != HTP_OP_RMS_NORM_MUL) return false;
+    if (norm.inputs.size() != 2 || norm.outputs.size() != 1) return false;
+
+    struct htp_mm_kernel_params kparams = *nx.kparams<htp_mm_kernel_params>();
+    const uint32_t nw = kparams.n_weights;
+    if (kparams.norm || kparams.glu || nx.inputs.size() != nw + 1) return false;
+
+    const ggml_tensor * x   = nx.inputs[nw];
+    const ggml_tensor * src = norm.inputs[0];
+    const ggml_tensor * w   = norm.inputs[1];
+    if (norm.outputs[0] != x || !x->extra) return false;
+    if (((const htp_tensor_extra *) x->extra)->n_mm_uses != nw) return false;
+    if (x->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) return false;
+    if (ggml_nrows(w) != 1 || w->ne[0] != x->ne[0] || !ggml_are_same_shape(src, x)) return false;
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(x) || !ggml_is_contiguous(w)) return false;
+
+    kparams.norm = 1;
+    memcpy(&kparams.norm_eps,   &norm.params[0], sizeof(float));
+    memcpy(&kparams.norm_scale, &norm.params[1], sizeof(float));
+
+    if (nx.fused.size() + 1 + norm.fused.size() > HTP_OP_MAX_FUSED) return false;
+
+    nx.inputs[nw] = src;
+    nx.inputs.push_back(w);
+    nx.fused.push_back(norm.node);
+    for (const ggml_tensor * f : norm.fused) {
+        nx.fused.push_back(f);
+    }
+    nx.set_kparams(kparams);
+    return true;
 }
 
 bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_opnode & prev, const struct htp_opnode & cur) {

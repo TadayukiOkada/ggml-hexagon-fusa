@@ -9,6 +9,7 @@ struct htp_tensor_extra {
     std::vector<std::pair<size_t, size_t>> shadow_ranges;              // parts of a tiled weight uploaded so far
     bool                                   repack_initialized { false }; // the tiled weight holds all rows
     uint32_t                               flags { 0 };
+    uint32_t                               n_mm_uses { 0 };  // RMS_NORM+MUL output used only as the activation of this many matmuls
 };
 
 extern int    opt_arch;

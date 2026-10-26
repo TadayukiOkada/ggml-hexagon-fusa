@@ -1600,6 +1600,15 @@ struct ggml_hexagon_opbatch {
         sync_op_desc(n_ops - 1);
         HEX_VERBOSE("ggml-hex: %s fused %s (N=%zu, #%u)\n",
                     sess->c_name(), last_node.name().c_str(), last_node.fused.size() + 1, n_ops - 1);
+
+        // the NX op takes the place of the RMS_NORM+MUL before it when it normalizes its activation itself
+        if (n_ops >= 2 && htp_fusion_try_absorb_norm(ops[n_ops - 2], last_node)) {
+            ops[n_ops - 2] = last_node;
+            n_ops--;
+            sync_op_desc(n_ops - 1);
+            HEX_VERBOSE("ggml-hex: %s fused RMS_NORM+%s (N=%zu, #%u)\n",
+                        sess->c_name(), ops[n_ops - 1].name().c_str(), ops[n_ops - 1].fused.size() + 1, n_ops - 1);
+        }
         return true;
     }
 };

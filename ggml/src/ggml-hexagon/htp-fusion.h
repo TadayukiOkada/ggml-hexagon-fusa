@@ -17,6 +17,7 @@ enum htp_fusion_flags {
     HTP_FUSE_RMS_NORM_SCALE  = (1 << 11), // 2048
     HTP_FUSE_SSM_CONV_SILU   = (1 << 12), // 4096
     HTP_FUSE_MUL_MAT_NX_GLU  = (1 << 13), // 8192
+    HTP_FUSE_NORM_MUL_MAT_NX = (1 << 14), // 16384
 };
 
 static inline bool htp_fusion_enabled(int flag) {
@@ -30,5 +31,6 @@ bool htp_fusion_can_stack(const struct ggml_tensor * a, const struct ggml_tensor
 int  htp_fusion_max(const struct ggml_cgraph * graph, int idx);
 void htp_fusion_tag_graph(struct ggml_cgraph * graph);
 bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_opnode & prev, const struct htp_opnode & cur);
+bool htp_fusion_try_absorb_norm(const struct htp_opnode & norm, struct htp_opnode & nx);
 
 #endif // HTP_FUSION_H

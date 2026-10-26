@@ -89,6 +89,9 @@ struct htp_mm_kernel_params {
     int32_t  act_row_size;       // Row size for activation scratchpad
     int32_t  vtcm_size;          // Total required scratchpad size in VTCM
     int32_t  vtcm_bias_size;     // bias scratchpad size in VTCM (fused only)
+    int32_t  norm;               // NX: the activation is RMS-normalized and scaled by src[n_weights + 1] first
+    float    norm_eps;           // the RMS_NORM_MUL op params: epsilon and scale (0 = none)
+    float    norm_scale;
 
     // Precomputed division values
     struct fastdiv_values div_ne12_ne1;

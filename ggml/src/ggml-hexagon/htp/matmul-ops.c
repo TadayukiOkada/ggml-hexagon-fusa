@@ -2137,6 +2137,9 @@ typedef struct {
     uint32_t                        dma_step_rows;
     uint32_t                        dma_step_rows_shift;
     uint32_t                        act_elem_size;  // 4=F32 src1, 2=F16 src1
+    const float                   * norm_w;         // RMS norm of each row (times norm_w) before the conversion
+    float                           norm_eps;
+    float                           norm_scale;
 } activation_transfer_task_state_t;
 
 typedef struct {
@@ -2267,7 +2270,10 @@ static void transfer_activation_chunk_to_fp16_dma_pipelined(
         uint32_t act_elem_size,
         struct htp_thread_trace *tr,
         uint32_t dma_step_rows,
-        uint32_t dma_step_rows_shift) {
+        uint32_t dma_step_rows_shift,
+        const float *norm_w,
+        float norm_eps,
+        float norm_scale) {
 
     const uint32_t R = dma_step_rows;
     const uint32_t n_rows_padded = hex_align_up(n_rows, HTP_MM_HMX_TILE_N_ROWS);
@@ -2322,6 +2328,16 @@ static void transfer_activation_chunk_to_fp16_dma_pipelined(
                 bool r0_valid = ((row_idx + 0) < n_rows);
                 bool r1_valid = ((row_idx + 1) < n_rows);
 
+                if (norm_w) {  // fused RMS_NORM+MUL, in place, as the norm op computes it
+                    uint8_t * row0 = curr_buf + (p << 1) * row_bytes;
+                    if (r0_valid) {
+                        hvx_fast_rms_norm_mul_f32(row0, (const uint8_t *) norm_w, row0, k_valid, norm_eps, norm_scale);
+                    }
+                    if (r1_valid) {
+                        hvx_fast_rms_norm_mul_f32(row0 + row_bytes, (const uint8_t *) norm_w, row0 + row_bytes, k_valid, norm_eps, norm_scale);
+                    }
+                }
+
                 transfer_activation_row_pair_fp32_to_fp16(vtcm_dst, pair_buf, pair_buf + k_block, row_idx, k_block, k_valid, r0_valid, r1_valid);
             }
         }
@@ -2352,7 +2368,8 @@ static void transfer_activation_chunk_worker_fn(unsigned int n, unsigned int i, 
 
         uint8_t *thread_act = (uint8_t *) st->vtcm_f32_act + i * st->vtcm_f32_act_bytes_per_thread;
         transfer_activation_chunk_to_fp16_dma_pipelined(
-            st->ctx->dma[i], dst, act_dma_addr, chunk_size, st->k_block, st->k_stride, st->k_valid, thread_act, st->act_elem_size, tr, st->dma_step_rows, st->dma_step_rows_shift
+            st->ctx->dma[i], dst, act_dma_addr, chunk_size, st->k_block, st->k_stride, st->k_valid, thread_act, st->act_elem_size, tr, st->dma_step_rows, st->dma_step_rows_shift,
+            st->norm_w, st->norm_eps, st->norm_scale
         );
     }
 }
@@ -2749,6 +2766,9 @@ struct activation_transfer_params {
     float *                       vtcm_f32_act;
     size_t                        vtcm_f32_act_bytes;
     uint32_t                      act_elem_size;  // 4=F32 src1, 2=F16 src1
+    const float *                 norm_w;         // fused RMS_NORM+MUL of the rows (F32), NULL = none
+    float                         norm_eps;
+    float                         norm_scale;
 };
 
 static void transfer_activation_chunk_threaded(const struct activation_transfer_params * params) {
@@ -2772,7 +2792,8 @@ static void transfer_activation_chunk_threaded(const struct activation_transfer_
     }
 
     const size_t n_tasks = (n_rows + 31) >> 5;
-    if (act_elem_size == sizeof(float) && n_threads > 1 && k_block > 32 && n_tasks < (size_t) n_threads) {
+    // the column split cannot normalize rows: a fused norm takes the row path
+    if (act_elem_size == sizeof(float) && n_threads > 1 && k_block > 32 && n_tasks < (size_t) n_threads && !params->norm_w) {
         // Calculate step rows parameters for column-chunked dma pipelining
         uint32_t dma_step_rows = 2;
         uint32_t dma_step_rows_shift = 1;
@@ -2824,6 +2845,9 @@ static void transfer_activation_chunk_threaded(const struct activation_transfer_
     state.ctx                = ctx;
     state.vtcm_f32_act       = vtcm_f32_act;
     state.act_elem_size = act_elem_size;
+    state.norm_w        = params->norm_w;
+    state.norm_eps      = params->norm_eps;
+    state.norm_scale    = params->norm_scale;
 
     state.vtcm_f32_act_bytes_per_thread = hex_align_down(fastdiv(vtcm_f32_act_bytes, act_threads_div), 128);
 
@@ -3227,6 +3251,11 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     const uint32_t act_elem_size = (act->type == HTP_TYPE_F16) ? sizeof(__fp16) : sizeof(float);
     const int act_stride  = (int) (act->nb[1] / act_elem_size);
     const dma_addr_t act_dma_addr = act->data;
+    // fused RMS_NORM+MUL of the activation rows (F32)
+    const float * norm_w = kparams->norm ? (const float *) octx->src[n_weights + 1]->data : NULL;
+    if (norm_w && act_elem_size != sizeof(float)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
 
     if (k % 32 != 0) { return HTP_STATUS_NO_SUPPORT; }
 
@@ -3356,6 +3385,9 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
                 .vtcm_f32_act = vtcm_f32_act,
                 .vtcm_f32_act_bytes = L.act_f32_bytes,
                 .act_elem_size = act_elem_size,
+                .norm_w        = norm_w,
+                .norm_eps      = kparams->norm_eps,
+                .norm_scale    = kparams->norm_scale,
             };
             transfer_activation_chunk_threaded(&act_params);
 
@@ -3448,6 +3480,9 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
                 .vtcm_f32_act = vtcm_f32_act,
                 .vtcm_f32_act_bytes = L.act_f32_bytes,
                 .act_elem_size = act_elem_size,
+                .norm_w        = norm_w,
+                .norm_eps      = kparams->norm_eps,
+                .norm_scale    = kparams->norm_scale,
             };
             transfer_activation_chunk_threaded(&act_params);
 
@@ -3550,6 +3585,9 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
                 .vtcm_f32_act = vtcm_f32_act,
                 .vtcm_f32_act_bytes = L.act_f32_bytes,
                 .act_elem_size = act_elem_size,
+                .norm_w        = norm_w,
+                .norm_eps      = kparams->norm_eps,
+                .norm_scale    = kparams->norm_scale,
             };
             transfer_activation_chunk_threaded(&act_params);
 
@@ -5006,6 +5044,17 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
     hvx_mm_transfer_act_dma(octx, kparams, act, mmctx->vtcm_act_raw, mmctx->vtcm_act_raw_stride, 0, act_nrows);
+
+    if (kparams->norm) {  // fused RMS_NORM+MUL of the activation rows, in place, as the norm op computes it
+        if (act->type != HTP_TYPE_F32) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+        const uint8_t * w = (const uint8_t *) octx->src[n_weights + 1]->data;
+        for (uint32_t ir = 0; ir < act_nrows; ir++) {
+            uint8_t * row = mmctx->vtcm_act_raw + ir * mmctx->vtcm_act_raw_stride;
+            hvx_fast_rms_norm_mul_f32(row, w, row, act->ne[0], kparams->norm_eps, kparams->norm_scale);
+        }
+    }
 
     mmctx->n_quant_rows_per_thread = (act_nrows + n_quant_tasks - 1) / n_quant_tasks;
     mmctx->n_quant_tasks = n_quant_tasks;
