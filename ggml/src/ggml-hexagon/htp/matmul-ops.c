@@ -122,6 +122,12 @@ struct htp_mm_context {
     uint32_t          n_quant_tasks;
     uint32_t          n_quant_rows_per_thread;
 
+    // activation quantization run inside the matvec job (fused_quant): quant_fn with n_quant_tasks,
+    // then all threads meet at quant_arrived
+    bool              fused_quant;
+    worker_callback_t quant_fn;
+    atomic_uint       quant_arrived;
+
     // Fields for scattered mapping & HMX support in MUL_MAT_ID
     const uint32_t * matrix_row_counts;
     const struct mmid_row_mapping * matrix_rows;
@@ -353,6 +359,18 @@ static void hvx_mm_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
+// One token: the matvec job quantizes the activation itself, after each thread has queued its first
+// weight tiles, so that they stream in meanwhile; the threads then wait for each other.
+static inline void hvx_mm_job_quant_barrier(struct htp_mm_context * mmctx, unsigned int nth, unsigned int ith) {
+    if (ith < mmctx->n_quant_tasks) {
+        mmctx->quant_fn(mmctx->n_quant_tasks, ith, mmctx);
+    }
+    atomic_fetch_add_explicit(&mmctx->quant_arrived, 1, memory_order_release);
+    while (atomic_load_explicit(&mmctx->quant_arrived, memory_order_acquire) < nth) {
+        hex_pause();
+    }
+}
+
 static void hvx_mv_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
@@ -410,6 +428,9 @@ static void hvx_mv_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
         }
     }
 
+    if (mmctx->fused_quant) {
+        hvx_mm_job_quant_barrier(mmctx, nth, ith);
+    }
     if (src0_start_row >= src0_end_row) {
         return;
     }
@@ -465,6 +486,8 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
     const uint32_t n_prefetch = kparams->n_prefetch;
     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
 
+    bool quant_pending = mmctx->fused_quant;  // see hvx_mm_job_quant_barrier: once, after the first prefetch
+
     for (uint32_t widx = 0; widx < n_weights; widx++) {
         const struct htp_tensor * restrict src_w = octx->src[widx];
         const struct htp_tensor * restrict dst   = octx->dsts[widx];
@@ -498,7 +521,13 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
 
         const uint32_t start_row = src0_start_row + src0_nrows_per_thread * ith;
         const uint32_t end_row   = MIN(start_row + src0_nrows_per_thread, src0_end_row);
-        if (start_row >= end_row) continue;
+        if (start_row >= end_row) {
+            if (quant_pending) {
+                hvx_mm_job_quant_barrier(mmctx, nth, ith);
+                quant_pending = false;
+            }
+            continue;
+        }
 
         uint32_t ct_start = start_row / 32;
         uint32_t ct_end   = (end_row + 31) / 32;
@@ -507,6 +536,10 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
         for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
             dma_queue_push(dma_q, dma_make_data(vtcm_weight_ptr + d * tile_row_transfer_size_aligned,
                             src_w_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+        }
+        if (quant_pending) {
+            hvx_mm_job_quant_barrier(mmctx, nth, ith);
+            quant_pending = false;
         }
 
         for (uint32_t ct = ct_start; ct < ct_end; ct++) {
@@ -542,6 +575,9 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
                 push_ct++;
             }
         }
+    }
+    if (quant_pending) {
+        hvx_mm_job_quant_barrier(mmctx, nth, ith);
     }
 }
 
@@ -1925,6 +1961,16 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
 
+    // One token through the tiled matvec: the job quantizes the activation itself while its first
+    // weight tiles load (hvx_mm_job_quant_barrier). The raw activation normally shares VTCM with the
+    // weight tiles, so it moves past the layout.
+    const bool fuse_quant = need_quant && act_nrows == 1 && is_tiled && !is_batched && octx->n_threads > 1 &&
+                            !(kparams->m_chunk > 0 && (uint32_t) kparams->m_chunk < act_nrows) &&
+                            hex_align_up(vtcm_size, 128) + L.act_raw_bytes <= octx->ctx->vtcm_size;
+    if (fuse_quant) {
+        mmctx->vtcm_act_raw = base + hex_align_up(vtcm_size, 128);
+    }
+
     mmctx->vtcm_src0_stride = src0_row_size_padded;
     mmctx->vtcm_act_stride  = act_row_size;
     if (kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK || kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW) {
@@ -1983,7 +2029,14 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             hvx_mm_transfer_act_dma(octx, kparams, act, mmctx->vtcm_act_raw, mmctx->vtcm_act_raw_stride, 0, act_nrows);
             mmctx->n_quant_rows_per_thread = (act_nrows + n_quant_tasks - 1) / n_quant_tasks;
             mmctx->n_quant_tasks = n_quant_tasks;
-            work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
+            // the tiled matvec quantizes inside its job, while its first weight tiles load
+            if (fuse_quant) {
+                mmctx->fused_quant = true;
+                mmctx->quant_fn    = quant_task_func;
+                atomic_store_explicit(&mmctx->quant_arrived, 0, memory_order_relaxed);
+            } else {
+                work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
+            }
         } else {
             hvx_mm_transfer_act_dma(octx, kparams, act, mmctx->vtcm_act, mmctx->vtcm_act_stride, 0, act_nrows);
         }
@@ -4656,6 +4709,15 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
 
+    // A few tokens: the NX job quantizes the activation itself while its first weight tiles load
+    // (hvx_mm_job_quant_barrier). The raw activation normally shares VTCM with the weight tiles, so it
+    // moves past the layout.
+    const bool fuse_quant = act_nrows < octx->n_threads && octx->n_threads > 1 &&
+                            hex_align_up(vtcm_size, 128) + L.act_raw_bytes <= octx->ctx->vtcm_size;
+    if (fuse_quant) {
+        mmctx->vtcm_act_raw = base + hex_align_up(vtcm_size, 128);
+    }
+
     mmctx->vtcm_src0_stride    = 0;
     mmctx->vtcm_act_stride     = act_row_size;
     mmctx->vtcm_act_raw_stride = htp_mm_act_raw_row_size(act->ne[0]);
@@ -4670,7 +4732,14 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
 
     mmctx->n_quant_rows_per_thread = (act_nrows + n_quant_tasks - 1) / n_quant_tasks;
     mmctx->n_quant_tasks = n_quant_tasks;
-    work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
+    // a few tokens: the NX job quantizes inside, while its first weight tiles load
+    if (fuse_quant) {
+        mmctx->fused_quant = true;
+        mmctx->quant_fn    = quant_task_func;
+        atomic_store_explicit(&mmctx->quant_arrived, 0, memory_order_relaxed);
+    } else {
+        work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
+    }
 
     work_queue_run(octx->ctx->work_queue, hvx_mm_nx_2d_tiled, mmctx, octx->n_threads);
 
