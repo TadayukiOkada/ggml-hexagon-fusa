@@ -276,6 +276,54 @@ static bool fuse_mul_mat_nx(const ggml_hexagon_session * sess, htp_opnode & prev
     return true;
 }
 
+// GEGLU / SWIGLU (split form, act(a) * b) of the two outputs of an HMX MUL_MAT_NX: the matmul
+// computes gate and up columns side by side and its store writes act(gate) * up, so neither
+// output goes to DDR.
+static bool fuse_mul_mat_nx_glu(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    GGML_UNUSED(sess);
+    if (prev.opcode != HTP_OP_MUL_MAT_NX || prev.outputs.size() != 2 || prev.inputs.size() != 3) return false;
+
+    const ggml_tensor * glu = cur.node;
+    const ggml_tensor * a   = glu->src[0];
+    const ggml_tensor * b   = glu->src[1];
+    if (!a || !b) return false;
+
+    const ggml_tensor * d0 = prev.outputs[0];
+    const ggml_tensor * d1 = prev.outputs[1];
+    int gate;
+    if (htp_same_tensor_data(a, d0) && htp_same_tensor_data(b, d1)) {
+        gate = 0;
+    } else if (htp_same_tensor_data(a, d1) && htp_same_tensor_data(b, d0)) {
+        gate = 1;
+    } else {
+        return false;
+    }
+
+    if (!htp_tensor_is_fuseable(a) || !htp_tensor_is_fuseable(b)) return false;
+    if ((a->flags | b->flags) & GGML_TENSOR_FLAG_OUTPUT) return false;
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) return false;
+    if (!ggml_are_same_shape(a, glu) || !ggml_are_same_shape(b, glu)) return false;
+    if (!ggml_is_contiguous_rows(glu) || glu->nb[1] != a->nb[1]) return false;
+
+    const auto * kp = prev.kparams<htp_mm_kernel_params>();
+    if (kp->n_weights != 2 || !kp->n_hmx || !kp->pipeline || ((kp->n_chunk / 2) & ~31) == 0) return false;
+
+    struct htp_mm_kernel_params kparams = *kp;
+    kparams.glu = cur.opcode == HTP_OP_GLU_GEGLU ? HTP_MM_GLU_GEGLU : HTP_MM_GLU_SWIGLU;
+
+    const ggml_tensor * w_gate = prev.inputs[gate];
+    const ggml_tensor * w_up   = prev.inputs[1 - gate];
+    const ggml_tensor * x      = prev.inputs[2];
+    // the NX outputs are row-collapsed copies when its activation was collapsed
+    const bool collapsed = d0 != a && d0 != b;
+
+    prev.inputs  = { w_gate, w_up, x };
+    prev.outputs = { collapsed ? prev.add_dummy(htp_tensor_collapse_rows(glu)) : glu };
+    prev.fused.push_back(cur.node);
+    prev.set_kparams(kparams);
+    return true;
+}
+
 static bool fuse_mul_mat_id_nx(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
     if (prev.opcode != HTP_OP_MUL_MAT_ID && prev.opcode != HTP_OP_MUL_MAT_ID_NX) return false;
 
@@ -643,6 +691,9 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
             return htp_fusion_enabled(HTP_FUSE_MUL_MAT_NX) && fuse_mul_mat_nx(sess, prev, cur);
         case HTP_OP_MUL_MAT_ID:
             return htp_fusion_enabled(HTP_FUSE_MUL_MAT_ID_NX) && fuse_mul_mat_id_nx(sess, prev, cur);
+        case HTP_OP_GLU_GEGLU:
+        case HTP_OP_GLU_SWIGLU:
+            return htp_fusion_enabled(HTP_FUSE_MUL_MAT_NX_GLU) && fuse_mul_mat_nx_glu(sess, prev, cur);
         default:
             return false;
     }
