@@ -150,20 +150,6 @@ set(CMAKE_ASM_FLAGS_DEBUG          "${COMMON_FLAGS} ${CMAKE_CXX_FLAGS_DEBUG}")
 set(CMAKE_ASM_FLAGS_RELEASE        "${COMMON_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}")
 set(CMAKE_ASM_FLAGS_RELWITHDEBINFO "${COMMON_FLAGS} ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}" )
 
-# The objects are LLVM bitcode (-flto), so code is generated at link time. The driver hands the
-# optimization level and -mllvm options to that code generator only when -flto is on the link line;
-# without it the code generator gets no options and skips the loop alignment pass.
-# Loop alignment: a branch to a packet that crosses a 16-byte boundary stalls instruction fetch for
-# a cycle (Hexagon V73 Programmer's Reference Manual, 3.3.7), and a loop body that spans one more
-# 32-byte line than it needs costs on every iteration, so the speed of a loop depended on where the
-# linker happened to place it. The loop alignment pass aligns small loops to 32 bytes; raise its
-# limits from 16 HVX / 8 scalar instructions and 4 packets so that the HVX inner loops qualify.
-set(HEXAGON_LOOP_ALIGN_FLAGS "-mllvm -hexagon-hvx-loop-align-limit-ub=64 -mllvm -hexagon-loop-align-limit-ub=32 -mllvm -hexagon-loop-bundle-align-limit=16")
-
-set(CMAKE_SHARED_LINKER_FLAGS_DEBUG          "-flto -O0")
-set(CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO "-flto -O2 ${HEXAGON_LOOP_ALIGN_FLAGS}")
-set(CMAKE_SHARED_LINKER_FLAGS_RELEASE        "-flto -O2 ${HEXAGON_LOOP_ALIGN_FLAGS}")
-
 #Linker Options
 set(CMAKE_C_CREATE_SHARED_LIBRARY   "${HEXAGON_LINKER} ${HEXAGON_PIC_SHARED_LINK_OPTIONS}")
 set(CMAKE_CXX_CREATE_SHARED_LIBRARY "${HEXAGON_LINKER} ${HEXAGON_PIC_SHARED_LINK_OPTIONS}")

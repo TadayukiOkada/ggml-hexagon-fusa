@@ -23,7 +23,6 @@ the commit, its test patch no longer applies (configure stops): delete it.
 
 | Upstream commit | In `main` as | Test patch to delete at the import |
 |---|---|---|
-| `d4d82d67f` hexagon: fix IM2COL patch-embed DMA ring overflow (#30189) | cherry-pick | `tests/patches/0011-im2col-exact-tiling-many-channels.patch` |
 
 The DSP side includes a few ggml headers by paths relative to
 `ggml/src/ggml-hexagon/htp`. They are symlinks into the submodule

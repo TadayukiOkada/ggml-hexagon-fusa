@@ -74,11 +74,6 @@ static inline void htp_mdev_group_barrier(struct htp_ops_context * octx) {
                 htp_ops_context_set_status(octx, HTP_STATUS_INTERNAL_ERR);
                 break;
             }
-#ifdef HTP_YIELD_BETWEEN_OPS
-            // Every caller is between ops (no live VTCM data). A peer can be held up by its
-            // own release, so honor release requests while waiting, as in the fence wait.
-            htp_vtcm_yield(ctx);
-#endif
             hex_pause();
         }
     }

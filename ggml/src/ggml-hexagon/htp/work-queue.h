@@ -19,7 +19,6 @@ void         work_queue_free(work_queue_t q);
 
 void work_queue_wakeup(work_queue_t q);
 void work_queue_suspend(work_queue_t q);
-bool work_queue_is_active(work_queue_t q);
 
 bool work_queue_run_async(work_queue_t q, work_queue_func_t func, void * data, unsigned int n);
 

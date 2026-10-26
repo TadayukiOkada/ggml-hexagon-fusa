@@ -48,17 +48,6 @@ static inline HVX_Vector hvx_vec_splat_f16(_Float16 v) {
     return Q6_Vh_vsplat_R(u.i);
 }
 
-// Bytes (b0, b1, b2, b3) of every word to (b0, b2, b1, b3): the k order of Q4_0 weight tiles and of
-// the activations quantized for them (see repack_q4_0_tiled). The permutation is its own inverse.
-static inline HVX_Vector hvx_vec_swap_mid_bytes(HVX_Vector v) {
-    const HVX_Vector keep = Q6_V_vsplat_R(0xFF0000FF);
-    const HVX_Vector b1   = Q6_V_vsplat_R(0x0000FF00);
-    const HVX_Vector b2   = Q6_V_vsplat_R(0x00FF0000);
-    const HVX_Vector up   = Q6_V_vand_VV(Q6_Vw_vasl_VwR(v, 8), b2);
-    const HVX_Vector down = Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(v, 8), b1);
-    return Q6_V_vor_VV(Q6_V_vand_VV(v, keep), Q6_V_vor_VV(up, down));
-}
-
 static inline HVX_Vector hvx_vec_repl4(HVX_Vector v) {
     // vdelta control to replicate first 4 bytes across all elements
     static const uint8_t __attribute__((aligned(128))) repl[128] = {
@@ -127,6 +116,17 @@ static inline HVX_Vector hvx_vec_step_f32(HVX_Vector v) {
     const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
     HVX_VectorPred q = Q6_Q_vcmp_gt_VsfVsf(v, zero);
     return Q6_V_vmux_QVV(q, one, zero);
+}
+
+static inline HVX_Vector hvx_vec_sgn_f32(HVX_Vector v) {
+    const HVX_Vector zero       = Q6_V_vzero();
+    const HVX_Vector one        = hvx_vec_splat_f32(1.0f);
+    const HVX_Vector sign_mask  = Q6_V_vsplat_R(0x80000000);
+    const HVX_Vector mag        = hvx_vec_abs_f32(v);
+    const HVX_Vector signed_one = Q6_V_vor_VV(one, Q6_V_vand_VV(v, sign_mask));
+    // The ordered magnitude comparison maps NaN and both signed zeros to zero.
+    const HVX_VectorPred nonzero = Q6_Q_vcmp_gt_VsfVsf(mag, zero);
+    return Q6_V_vmux_QVV(nonzero, signed_one, zero);
 }
 
 static inline HVX_Vector hvx_vec_step_f16(HVX_Vector v) {

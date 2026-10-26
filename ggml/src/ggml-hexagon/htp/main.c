@@ -28,8 +28,8 @@
 #include "ggml-common.h"
 #include "hex-bitmap.h"
 #include "htp-ctx.h"
+#include "htp-dcache.h"
 #include "htp-ops.h"
-#include "htp-tensor.h"
 #include "htp_iface.h"
 #include "work-queue.h"
 #include "hex-profile.h"
@@ -287,38 +287,15 @@ AEEResult htp_iface_munmap(remote_handle64 handle, uint32 fd) {
 }
 
 static void vtcm_acquire(struct htp_context * ctx) {
-    if (!ctx->vtcm_valid) {
-        if (ctx->profiler) atomic_store(&ctx->resource_request_us, 0);
-        // Clear before asking, not after: a release request can come as soon as the resources
-        // are granted, and clearing it afterwards lost it, so the holder kept them until its
-        // batch ran out (about 0.5 s for a 512-token prefill) while the requester waited.
-        ctx->vtcm_needs_release = false;
-        // The resource manager takes the caller's thread priority as the request priority. Ask at
-        // the lowered priority the resources are held with (below), so that two sessions on one
-        // CDSP do not take them from each other at every op boundary: a client above both (the
-        // NSP self-test on FuSa firmware) then kept losing the handover to the other session and
-        // waited up to 0.5 s. Sessions now hand over when the holder runs out of work or when a
-        // higher-priority client asks; waiting behind a whole batch is why the wait is retried.
-        qurt_thread_t self = qurt_thread_get_id();
-        const int prio = qurt_thread_get_priority(self);
-        const int low  = ctx->thread_prio + 10;
-        if (prio < low) qurt_thread_set_priority(self, low);
-        int err = 0;
-        for (int i = 0; i < 6; i++) {
-            err = HAP_compute_res_acquire_cached(ctx->vtcm_rctx, 10000000u);
-            if (err == 0) break;
-            FARF(ERROR, "ggml-hex: VTCM not acquired in 10 s (try %d): 0x%08x", i + 1, (unsigned)err);
-        }
-        if (prio < low) qurt_thread_set_priority(self, prio);
+    if (!atomic_load(&ctx->vtcm_valid)) {
+        int err = HAP_compute_res_acquire_cached(ctx->vtcm_rctx, 10000000u);
         if (err != 0) {
             FARF(ERROR, "ggml-hex: failed to acquire VTCM: 0x%08x", (unsigned)err);
             abort();
         }
 
-        ctx->vtcm_valid = true;
-        if (ctx->profiler) {
-            ctx->resource_acquired_us = HAP_perf_get_time_us();
-        }
+        atomic_store(&ctx->vtcm_needs_release, false);
+        atomic_store(&ctx->vtcm_valid, true);
 
         // Drop the priority to make sure we get the release callback from other GGML-HTP and QNN-HTP sessions
         HAP_compute_res_update_priority(ctx->vtcm_rctx, ctx->thread_prio + 10);
@@ -326,44 +303,30 @@ static void vtcm_acquire(struct htp_context * ctx) {
 }
 
 static void vtcm_release(struct htp_context * ctx) {
-    if (ctx->vtcm_valid) {
-        ctx->vtcm_valid         = false;
-        ctx->vtcm_needs_release = false;
+    if (atomic_load(&ctx->vtcm_valid)) {
+        atomic_store(&ctx->vtcm_valid, false);
+        atomic_store(&ctx->vtcm_needs_release, false);
         HAP_compute_res_release_cached(ctx->vtcm_rctx);
-        if (ctx->profiler && ctx->resource_acquired_us) {
-            const uint64_t now = HAP_perf_get_time_us();
-            const uint64_t span = now - ctx->resource_acquired_us;
-            const uint32_t bounded = span > UINT32_MAX ? UINT32_MAX : (uint32_t) span;
-            if (bounded > ctx->resource_hold_max_us) ctx->resource_hold_max_us = bounded;
-            const uint32_t request = atomic_exchange(&ctx->resource_request_us, 0);
-            if (request) {
-                // Low-word subtraction handles clock wrap for bounded request
-                // delays. The callback writes through a native 32-bit atomic.
-                const uint32_t delay = (uint32_t) now - request;
-                if (delay > ctx->resource_response_max_us) ctx->resource_response_max_us = delay;
-                ctx->resource_requests_served++;
-            }
-            ctx->resource_releases++;
-            ctx->resource_acquired_us = 0;
-        }
     }
 }
 
 static int vtcm_release_callback(unsigned int rctx, void * state) {
     struct htp_context * ctx = (struct htp_context *) state;
-    if (ctx->profiler && ctx->vtcm_valid) {
-        unsigned int expected = 0;
-        unsigned int now = (uint32_t) HAP_perf_get_time_us();
-        if (!now) now = 1;
-        atomic_compare_exchange_strong(&ctx->resource_request_us, &expected, now);
-    }
-    ctx->vtcm_needs_release = true;
+    atomic_store(&ctx->vtcm_needs_release, true);
     return 0;
 }
 
-static int vtcm_alloc(struct htp_context * ctx) {
+static unsigned int vtcm_query_size(void) {
     unsigned int vtcm_size = 8 * 1024 * 1024;  // 8MB default
-    HAP_compute_res_query_VTCM(0, &vtcm_size, NULL, NULL, NULL);
+    unsigned int vtcm_avail;
+    compute_res_vtcm_page_t total_layout, avail_layout;
+    // some images (e.g. FuSa cDSP) fail the query when the layout out-params are NULL
+    HAP_compute_res_query_VTCM(0, &vtcm_size, &total_layout, &vtcm_avail, &avail_layout);
+    return vtcm_size;
+}
+
+static int vtcm_alloc(struct htp_context * ctx) {
+    unsigned int vtcm_size = vtcm_query_size();
 
     compute_res_attr_t attr;
     HAP_compute_res_attr_init(&attr);
@@ -390,8 +353,8 @@ static int vtcm_alloc(struct htp_context * ctx) {
     ctx->vtcm_base          = (uint8_t *) vtcm_ptr;
     ctx->vtcm_size          = vtcm_size;
     ctx->vtcm_rctx          = rctx;
-    ctx->vtcm_valid         = false;
-    ctx->vtcm_needs_release = false;
+    atomic_store(&ctx->vtcm_valid, false);
+    atomic_store(&ctx->vtcm_needs_release, false);
 
     return 0;
 }
@@ -408,37 +371,90 @@ static void htp_main_thread(void * context);
 static void htp_packet_callback(dspqueue_t queue, int error, void * context);
 static void htp_error_callback(dspqueue_t queue, int error, void * context);
 
-static int htp_start_main_thread(struct htp_context * ctx) {
-    qurt_thread_attr_t attr;
-    qurt_thread_attr_init(&attr);
-    qurt_thread_attr_set_stack_addr(&attr, ctx->main_stack);
-    qurt_thread_attr_set_stack_size(&attr, MAIN_THREAD_STACK_SIZE);
-    qurt_thread_attr_set_priority(&attr, ctx->thread_prio);
-    qurt_thread_attr_set_name(&attr, "htp-main");
+// Non-BURST modes leave DCVS enabled and keep the HTP awake.
+// BURST pins all corners to MAX and disables DCVS.
+// Corner constants are from HAP_power.h (HAP_dcvs_voltage_corner_t / HAP_dcvs_exp_vcorner_t).
+struct htp_power_profile {
+    boolean  dcvs_enable;
+    uint32_t bus_min_corner;
+    uint32_t bus_max_corner;
+    uint32_t bus_target_corner;
+    uint32_t core_min_corner;
+    uint32_t core_max_corner;
+    uint32_t core_target_corner;
+    boolean  sleep_disable;
+    uint32_t hmx_min_corner;    // only used when __HVX_ARCH__ >= 75
+    uint32_t hmx_max_corner;
+    uint32_t hmx_target_corner;
+    uint32_t hmx_perf_mode;
+};
 
-    atomic_store(&ctx->killed, false);
-    int err = qurt_thread_create(&ctx->main_thread, &attr, htp_main_thread, ctx);
-    if (err) {
-        FARF(ERROR, "Unable to create htp main thread: %d", err);
-        ctx->main_thread = 0;
+#define HTP_POWER_PROFILE_ENTRY(min_c, max_c, hmx_c) \
+    { \
+        .dcvs_enable        = TRUE, \
+        .bus_min_corner     = (min_c), \
+        .bus_max_corner     = (max_c), \
+        .bus_target_corner  = (max_c), \
+        .core_min_corner    = (min_c), \
+        .core_max_corner    = (max_c), \
+        .core_target_corner = (max_c), \
+        .sleep_disable      = TRUE, \
+        .hmx_min_corner     = (hmx_c), \
+        .hmx_max_corner     = (hmx_c), \
+        .hmx_target_corner  = (hmx_c), \
+        .hmx_perf_mode      = HAP_CLK_PERF_HIGH, \
     }
-    return err;
-}
 
-static void htp_stop_main_thread(struct htp_context * ctx) {
-    if (ctx->main_thread) {
-        atomic_store(&ctx->killed, true);
-        int status;
-        (void) qurt_thread_join(ctx->main_thread, &status);
-        ctx->main_thread = 0;
-    }
-}
+static const struct htp_power_profile htp_power_profiles[HTP_POWER_MODE_COUNT] = {
+    [HTP_POWER_MODE_LOW_POWER_SAVER] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_SVS2, HAP_DCVS_VCORNER_SVS2, HAP_DCVS_EXP_VCORNER_MIN_SVS),
+    [HTP_POWER_MODE_POWER_SAVER] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_SVS, HAP_DCVS_VCORNER_SVS_PLUS, HAP_DCVS_EXP_VCORNER_SVS),
+    [HTP_POWER_MODE_HIGH_POWER_SAVER] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_SVS_PLUS, HAP_DCVS_VCORNER_NOM, HAP_DCVS_EXP_VCORNER_SVS_L2),
+    [HTP_POWER_MODE_LOW_BALANCED] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_NOM, HAP_DCVS_VCORNER_NOM_PLUS, HAP_DCVS_EXP_VCORNER_NOM),
+    [HTP_POWER_MODE_BALANCED] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_NOM_PLUS, HAP_DCVS_VCORNER_TURBO, HAP_DCVS_EXP_VCORNER_NOM_L1),
+    [HTP_POWER_MODE_HIGH_PERFORMANCE] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_TURBO, HAP_DCVS_VCORNER_TURBO_PLUS, HAP_DCVS_EXP_VCORNER_TUR_L2),
+    [HTP_POWER_MODE_SUSTAINED_HIGH_PERFORMANCE] =
+        HTP_POWER_PROFILE_ENTRY(HAP_DCVS_VCORNER_NOM_PLUS, HAP_DCVS_VCORNER_TURBO_PLUS, HAP_DCVS_EXP_VCORNER_TUR_L2),
+    [HTP_POWER_MODE_BURST] = {
+        .dcvs_enable        = FALSE,
+        .bus_min_corner     = HAP_DCVS_VCORNER_MAX,
+        .bus_max_corner     = HAP_DCVS_VCORNER_MAX,
+        .bus_target_corner  = HAP_DCVS_VCORNER_MAX,
+        .core_min_corner    = HAP_DCVS_VCORNER_MAX,
+        .core_max_corner    = HAP_DCVS_VCORNER_MAX,
+        .core_target_corner = HAP_DCVS_VCORNER_MAX,
+        .sleep_disable      = TRUE,
+        .hmx_min_corner     = HAP_DCVS_EXP_VCORNER_MAX,
+        .hmx_max_corner     = HAP_DCVS_EXP_VCORNER_MAX,
+        .hmx_target_corner  = HAP_DCVS_EXP_VCORNER_MAX,
+        .hmx_perf_mode      = HAP_CLK_PERF_HIGH,
+    },
+};
 
-AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
+#undef HTP_POWER_PROFILE_ENTRY
+
+AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem, uint32_t power_mode) {
     struct htp_handle * h = (struct htp_handle *) handle;
     if (!h) {
         return AEE_EBADPARM;
     }
+
+    if (power_mode >= HTP_POWER_MODE_COUNT) {
+        FARF(ERROR, "invalid power-mode %u, falling back to burst", (unsigned) power_mode);
+        power_mode = HTP_POWER_MODE_BURST;
+    }
+    const struct htp_power_profile * pwr = &htp_power_profiles[power_mode];
+    FARF(ALWAYS, "power-mode %u : dcvs-enable %d bus[%u,%u,%u] core[%u,%u,%u] sleep-disable %d hmx[%u,%u,%u]",
+         (unsigned) power_mode, (int) pwr->dcvs_enable,
+         (unsigned) pwr->bus_min_corner, (unsigned) pwr->bus_max_corner, (unsigned) pwr->bus_target_corner,
+         (unsigned) pwr->core_min_corner, (unsigned) pwr->core_max_corner, (unsigned) pwr->core_target_corner,
+         (int) pwr->sleep_disable,
+         (unsigned) pwr->hmx_min_corner, (unsigned) pwr->hmx_max_corner, (unsigned) pwr->hmx_target_corner);
 
     if (h->ctx) {
         FARF(ERROR, "Queue already open");
@@ -570,17 +586,17 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
 
         request.type                              = HAP_power_set_DCVS_v3;
         request.dcvs_v3.set_dcvs_enable           = TRUE;
-        request.dcvs_v3.dcvs_enable               = FALSE;
+        request.dcvs_v3.dcvs_enable               = pwr->dcvs_enable;
         request.dcvs_v3.set_bus_params            = TRUE;
-        request.dcvs_v3.bus_params.min_corner     = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.bus_params.max_corner     = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.bus_params.target_corner  = HAP_DCVS_VCORNER_MAX;
+        request.dcvs_v3.bus_params.min_corner     = pwr->bus_min_corner;
+        request.dcvs_v3.bus_params.max_corner     = pwr->bus_max_corner;
+        request.dcvs_v3.bus_params.target_corner  = pwr->bus_target_corner;
         request.dcvs_v3.set_core_params           = TRUE;
-        request.dcvs_v3.core_params.min_corner    = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.core_params.max_corner    = HAP_DCVS_VCORNER_MAX;
-        request.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_MAX;
+        request.dcvs_v3.core_params.min_corner    = pwr->core_min_corner;
+        request.dcvs_v3.core_params.max_corner    = pwr->core_max_corner;
+        request.dcvs_v3.core_params.target_corner = pwr->core_target_corner;
         request.dcvs_v3.set_sleep_disable         = TRUE;
-        request.dcvs_v3.sleep_disable             = TRUE;
+        request.dcvs_v3.sleep_disable             = pwr->sleep_disable;
 
 #if (__HEXAGON_ARCH__ >= 79)
         HAP_set_dcvs_v3_protected_bus_corners(&request, 1);
@@ -608,10 +624,10 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         request.hmx_v2.set_power     = TRUE;
         request.hmx_v2.power_up      = TRUE;
         request.hmx_v2.set_clock     = TRUE;
-        request.hmx_v2.target_corner = HAP_DCVS_EXP_VCORNER_MAX;
-        request.hmx_v2.min_corner    = HAP_DCVS_EXP_VCORNER_MAX;
-        request.hmx_v2.max_corner    = HAP_DCVS_EXP_VCORNER_MAX;
-        request.hmx_v2.perf_mode     = HAP_CLK_PERF_HIGH;
+        request.hmx_v2.target_corner = pwr->hmx_target_corner;
+        request.hmx_v2.min_corner    = pwr->hmx_min_corner;
+        request.hmx_v2.max_corner    = pwr->hmx_max_corner;
+        request.hmx_v2.perf_mode     = pwr->hmx_perf_mode;
         FARF(ALWAYS, "Setting HMX clock\n");
         err = HAP_power_set((void *) ctx, &request);
         if (err != AEE_SUCCESS) {
@@ -661,10 +677,6 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     ctx->ddr_spad_size = 512 * 1024; // 512 KB
     ctx->ddr_spad_base = memalign(128, ctx->ddr_spad_size);
 
-    ctx->fa_mask_flags_size = 64 * 1024;
-    ctx->fa_mask_flags      = memalign(128, ctx->fa_mask_flags_size);
-    ctx->fa_mask_n          = 0;
-
     void * wq_ptr = (void *) ((uintptr_t) block + offset_wq);
     ctx->work_queue = work_queue_init(wq_ptr, n_hvx, WORK_QUEUE_CAPACITY, WORK_QUEUE_STACK_SIZE);
 
@@ -676,7 +688,16 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         // Start main compute thread
         ctx->main_stack = (void *) ((uintptr_t) block + offset_main_stack);
 
-        if (htp_start_main_thread(ctx)) {
+        qurt_thread_attr_t attr;
+        qurt_thread_attr_init(&attr);
+        qurt_thread_attr_set_stack_addr(&attr, ctx->main_stack);
+        qurt_thread_attr_set_stack_size(&attr, size_main_stack);
+        qurt_thread_attr_set_priority(&attr, main_prio);
+        qurt_thread_attr_set_name(&attr, "htp-main");
+
+        int err_thread = qurt_thread_create(&ctx->main_thread, &attr, htp_main_thread, ctx);
+        if (err_thread) {
+            FARF(ERROR, "Unable to create htp main thread: %d", err_thread);
             htp_iface_stop(handle);
             return AEE_ENOMEMORY;
         }
@@ -695,7 +716,12 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
     }
     struct htp_context * ctx = h->ctx;
 
-    htp_stop_main_thread(ctx);
+    if (ctx->main_thread) {
+        atomic_store(&ctx->killed, true);
+        int status;
+        (void) qurt_thread_join(ctx->main_thread, &status);
+        ctx->main_thread = 0;
+    }
 
     int err = dspqueue_close(ctx->dsp_queue); ctx->dsp_queue = NULL;
     if (err != 0) {
@@ -717,10 +743,6 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
 
     vtcm_free(ctx);
 
-    if (ctx->fa_mask_flags) {
-        free(ctx->fa_mask_flags);
-        ctx->fa_mask_flags = NULL;
-    }
     if (ctx->ddr_spad_base) {
         free(ctx->ddr_spad_base);
         ctx->ddr_spad_base = NULL;
@@ -730,45 +752,6 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
     free(ctx);
     h->ctx = NULL;
 
-    return AEE_SUCCESS;
-}
-
-// Switch the session to a new dspqueue created by the host. VTCM, HMX, the mappings and the
-// worker threads stay as they are. Some FastRPC drivers leave a signal that arrived before
-// the host started waiting in the signaled state, after which every blocking read of that
-// queue on the host busy-waits; new signals start clean. The host calls this only while no
-// batches are outstanding.
-AEEResult htp_iface_requeue(remote_handle64 handle, uint64_t dsp_queue_id) {
-    struct htp_handle * h = (struct htp_handle *) handle;
-    if (!h || !h->ctx) {
-        return AEE_EBADPARM;
-    }
-    struct htp_context * ctx = h->ctx;
-
-    // Callbacks could still run on the old queue while the new one is imported
-    if (!ctx->main_stack) {
-        return AEE_EUNSUPPORTED;
-    }
-
-    dspqueue_t dsp_queue = NULL;
-    int err = dspqueue_import(dsp_queue_id, NULL, NULL, (void *) h, &dsp_queue);
-    if (err) {
-        FARF(ERROR, "Queue import failed with 0x%08x", (unsigned) err);
-        return err == AEE_EBADSTATE ? AEE_EFAILED : err;
-    }
-
-    htp_stop_main_thread(ctx);
-
-    err = dspqueue_close(ctx->dsp_queue);
-    if (err != 0) {
-        FARF(ERROR, "Queue close failed with 0x%08x", (unsigned) err);
-    }
-    ctx->dsp_queue = dsp_queue;
-
-    // AEE_EBADSTATE tells the host that the session is lost
-    if (htp_start_main_thread(ctx)) {
-        return AEE_EBADSTATE;
-    }
     return AEE_SUCCESS;
 }
 
@@ -795,28 +778,8 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     *n_hvx     = n_hvx_val;
     *n_hmx     = 1;
 
-    uint32_t vtcm_sz = 8 * 1024 * 1024; // 8MB default fallback
-    HAP_compute_res_query_VTCM(0, (unsigned int *)&vtcm_sz, NULL, NULL, NULL);
-    *vtcm_size = vtcm_sz;
+    *vtcm_size = vtcm_query_size();
 
-    return AEE_SUCCESS;
-}
-
-#ifndef HTP_BUILD_ID
-#define HTP_BUILD_ID "unknown"
-#endif
-
-// The host library carries the same ID and refuses a skel from another build.
-AEEResult htp_iface_build_id(remote_handle64 handle, char * id, int id_len) {
-    (void)handle;
-    if (!id || id_len <= 0) {
-        return AEE_EBADPARM;
-    }
-    if ((size_t) id_len < sizeof(HTP_BUILD_ID)) {
-        id[0] = '\0';
-        return AEE_EBUFFERTOOSMALL;
-    }
-    memcpy(id, HTP_BUILD_ID, sizeof(HTP_BUILD_ID));
     return AEE_SUCCESS;
 }
 
@@ -878,7 +841,7 @@ static int op_fence(struct htp_ops_context * octx) {
     atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
 
     if (mode == 1) {
-        htp_flush_dirty_ranges(ctx);
+        htp_dcache_flush_dirty_ranges(ctx);
 
         htp_mdev_group_barrier(octx);
 
@@ -908,11 +871,6 @@ static int op_fence(struct htp_ops_context * octx) {
             status = HTP_STATUS_INTERNAL_ERR;
             break;
         }
-#ifdef HTP_YIELD_BETWEEN_OPS
-        // A peer can take longer than the FuSa self-test period. Fence waits
-        // have no live VTCM scratch; honor release requests while waiting too.
-        htp_vtcm_yield(ctx);
-#endif
         hex_pause();
     }
 
@@ -987,7 +945,10 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_LOG:
         case HTP_OP_UNARY_RELU:
         case HTP_OP_UNARY_STEP:
+        case HTP_OP_UNARY_CEIL:
+        case HTP_OP_UNARY_SGN:
         case HTP_OP_L2_NORM:
+        case HTP_OP_HADAMARD:
             return op_unary(octx);
 
         case HTP_OP_GLU_SWIGLU:
@@ -996,7 +957,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_GLU_GEGLU:
         case HTP_OP_GLU_GEGLU_QUICK:
         case HTP_OP_GLU_GEGLU_ERF:
-            return op_activations(octx);
+        case HTP_OP_GLU_REGLU:
+        case HTP_OP_GLU_SIGMOID:
+            return op_glu(octx);
 
         case HTP_OP_SOFTMAX:
             return op_softmax(octx);
@@ -1055,6 +1018,9 @@ static int execute_op(struct htp_ops_context * octx) {
 
         case HTP_OP_IM2COL:
             return op_im2col(octx);
+
+        case HTP_OP_IM2COL_3D:
+            return op_im2col_3d(octx);
 
         case HTP_OP_ROLL:
             return op_roll(octx);
@@ -1256,7 +1222,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
     }
 
-    htp_tensor_flush_all(octx->ctx, octx->src, HTP_OP_MAX_INPUTS);
+    htp_dcache_flush_dirty_tensors(octx->ctx, octx->src, HTP_OP_MAX_INPUTS);
 
     // Prep output tensors
     for (uint32_t i = 0; i < HTP_OP_MAX_OUTPUTS; i++) {
@@ -1272,21 +1238,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
-    htp_tensor_dirty_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
-
-    // an op writing over a mask whose flash-attention flags are cached invalidates them
-    struct htp_context * ctx = octx->ctx;
-    for (uint32_t i = 0; i < HTP_OP_MAX_OUTPUTS && ctx->fa_mask_n > 0; i++) {
-        const struct htp_tensor * d = octx->dsts[i];
-        if (!d) continue;
-        for (uint32_t e = 0; e < ctx->fa_mask_n; e++) {
-            const uint32_t m0 = ctx->fa_mask[e].mask, m1 = m0 + ctx->fa_mask[e].nb1 * ctx->fa_mask[e].neq1;
-            if ((uint32_t) d->data < m1 && m0 < (uint32_t) d->data + d->size) {
-                ctx->fa_mask_n = 0;
-                break;
-            }
-        }
-    }
+    htp_dcache_mark_dirty_tensors(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
 
     htp_mdev_group_barrier(octx);
 
@@ -1296,46 +1248,10 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
 
     octx->src0_spad.src = NULL;
     octx->src1_spad.src = NULL;
-    octx->src2_spad.src = NULL;
-    octx->src3_spad.src = NULL;
     octx->dst_spad.src  = NULL;
 
     return octx->status;
 }
-
-#ifdef HTP_YIELD_BETWEEN_OPS
-// Give VTCM and HMX to other clients between ops, not only between batches.
-// A batch can be a whole graph. Some clients (e.g. the NSP self-test on FuSa firmware) fail if they wait that long.
-// VTCM only holds per-op scratch, so this is safe.
-void htp_vtcm_yield(struct htp_context * ctx) {
-    if (!ctx->vtcm_needs_release) {
-        return;
-    }
-
-    // Both queues are woken and suspended together. They are active inside a batch; the
-    // mdev barrier at the end of a batch runs after they are suspended, so leave them so.
-    const bool active = work_queue_is_active(ctx->work_queue);
-
-    if (active) {
-        // The hmx-queue thread holds the HMX lock and the workers spin while active
-        if (ctx->hmx_queue) {
-            hmx_queue_suspend(ctx->hmx_queue);
-            hmx_queue_flush(ctx->hmx_queue);
-        }
-        work_queue_suspend(ctx->work_queue);
-    }
-
-    vtcm_release(ctx);
-    vtcm_acquire(ctx);
-
-    if (active) {
-        work_queue_wakeup(ctx->work_queue);
-        if (ctx->hmx_queue) {
-            hmx_queue_wakeup(ctx->hmx_queue);
-        }
-    }
-}
-#endif // HTP_YIELD_BETWEEN_OPS
 
 static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf) {
     dspqueue_t queue = ctx->dsp_queue;
@@ -1383,7 +1299,6 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
     hex_l2fetch_block(ctx, ctx->footprint);
     memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
-    ctx->fa_mask_n = 0;  // the host rewrites the masks between batches
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
@@ -1393,10 +1308,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     prep_tensors(ctx, bufs, tens, n_tens);
 
     struct htp_ops_context *octx = &ctx->octx;
-    memset(octx, 0, sizeof(*octx));
-    octx->n_threads     = ctx->n_threads;
-    octx->n_threads_div = ctx->n_threads_div;
-    octx->ctx           = ctx;
+    htp_ops_context_reset(octx, ctx);
 
     mdev_group_init(ctx, req);
 
@@ -1427,12 +1339,6 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
                 pds[i].pmu[j] = prof.pmu_counters[j];
             }
         }
-
-#ifdef HTP_YIELD_BETWEEN_OPS
-        if (i + 1 < n_ops) {
-            htp_vtcm_yield(ctx);
-        }
-#endif
     }
 
     if (ctx->hmx_queue) {
@@ -1460,18 +1366,6 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.usecs        = batch_prof.usecs;
     rsp.cycles_start = batch_prof.cycles_start;
     rsp.cycles_stop  = batch_prof.cycles_stop;
-    if (ctx->profiler) {
-        const uint64_t now = HAP_perf_get_time_us();
-        uint64_t open_span = ctx->resource_acquired_us ? now - ctx->resource_acquired_us : 0;
-        if (open_span > UINT32_MAX) open_span = UINT32_MAX;
-        rsp.resource_hold_max_us = ctx->resource_hold_max_us > open_span ?
-            ctx->resource_hold_max_us : (uint32_t) open_span;
-        rsp.resource_response_max_us = ctx->resource_response_max_us;
-        rsp.resource_requests_served = ctx->resource_requests_served;
-        rsp.resource_releases = ctx->resource_releases;
-        const uint32_t request = atomic_load(&ctx->resource_request_us);
-        rsp.resource_pending_us = request ? (uint32_t) now - request : 0;
-    }
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
@@ -1500,7 +1394,7 @@ static void process_ops(struct htp_context * ctx) {
 
     vtcm_acquire(ctx);
 
-    while (!ctx->vtcm_needs_release && !atomic_load(&ctx->killed)) {
+    while (!atomic_load(&ctx->vtcm_needs_release) && !atomic_load(&ctx->killed)) {
         struct htp_opbatch_req req;
         uint32_t r_size = sizeof(req);
 
@@ -1510,12 +1404,6 @@ static void process_ops(struct htp_context * ctx) {
 
         err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &dbuf, r_size, &r_size, (uint8_t *) &req);
         if (err == AEE_EWOULDBLOCK) {
-#ifdef HTP_YIELD_BETWEEN_OPS
-            // Do not hold VTCM/HMX while the queue is empty. A release request that arrives while
-            // polling is not reliably seen, so another client could otherwise wait for the whole
-            // stream of short batches (up to 51 ms measured on v73 with back-to-back small graphs).
-            vtcm_release(ctx);
-#endif
             if (--poll_count) {
                 qurt_sleep(DSPQUEUE_POLL_TIMEOUT_USEC);
                 continue;
@@ -1536,9 +1424,6 @@ static void process_ops(struct htp_context * ctx) {
         // Reset poll count for valid requests
         poll_count = DSPQUEUE_POLL_COUNT;
 
-#ifdef HTP_YIELD_BETWEEN_OPS
-        vtcm_acquire(ctx);
-#endif
         process_opbatch(ctx, &req, &dbuf);
     }
 
