@@ -129,6 +129,11 @@ struct htp_mm_context {
     worker_callback_t quant_fn;
     atomic_uint       quant_arrived;
 
+    // fused GLU in the HVX NX kernel: gate outputs [act_nrows][glu_stride] and per-thread up tiles
+    float *  vtcm_glu_gate;
+    float *  vtcm_glu_up;
+    uint32_t glu_stride;
+
     // Fields for scattered mapping & HMX support in MUL_MAT_ID
     const uint32_t * matrix_row_counts;
     const struct mmid_row_mapping * matrix_rows;
@@ -469,6 +474,18 @@ static void hvx_mv_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
+// fused GLU store of one output column tile (n <= 32 values), gate and up in VTCM
+static inline void hvx_mm_glu_store(float * dst, const float * gate, const float * up, uint32_t n, uint32_t glu) {
+    const HVX_Vector g = hvx_vmem(gate);
+    const HVX_Vector u = hvx_vmem(up);
+    const HVX_Vector v = glu == HTP_MM_GLU_GEGLU ? hvx_vec_geglu_f32(g, u) : hvx_vec_swiglu_f32(g, u);
+    if (n == 32) {
+        hvx_vmemu(dst) = v;
+    } else {
+        hvx_vec_store_u(dst, n * sizeof(float), v);
+    }
+}
+
 static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
     struct htp_mm_context * mmctx = data;
     struct htp_ops_context * octx = mmctx->octx;
@@ -487,13 +504,19 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
     const uint32_t n_prefetch = kparams->n_prefetch;
     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
 
+    // fused GLU: the gate outputs go to VTCM, the up tile to a scratch, and the store writes act(gate) * up
+    const uint32_t glu = kparams->glu;
+    float * restrict glu_up = mmctx->vtcm_glu_up + ith * 64;
+
     bool quant_pending = mmctx->fused_quant;  // see hvx_mm_job_quant_barrier: once, after the first prefetch
 
     for (uint32_t widx = 0; widx < n_weights; widx++) {
         const struct htp_tensor * restrict src_w = octx->src[widx];
-        const struct htp_tensor * restrict dst   = octx->dsts[widx];
+        const struct htp_tensor * restrict dst   = glu ? octx->dsts[0] : octx->dsts[widx];
         if (!src_w || !dst) continue;
         dma_queue * dma_q = octx->ctx->dma[ith];
+        const bool glu_gate = glu && widx == 0;
+        const bool glu_out  = glu && widx == 1;
 
         const uint32_t tile_size = htp_tensor_get_tile_size(src_w->type);
         const uint32_t aligned_tile_size = htp_mm_hvx_vtcm_tile_stride(src_w->type);
@@ -558,15 +581,33 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
                 float * restrict dst_row1 = (float *) (dst->data + ((ir1+1) * dst_row_size));
                 float * dst_ptr0 = &dst_row0[ct * 32];
                 float * dst_ptr1 = &dst_row1[ct * 32];
+                float * gate0    = mmctx->vtcm_glu_gate + (ir1 + 0) * mmctx->glu_stride + ct * 32;
+                float * gate1    = gate0 + mmctx->glu_stride;
 
-                mmctx->vec_dot_32x2(ne10, dst_ptr0, dst_ptr1, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);
+                if (glu_gate) {
+                    mmctx->vec_dot_32x2(ne10, gate0, gate1, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);
+                } else if (glu_out) {
+                    mmctx->vec_dot_32x2(ne10, glu_up, glu_up + 32, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);
+                    hvx_mm_glu_store(dst_ptr0, gate0, glu_up, valid_rows, glu);
+                    hvx_mm_glu_store(dst_ptr1, gate1, glu_up + 32, valid_rows, glu);
+                } else {
+                    mmctx->vec_dot_32x2(ne10, dst_ptr0, dst_ptr1, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);
+                }
             }
 
             for (; ir1 < act_nrows; ++ir1) {
                 const uint8_t * restrict act_col = (const uint8_t *) (act_data + ir1 * act_stride);
                 float * restrict dst_row = (float *) (dst->data + (ir1 * dst_row_size));
                 float * dst_ptr = &dst_row[ct * 32];
-                mmctx->vec_dot_32x1(ne10, dst_ptr, w_tile, act_col, valid_rows, NULL);
+                float * gate    = mmctx->vtcm_glu_gate + ir1 * mmctx->glu_stride + ct * 32;
+                if (glu_gate) {
+                    mmctx->vec_dot_32x1(ne10, gate, w_tile, act_col, valid_rows, NULL);
+                } else if (glu_out) {
+                    mmctx->vec_dot_32x1(ne10, glu_up, w_tile, act_col, valid_rows, NULL);
+                    hvx_mm_glu_store(dst_ptr, gate, glu_up, valid_rows, glu);
+                } else {
+                    mmctx->vec_dot_32x1(ne10, dst_ptr, w_tile, act_col, valid_rows, NULL);
+                }
             }
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
 
@@ -4920,7 +4961,14 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, act->ne[0], act_nrows, octx->n_threads,
                                  0, src0_row_size, act_row_size, 0, kparams->n_prefetch, false, true);
 
-    const size_t vtcm_size = L.total_bytes;
+    size_t vtcm_size = L.total_bytes;
+    if (kparams->glu) {
+        if (kparams->n_weights != 2) {
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+        mmctx->glu_stride = hex_round_up(src0->ne[1], 32);
+        vtcm_size = hex_align_up(vtcm_size, 128) + htp_mm_hvx_glu_vtcm_size(act_nrows, src0->ne[1], octx->n_threads);
+    }
 
     if (octx->ctx->vtcm_size < vtcm_size) {
         FARF(ERROR, "matmul-nx: current VTCM reservation %zu is too small, needed %zu\n",
@@ -4933,6 +4981,10 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     mmctx->vtcm_act      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act);
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
+    if (kparams->glu) {
+        mmctx->vtcm_glu_up   = (float *) (base + hex_align_up(L.total_bytes, 128));
+        mmctx->vtcm_glu_gate = mmctx->vtcm_glu_up + octx->n_threads * 64;
+    }
 
     // A few tokens: the NX job quantizes the activation itself while its first weight tiles load
     // (hvx_mm_job_quant_barrier). The raw activation normally shares VTCM with the weight tiles, so it

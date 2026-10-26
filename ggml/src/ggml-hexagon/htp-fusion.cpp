@@ -276,11 +276,11 @@ static bool fuse_mul_mat_nx(const ggml_hexagon_session * sess, htp_opnode & prev
     return true;
 }
 
-// GEGLU / SWIGLU (split form, act(a) * b) of the two outputs of an HMX MUL_MAT_NX: the matmul
-// computes gate and up columns side by side and its store writes act(gate) * up, so neither
-// output goes to DDR.
+// GEGLU / SWIGLU (split form, act(a) * b) of the two outputs of a MUL_MAT_NX, so neither output
+// goes to DDR. On HMX the matmul computes gate and up columns side by side and its store writes
+// act(gate) * up; the HVX kernel (a few rows) keeps the gate outputs in VTCM and writes
+// act(gate) * up with each up tile.
 static bool fuse_mul_mat_nx_glu(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
-    GGML_UNUSED(sess);
     if (prev.opcode != HTP_OP_MUL_MAT_NX || prev.outputs.size() != 2 || prev.inputs.size() != 3) return false;
 
     const ggml_tensor * glu = cur.node;
@@ -306,7 +306,17 @@ static bool fuse_mul_mat_nx_glu(const ggml_hexagon_session * sess, htp_opnode & 
     if (!ggml_is_contiguous_rows(glu) || glu->nb[1] != a->nb[1]) return false;
 
     const auto * kp = prev.kparams<htp_mm_kernel_params>();
-    if (kp->n_weights != 2 || !kp->n_hmx || !kp->pipeline || ((kp->n_chunk / 2) & ~31) == 0) return false;
+    if (kp->n_weights != 2) return false;
+    if (kp->n_hmx) {
+        if (!kp->pipeline || ((kp->n_chunk / 2) & ~31) == 0) return false;
+    } else {
+        // the HVX kernel (a few rows) keeps the gate outputs in VTCM and writes act(gate) * up with each up tile
+        const ggml_tensor * x0 = prev.inputs[2];
+        const uint32_t act_nrows = (uint32_t) (x0->ne[1] * x0->ne[2] * x0->ne[3]);
+        const size_t   vtcm      = hex_align_up((size_t) kp->vtcm_size, 128) +
+                                   htp_mm_hvx_glu_vtcm_size(act_nrows, (uint32_t) a->ne[0], kp->n_threads);
+        if (kp->kernel_type != HTP_MM_KERNEL_HVX_QUANT_ROW || vtcm > htp_session_vtcm_size(sess)) return false;
+    }
 
     struct htp_mm_kernel_params kparams = *kp;
     kparams.glu = cur.opcode == HTP_OP_GLU_GEGLU ? HTP_MM_GLU_GEGLU : HTP_MM_GLU_SWIGLU;
