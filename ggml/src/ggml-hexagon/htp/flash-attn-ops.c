@@ -49,6 +49,7 @@ struct hvx_fa_ddr_spad {
 
 struct hmx_fa_ddr_spad {
     uint16_t active_blocks[FA_MAX_KV_BLOCKS];
+    uint8_t  zero_blocks[FA_MAX_KV_BLOCKS];   // per active block: the mask is all +-0
     __fp16   slopes[] __attribute__((aligned(128))); // [g_br]
 };
 
@@ -190,6 +191,8 @@ struct hmx_fa_context {
 };
 
 // Scan mask rows [q_start, q_start + n_rows_q) and build compact list of KV blocks with any entry != -inf.
+// With zero_blocks, also flag the active blocks whose mask is all +-0: the softmax can ignore it there
+// (adding zero, nothing below the threshold).
 static uint32_t fa_scan_active_blocks(
         dma_queue *               dma_q,
         const struct htp_tensor * mask,
@@ -202,7 +205,8 @@ static uint32_t fa_scan_active_blocks(
         uint32_t                  n_kv_blocks,
         void *                    vtcm_scratch,
         size_t                    scratch_bytes,
-        uint16_t *                active_blocks) {
+        uint16_t *                active_blocks,
+        uint8_t *                 zero_blocks) {
     const size_t row_bytes  = (size_t) nek1 * sizeof(__fp16);
     const size_t row_stride = hex_round_up(row_bytes, 128);
 
@@ -211,6 +215,9 @@ static uint32_t fa_scan_active_blocks(
         #pragma clang loop vectorize(disable)
         for (uint32_t b = 0; b < n_kv_blocks; ++b) {
             active_blocks[b] = (uint16_t) b;
+            if (zero_blocks) {
+                zero_blocks[b] = 0;
+            }
         }
         return n_kv_blocks;
     }
@@ -220,12 +227,15 @@ static uint32_t fa_scan_active_blocks(
     const uint8_t * m_buf = (const uint8_t *) dma_queue_pop(dma_q).dst;
 
     const HVX_Vector v_ninf   = Q6_Vh_vsplat_R(0xFC00);
+    const HVX_Vector v_mag    = Q6_Vh_vsplat_R(0x7FFF);
     uint32_t         n_active = 0;
 
     for (uint32_t b = 0; b < n_kv_blocks; ++b) {
         const uint32_t col0 = b * Bc;
         const uint32_t cols = MIN(Bc, nek1 - col0);
 
+        bool       active = false;
+        HVX_Vector v_nz   = Q6_V_vzero();  // OR of the magnitudes of the rows seen so far
         for (uint32_t r = 0; r < n_rows_q; ++r) {
             const __fp16 * row_ptr = (const __fp16 *) (m_buf + r * row_stride) + col0;
             HVX_Vector v_any = Q6_V_vzero();
@@ -233,6 +243,7 @@ static uint32_t fa_scan_active_blocks(
             for (; c + 64 <= cols; c += 64) {
                 const HVX_Vector v_m = *(const HVX_Vector *) (row_ptr + c);
                 v_any = Q6_V_vor_VV(v_any, Q6_V_vxor_VV(v_m, v_ninf));
+                v_nz  = Q6_V_vor_VV(v_nz, Q6_V_vand_VV(v_m, v_mag));
             }
             if (c < cols) {
                 const uint32_t rem = cols - c;
@@ -240,6 +251,7 @@ static uint32_t fa_scan_active_blocks(
                 const HVX_Vector v_m = *(const HVX_Vector *) (row_ptr + c);
                 const HVX_Vector v_diff = Q6_V_vand_QV(q_rem, Q6_V_vxor_VV(v_m, v_ninf));
                 v_any = Q6_V_vor_VV(v_any, v_diff);
+                v_nz  = Q6_V_vor_VV(v_nz, Q6_V_vand_QV(q_rem, Q6_V_vand_VV(v_m, v_mag)));
             }
             v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 64));
             v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 32));
@@ -247,14 +259,28 @@ static uint32_t fa_scan_active_blocks(
             v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 8));
             v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 4));
             if (Q6_R_vextract_VR(v_any, 0) != 0) {
-                active_blocks[n_active++] = (uint16_t) b;
-                break;
+                active = true;
+                if (!zero_blocks) {
+                    break;
+                }
             }
+            if (zero_blocks && active && Q6_R_vextract_VR(hvx_vec_reduce_max_i32(v_nz), 0) != 0) {
+                break;  // active, and not all zero
+            }
+        }
+        if (active) {
+            if (zero_blocks) {
+                zero_blocks[n_active] = Q6_R_vextract_VR(hvx_vec_reduce_max_i32(v_nz), 0) == 0;
+            }
+            active_blocks[n_active++] = (uint16_t) b;
         }
     }
 
     if (n_active == 0 && n_kv_blocks > 0) {
         active_blocks[0] = 0;
+        if (zero_blocks) {
+            zero_blocks[0] = 0;
+        }
         n_active = 1;
     }
     return n_active;
@@ -388,7 +414,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             if (!factx->shared_active_blocks && mp_base != prev_mp_base) {
                 n_active_blocks = fa_scan_active_blocks(
                     dma_q, mask, iq1, 1, im2, im3, nek1, FLASH_ATTN_BLOCK_SIZE,
-                    factx->n_blocks, spad_k, factx->size_k_block * 2, thread_active_blocks);
+                    factx->n_blocks, spad_k, factx->size_k_block * 2, thread_active_blocks, NULL);
                 prev_mp_base = mp_base;
             }
         }
@@ -2318,12 +2344,14 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             const size_t   n_row_tiles = g_br_actual / HMX_FP16_TILE_N_ROWS;
 
             uint16_t * active_blocks = ddr->active_blocks;
+            uint8_t *  zero_blocks   = NULL;  // the active blocks whose mask is all +-0 (softmax without the mask)
             uint32_t n_active_blocks = factx.n_kv_blocks;
             if (mask && factx.mask_broadcast && factx.n_kv_blocks > 1) {
                 const size_t scratch_bytes = factx.k_tile_bytes * (factx.pipeline ? 2 : 1);
+                zero_blocks     = ddr->zero_blocks;
                 n_active_blocks = fa_scan_active_blocks(
                     dma_q, mask, q_start, n_rows_q, 0, im3, nek1, Bc,
-                    factx.n_kv_blocks, factx.vtcm_k_tiles[0], scratch_bytes, active_blocks);
+                    factx.n_kv_blocks, factx.vtcm_k_tiles[0], scratch_bytes, active_blocks, zero_blocks);
             } else {
                 #pragma clang loop vectorize(disable)
                 for (uint32_t b = 0; b < factx.n_kv_blocks; ++b) {
@@ -2502,8 +2530,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.q_start              = q_start;
                         sargs.ib3                  = ib3;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
-                        sargs.mask                 = mask;
-                        sargs.mask_vtcm            = current_mask_vtcm;
+                        sargs.mask                 = (zero_blocks && zero_blocks[step]) ? NULL : mask;
+                        sargs.mask_vtcm            = sargs.mask ? current_mask_vtcm : NULL;
                         sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                         sargs.slopes               = factx.vtcm_slopes;
 
@@ -2628,8 +2656,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.q_start              = q_start;
                         sargs.ib3                  = ib3;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
-                        sargs.mask                 = mask;
-                        sargs.mask_vtcm            = current_mask_vtcm;
+                        sargs.mask                 = (zero_blocks && zero_blocks[step]) ? NULL : mask;
+                        sargs.mask_vtcm            = sargs.mask ? current_mask_vtcm : NULL;
                         sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                         sargs.slopes               = factx.vtcm_slopes;
                         fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
@@ -2900,7 +2928,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     if (has_mask && neq1 == 1 && neq3 == 1 && mask->ne[2] == 1 && factx.n_blocks > 1 && factx.n_blocks <= FA_MAX_KV_BLOCKS) {
         factx.n_active_blocks = fa_scan_active_blocks(
             octx->ctx->dma[0], mask, 0, 1, 0, 0, k->ne[1], FLASH_ATTN_BLOCK_SIZE,
-            factx.n_blocks, factx.spad_k, factx.size_k_block * 2, factx.ddr->active_blocks);
+            factx.n_blocks, factx.spad_k, factx.size_k_block * 2, factx.ddr->active_blocks, NULL);
         factx.shared_active_blocks = true;
     }
 
