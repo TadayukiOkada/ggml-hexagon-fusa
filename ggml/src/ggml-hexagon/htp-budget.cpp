@@ -103,8 +103,13 @@ static bool htp_mul_mat_within_budget(const struct ggml_hexagon_session * sess, 
     }
 #endif
 
+    // Weights take the HMX rate: on HMX, and for a few rows (decode) on HVX, where the bytes bound
+    // the time. F16/F32/BF16 weights that HMX does not take over many rows (K not a multiple of 32,
+    // such as the SigLIP FFN down projection with K = 4304: 107 ms for 1024 tokens) run at the HVX rate.
+    const bool hvx_float = (kernel_type == HTP_MM_KERNEL_HVX_F16_F16_VTCM || kernel_type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||
+                            kernel_type == HTP_MM_KERNEL_HVX_BF16_F32_VTCM) && ggml_nrows(src1) > 32;
     const double flops = 2.0 * src0->ne[0] * src0->ne[1] * ggml_nrows(src1);
-    const double rate  = src0_weight ? 5.0e9 : htp_mm_flop_per_ms(kernel_type);
+    const double rate  = src0_weight && !hvx_float ? 5.0e9 : htp_mm_flop_per_ms(kernel_type);
     const double est   = (std::max)(flops / rate, (double) ggml_nbytes(src0) / 45.0e6);
     return htp_budget_check(sess, op, est);
 }
