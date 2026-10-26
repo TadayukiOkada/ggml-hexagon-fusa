@@ -62,6 +62,7 @@
 #include "htp-common.h"
 #include "htp-kparams.h"
 #include "htp-fusion.h"
+#include "htp-budget.h"
 
 using intvec  = std::vector<int>;
 using uintvec = std::vector<unsigned int>;
@@ -3010,7 +3011,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         default:
-            supp = htp_kparams_check(sess, op);
+            supp = htp_kparams_check(sess, op) && htp_op_within_budget(sess, op);
             break;
     }
 
@@ -3418,6 +3419,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
     const char * str_power_mode = getenv("GGML_HEXAGON_POWER_MODE");
+    const char * str_budget   = getenv("GGML_HEXAGON_OP_BUDGET_MS");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -3446,6 +3448,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     // Update vmem default
     opt_vmem  = opt_arch >= 75 ? HTP_OP_MAX_VMEM_DEFAULT : 3000 * MiB;
     opt_dma64 = opt_arch > 79 && (!str_dma64 || atoi(str_dma64) != 0);
+    if (str_budget) {
+        opt_op_budget_ms = atof(str_budget);
+    }
 
     auto RE_ICASE = std::regex_constants::icase;
 

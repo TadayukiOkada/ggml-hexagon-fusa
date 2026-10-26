@@ -93,6 +93,8 @@ endif()
 set(TARGET_NAME ggml-hexagon)
 ggml_add_backend_library(${TARGET_NAME}
     ggml-hexagon.cpp
+    htp-budget.cpp
+    htp-budget.h
     htp-common.h
     htp-kparams.cpp
     htp-kparams.h
