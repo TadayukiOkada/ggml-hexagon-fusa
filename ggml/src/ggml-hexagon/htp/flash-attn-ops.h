@@ -333,7 +333,8 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                                          bool     is_q_fp32,
                                          bool     has_sinks,
                                          size_t   n_heads,
-                                         size_t   q_split) {
+                                         size_t   q_split,
+                                         bool     causal) {
     const size_t T       = HMX_FP16_TILE_N_ROWS;  // 32
     const size_t br_unit = hmx_ceil_div(T, gqa_factor);
     const size_t bc_unit = HMX_FP16_TILE_N_COLS * 2;  // 64
@@ -374,7 +375,20 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
 
                 const size_t c_iter_actual  = c_iter_base + c_softmax * vecs_per_t;
                 const size_t q_blocks_nsp   = (q_blocks + q_split - 1) / (q_split ? q_split : 1);
-                const size_t cost           = q_blocks_nsp * (c_q_fixed + kv_blocks * c_iter_actual);
+
+                // causal: Q block b needs the KV blocks up to its last row only (the kernel skips
+                // blocks its mask rows fully mask), the past tokens all, so smaller Q blocks do less
+                size_t kv_iters = q_blocks * kv_blocks;
+                if (causal && kv_len >= qo_len) {
+                    kv_iters = 0;
+                    for (size_t b = 0; b < q_blocks; b++) {
+                        const size_t last = kv_len - qo_len + (b + 1) * Br;  // KV rows seen by the block
+                        const size_t need = (last + Bc - 1) / Bc;
+                        kv_iters += need < kv_blocks ? need : kv_blocks;
+                    }
+                }
+                const size_t kv_iters_nsp   = (kv_iters + q_split - 1) / (q_split ? q_split : 1);
+                const size_t cost           = q_blocks_nsp * c_q_fixed + kv_iters_nsp * c_iter_actual;
                 const size_t mn             = Br * Bc;
 
                 if (cost < best_cost || (cost == best_cost && mn > best_mn)) {

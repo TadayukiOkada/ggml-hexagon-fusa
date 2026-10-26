@@ -421,7 +421,9 @@ static bool htp_kparams_solve_flash_attn(
         const uint32_t DK_pad = hex_round_up(DK, 64);
         const uint32_t DV_pad = hex_round_up(DV, 64);
         size_t Br = 0, Bc = 0;
-        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size);
+        // a mask over several query rows is taken to be causal (the kernel skips fully masked KV blocks)
+        const bool causal = mask != nullptr && neq1 > 1;
+        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size, causal);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
             if (logit_softcap == 0.0f) {
