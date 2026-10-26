@@ -1643,6 +1643,13 @@ static inline void fa_softmax_impl(
 
         HVX_Vector v_m_diff_f16   = hvx_vec_f32_to_f16(v_m_diff0, v_m_diff1);
         HVX_Vector exp_m_diff_f16 = fa_exp2_f16(v_m_diff_f16);
+        if (factx->sinks != NULL) {
+            // fa_exp2_f16(0) is off by an ulp. Without a sink O and l absorb the same factor,
+            // but the sink term is added in f32 at the end: keep the rescale of a row whose
+            // maximum did not change exactly 1 so the error does not compound over the blocks.
+            const HVX_VectorPred q_same = Q6_Q_vcmp_eq_VhVh(Q6_V_vand_VV(v_m_diff_f16, Q6_Vh_vsplat_R(0x7fff)), Q6_V_vzero());
+            exp_m_diff_f16 = Q6_V_vmux_QVV(q_same, Q6_Vh_vsplat_R(0x3c00), exp_m_diff_f16);
+        }
 
         HVX_VectorPair exp_m_diff_pair = hvx_vec_f16_to_f32(exp_m_diff_f16);
         HVX_Vector exp_m_diff0 = Q6_V_lo_W(exp_m_diff_pair);
