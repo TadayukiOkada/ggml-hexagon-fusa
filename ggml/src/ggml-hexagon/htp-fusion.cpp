@@ -316,6 +316,9 @@ static bool fuse_mul_mat_add(const ggml_hexagon_session * sess, htp_opnode & pre
     const ggml_tensor * src2 = nullptr;
     if (!htp_match_consumer(prev, cur, /*commutative=*/ true, &src2)) return false;
     if (src2->type != GGML_TYPE_F32) return false;
+    // the fused kernels read src2 in rows of dst->ne[0] (broadcast along dims 1-3 only), so a
+    // residual broadcast along ne0, like the [1, C] bias of a conv output, stays a separate ADD
+    if (src2->ne[0] != cur.dst()->ne[0]) return false;
 
     const ggml_tensor * src0 = prev.node->src[0];
     const ggml_tensor * src1 = prev.node->src[1];
