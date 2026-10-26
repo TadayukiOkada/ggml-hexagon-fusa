@@ -240,6 +240,11 @@ static bool fuse_rms_norm_mul_add_scale(const ggml_hexagon_session * sess, htp_o
     return true;
 }
 
+// the tiled HVX kernels with a quantized activation (row- or block-wise quantization)
+static inline bool htp_mm_kernel_is_hvx_quant(int kernel_type) {
+    return kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK;
+}
+
 // SCALE, TANH, SCALE on the output of a matrix-vector product (the final logit softcap) run in the
 // epilogue of the tiled HVX matvec, one step at a time (kparams.post).
 static bool fuse_mul_mat_post(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
@@ -256,7 +261,7 @@ static bool fuse_mul_mat_post(const ggml_hexagon_session * sess, htp_opnode & pr
     const ggml_tensor * x   = prev.inputs[1];
     const ggml_tensor * mo  = prev.dst();
     const ggml_tensor * out = cur.dst();
-    if (kp->n_hmx || kp->kernel_type != HTP_MM_KERNEL_HVX_QUANT_ROW || !htp_is_tiled_weight_tensor(w)) return false;
+    if (kp->n_hmx || !htp_mm_kernel_is_hvx_quant(kp->kernel_type) || !htp_is_tiled_weight_tensor(w)) return false;
     if (ggml_nrows(x) != 1 || w->ne[2] * w->ne[3] != 1) return false;
     if (cur.node->src[0] != mo || !htp_tensor_is_fuseable(mo)) return false;
     if (out->type != GGML_TYPE_F32 || mo->type != GGML_TYPE_F32 || !ggml_are_same_shape(out, mo) ||
