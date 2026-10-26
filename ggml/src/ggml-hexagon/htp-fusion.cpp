@@ -260,7 +260,8 @@ static bool fuse_mul_mat_post(const ggml_hexagon_session * sess, htp_opnode & pr
     const ggml_tensor * w   = prev.inputs[0];
     const ggml_tensor * x   = prev.inputs[1];
     const ggml_tensor * mo  = prev.dst();
-    const ggml_tensor * out = cur.dst();
+    // the graph node, not cur.dst(): a long SCALE / TANH row runs reshaped into several rows
+    const ggml_tensor * out = cur.node;
     if (kp->n_hmx || !htp_mm_kernel_is_hvx_quant(kp->kernel_type) || !htp_is_tiled_weight_tensor(w)) return false;
     if (ggml_nrows(x) != 1 || w->ne[2] * w->ne[3] != 1) return false;
     if (cur.node->src[0] != mo || !htp_tensor_is_fuseable(mo)) return false;
