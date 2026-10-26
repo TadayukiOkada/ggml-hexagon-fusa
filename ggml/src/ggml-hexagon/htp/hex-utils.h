@@ -51,6 +51,16 @@ static inline void hex_l2flush(void * addr, size_t size) {
     }
 }
 
+// write back (keep) the lines of [addr, addr + size)
+static inline void hex_l2clean(void * addr, size_t size) {
+    if (size == 0) return;
+    const uint32_t s = ((uint32_t) addr) & ~(HEX_L2_LINE_SIZE - 1);
+    const uint32_t e = (((uint32_t) addr) + size + HEX_L2_LINE_SIZE - 1) & ~(HEX_L2_LINE_SIZE - 1);
+    for (uint32_t i = s; i < e; i += HEX_L2_LINE_SIZE) {
+        Q6_dccleana_A((void *) i);
+    }
+}
+
 static inline void hex_pause() {
     asm volatile(" pause(#255)\n");
 }
