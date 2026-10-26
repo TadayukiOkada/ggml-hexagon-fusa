@@ -351,6 +351,11 @@ int op_allreduce(struct htp_ops_context * octx) {
                 htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
                 return HTP_STATUS_INTERNAL_ERR;
             }
+#ifdef HTP_YIELD_BETWEEN_OPS
+            // A peer can take longer than the FuSa self-test period. Nothing lives in VTCM
+            // across this wait (before the reduction, or after it is written out).
+            htp_vtcm_yield(octx->ctx);
+#endif
             hex_pause();
         }
     }
@@ -464,6 +469,11 @@ int op_allreduce(struct htp_ops_context * octx) {
                 htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
                 return HTP_STATUS_INTERNAL_ERR;
             }
+#ifdef HTP_YIELD_BETWEEN_OPS
+            // A peer can take longer than the FuSa self-test period. Nothing lives in VTCM
+            // across this wait (before the reduction, or after it is written out).
+            htp_vtcm_yield(octx->ctx);
+#endif
             hex_pause();
         }
     }
