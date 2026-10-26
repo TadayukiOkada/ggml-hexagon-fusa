@@ -502,6 +502,60 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset,
         });
 }
 
+// IQ4_NL keeps the tile layout of the other 4-bit types, which its kernels read (Q4_0 has its own, above).
+static void repack_iq4_nl_tiled(ggml_tensor * t, const void * data, size_t offset, size_t size) {
+    repack_to_tiled_grid_32<block_q4_0, 1>(t, data, offset, size, HTP_TENSOR_TILE_SIZE_Q4_0,
+        [](uint8_t * tile_dst, const block_q4_0 * src_slice, int64_t ne0, int64_t ne1, int64_t row_stride, int ct, int kt) {
+            ggml_half * scale_dst = (ggml_half *) (tile_dst + 512);
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            if (ct * 32 + 32 <= ne1 && kt < ne0 / 32) {
+                for (int row0 = 0; row0 < 32; row0 += 8) {
+                    const uint8_t * qs[8];
+                    for (int rr = 0; rr < 8; ++rr) {
+                        qs[rr] = src_slice[(ct * 32 + row0 + rr) * row_stride + kt].qs;
+                    }
+                    repack_neon_4bit_rows(qs, tile_dst, row0);
+                }
+
+                for (int row = 0; row < 32; ++row) {
+                    scale_dst[row] = src_slice[(ct * 32 + row) * row_stride + kt].d;
+                }
+                return;
+            }
+#endif
+            uint8_t tile_quants[32][32];
+            for (int row = 0; row < 32; row++) {
+                const int64_t r = ct * 32 + row;
+                if (r < ne1 && kt < ne0 / 32) {
+                    const block_q4_0 & b = src_slice[r * row_stride + kt];
+                    unpack_nibbles_32(tile_quants[row], b.qs);
+                    scale_dst[row] = b.d;
+                } else {
+                    memset(tile_quants[row], 8, 32);
+                    scale_dst[row] = 0;
+                }
+            }
+            transpose_nibbles_to_tile(tile_dst, tile_quants);
+        });
+}
+
+static void repack_tiled_iq4_nl(void * data, const ggml_tensor * t, size_t offset, size_t size) {
+    unpack_from_tiled_grid_32<block_q4_0, 1>(data, t, offset, size, HTP_TENSOR_TILE_SIZE_Q4_0,
+        [](block_q4_0 * dst_slice, const uint8_t * tile_src, int64_t ne0, int64_t start_row, int64_t end_row, int64_t row_stride, int ct, int kt) {
+            uint8_t tile_quants[32][32];
+            transpose_tile_to_nibbles(tile_quants, tile_src);
+            const ggml_half * scale_src = (const ggml_half *) (tile_src + 512);
+            for (int row = 0; row < 32; row++) {
+                const int64_t r = ct * 32 + row;
+                if (r >= start_row && r < end_row && kt < ne0 / 32) {
+                    block_q4_0 & b = dst_slice[(r - start_row) * row_stride + kt];
+                    pack_nibbles_32(b.qs, tile_quants[row]);
+                    b.d = scale_src[row];
+                }
+            }
+        });
+}
+
 static void repack_q4_1_tiled(ggml_tensor * t, const void * data, size_t offset, size_t size) {
     repack_to_tiled_grid_32<block_q4_1, 1>(t, data, offset, size, HTP_TENSOR_TILE_SIZE_Q4_1,
         [](uint8_t * tile_dst, const block_q4_1 * src_slice, int64_t ne0, int64_t ne1, int64_t row_stride, int ct, int kt) {
@@ -1546,8 +1600,10 @@ void htp_repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t siz
             repack_q1_0_tiled(tensor, data, 0, size);
             break;
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_IQ4_NL:
             repack_q4_0_tiled(tensor, data, 0, size);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            repack_iq4_nl_tiled(tensor, data, 0, size);
             break;
         case GGML_TYPE_Q4_1:
             repack_q4_1_tiled(tensor, data, 0, size);
@@ -1601,8 +1657,10 @@ void htp_unpack_tensor_tiled(void * data, const ggml_tensor * tensor, size_t off
             repack_tiled_q1_0(data, tensor, offset, size);
             break;
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_IQ4_NL:
             repack_tiled_q4_0(data, tensor, offset, size);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            repack_tiled_iq4_nl(data, tensor, offset, size);
             break;
         case GGML_TYPE_Q4_1:
             repack_tiled_q4_1(data, tensor, offset, size);
