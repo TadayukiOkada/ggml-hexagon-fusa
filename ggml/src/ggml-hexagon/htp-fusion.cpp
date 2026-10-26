@@ -188,9 +188,37 @@ static bool fuse_rms_norm_mul_rope(const ggml_hexagon_session * sess, htp_opnode
     return true;
 }
 
+// Residual ADD of an RMS_NORM+MUL output (post-norms, gemma): x = x + rms_norm(y) * w. The norm op
+// DMAs the residual rows next to its input rows and adds them, with the ADD op's vector add, before
+// the output leaves VTCM.
+static bool fuse_rms_norm_mul_add(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (prev.opcode != HTP_OP_RMS_NORM_MUL || prev.inputs.size() != 2) return false;
+
+    const ggml_tensor * res = nullptr;
+    if (!htp_match_consumer(prev, cur, /*commutative=*/ true, &res)) return false;
+
+    const ggml_tensor * src0 = prev.inputs[0];
+    const ggml_tensor * w    = prev.inputs[1];
+    const ggml_tensor * dst  = cur.dst();
+    if (res->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (!ggml_are_same_shape(res, dst) || !ggml_are_same_shape(prev.dst(), dst)) return false;
+    if (!ggml_is_contiguous(res) || !ggml_is_contiguous(dst) || !ggml_is_contiguous(prev.dst())) return false;
+    if (htp_inputs_overlap_unsafe(prev, dst, res)) return false;
+
+    struct htp_unary_kernel_params kparams;
+    if (!htp_kparams_solve_rms_norm_mul_add(sess, src0, w, dst, &kparams)) return false;
+
+    prev.inputs  = { src0, w, res };
+    prev.outputs = { dst };
+    prev.fused.push_back(cur.node);
+    prev.set_kparams(kparams);
+    return true;
+}
+
 static bool fuse_rms_norm_scale(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
     GGML_UNUSED(sess);
     if (prev.opcode != HTP_OP_RMS_NORM && prev.opcode != HTP_OP_RMS_NORM_MUL) return false;
+    if (prev.opcode == HTP_OP_RMS_NORM_MUL && prev.inputs.size() > 2) return false;  // the residual is added after the scale
     if (!htp_match_consumer(prev, cur, /*commutative=*/ false)) return false;
 
     const ggml_tensor * src0 = prev.src0();
@@ -781,6 +809,7 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
     switch (cur.opcode) {
         case HTP_OP_ADD:
             return (htp_fusion_enabled(HTP_FUSE_ALLREDUCE_ADD) && fuse_allreduce_add(sess, prev, cur)) ||
+                   (htp_fusion_enabled(HTP_FUSE_RMS_NORM_ADD)  && fuse_rms_norm_mul_add(sess, prev, cur)) ||
                    (htp_fusion_enabled(HTP_FUSE_MUL_MAT_ADD)   && fuse_mul_mat_add(sess, prev, cur))   ||
                    (htp_fusion_enabled(HTP_FUSE_BINARY_NX)     && fuse_binary_nx(sess, prev, cur));
         case HTP_OP_MUL:

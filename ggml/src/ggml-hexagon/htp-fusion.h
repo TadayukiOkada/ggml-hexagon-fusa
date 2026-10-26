@@ -19,6 +19,7 @@ enum htp_fusion_flags {
     HTP_FUSE_MUL_MAT_NX_GLU  = (1 << 13), // 8192
     HTP_FUSE_NORM_MUL_MAT_NX = (1 << 14), // 16384
     HTP_FUSE_RMS_NORM_ROPE   = (1 << 15), // 32768
+    HTP_FUSE_RMS_NORM_ADD    = (1 << 16), // 65536
 };
 
 static inline bool htp_fusion_enabled(int flag) {

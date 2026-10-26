@@ -1509,7 +1509,8 @@ static bool htp_kparams_solve_unary_impl(
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     const struct ggml_tensor * dst,
-    struct htp_unary_kernel_params * kparams
+    struct htp_unary_kernel_params * kparams,
+    bool add_src2 = false
 ) {
     memset(kparams, 0, sizeof(*kparams));
 
@@ -1592,7 +1593,11 @@ static bool htp_kparams_solve_unary_impl(
     htp_unary_solve_layout(&L, op, src0->ne[0], dst->ne[0],
                            op == HTP_OP_RMS_NORM_MUL ? src1->ne[0] : 0,
                            max_block, broadcast_weight, n_threads, vtcm_size, elem_size,
-                           &col_tile, &vtcm_row_per_thread);
+                           &col_tile, &vtcm_row_per_thread, add_src2);
+    kparams->add_src2 = add_src2 ? 1 : 0;
+    if (add_src2 && col_tile > 0) {
+        return false;  // the residual rides on the row-block path only
+    }
 
     kparams->col_tile  = col_tile;
     kparams->vtcm_size = L.total_bytes;
@@ -1627,6 +1632,16 @@ bool htp_kparams_solve_rms_norm_mul(
     struct htp_unary_kernel_params * kparams
 ) {
     return htp_kparams_solve_unary_impl(sess, HTP_OP_RMS_NORM_MUL, src0, src1, dst, kparams);
+}
+
+bool htp_kparams_solve_rms_norm_mul_add(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * dst,
+    struct htp_unary_kernel_params * kparams
+) {
+    return htp_kparams_solve_unary_impl(sess, HTP_OP_RMS_NORM_MUL, src0, src1, dst, kparams, true);
 }
 
 bool htp_kparams_solve_repeat_get_rows(
