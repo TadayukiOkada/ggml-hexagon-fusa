@@ -114,6 +114,15 @@ static bool htp_mul_mat_within_budget(const struct ggml_hexagon_session * sess, 
     return htp_budget_check(sess, op, est);
 }
 
+// GATED_DELTA_NET has no point where VTCM could be released. On v73 (QCS9075) it takes about
+// 0.27-0.32 us per token and V head with 128x128 states (0.64 us with few tokens per sequence):
+// 2047 tokens x 2 sequences x 48 heads, 53 ms. Estimate at 0.7 us, scaled by the state size.
+static double htp_estimate_gdn_ms(const struct ggml_tensor * op) {
+    const struct ggml_tensor * v = op->src[2];
+    const double s = (double) v->ne[0] / 128.0;
+    return 0.7e-3 * (double) v->ne[1] * v->ne[2] * v->ne[3] * s * s;
+}
+
 bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     if (opt_op_budget_ms <= 0) {
         return true;
@@ -128,6 +137,8 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
             return htp_budget_check(sess, op, htp_estimate_sort_ms(op->src[0], op->ne[0], n_threads));
         case GGML_OP_MUL_MAT:
             return htp_mul_mat_within_budget(sess, op);
+        case GGML_OP_GATED_DELTA_NET:
+            return htp_budget_check(sess, op, htp_estimate_gdn_ms(op));
 #ifndef GGML_HEXAGON_HTP_YIELD_IN_OPS
         case GGML_OP_SOFT_MAX:
             // Without rounds the whole op holds VTCM: about 1.7 G elements/s on v73 (attention scores
