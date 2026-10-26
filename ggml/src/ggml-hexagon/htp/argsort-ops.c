@@ -1022,11 +1022,12 @@ static int op_sort_common(struct htp_ops_context * octx, bool is_top_k) {
     // Each thread sorts whole rows. Run the rows in rounds of about 5 ms per thread, so VTCM/HMX
     // can be given away between rounds when a release is requested; a row is staged within its
     // round. Per-row cost fitted on v73 (us per element), as in the host's op budget estimate.
+    // A thread takes whole cache lines of dst rows (rows_per_chunk), so a round can be longer.
     float elem_us;
     if (!is_top_k) {
         elem_us = ne00 <= 512 ? 0.05f : 1.1f;
     } else {
-        elem_us = (ne00 % 128 == 0 && k <= 128) ? 0.1f : 0.8f;
+        elem_us = (ne00 % 128 == 0 && k <= 128) ? 0.2f : (k <= 128 ? 0.3f : 0.8f);
     }
     const uint32_t row_us     = (uint32_t) (elem_us * (float) ne00) + 1;
     uint32_t       per_thread = MAX(1u, 5000u / row_us);

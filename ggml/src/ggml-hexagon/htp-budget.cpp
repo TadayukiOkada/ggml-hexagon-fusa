@@ -19,14 +19,21 @@ static bool htp_budget_check(const struct ggml_hexagon_session * sess, const str
 // release it between rounds when the skel is built with yield inside ops.
 // Fitted to v73 (QCS9075, 4 HVX threads): a single row is sorted by all threads, several rows
 // one per thread; ARGSORT rows above 512 and TOP_K rows that are not a multiple of 128 or take
-// a large k go through much slower paths.
-static double htp_estimate_sort_ms(const struct ggml_tensor * src0, int64_t k, uint32_t n_threads) {
+// a large k go through much slower paths. With llama.cpp caa8191df a 151936-wide TOP_K row takes
+// 27 ms on one thread, a 524288-wide single row 15 ms and an 8193-wide row about 1.3 ms.
+static double htp_estimate_sort_ms(const struct ggml_tensor * src0, const struct ggml_tensor * dst, int64_t k, uint32_t n_threads) {
     const double n      = (double) src0->ne[0];
     const int64_t nrows = ggml_nrows(src0);
 #ifdef GGML_HEXAGON_HTP_YIELD_IN_OPS
-    // Several rows run in rounds with a yield point between them: only one row per thread counts.
-    const double rounds = 1.0;
+    // Several rows run in rounds with a yield point between them. A thread takes whole cache lines
+    // of dst rows in a round, so a round holds that many rows, or all of them if there are fewer.
+    const uint32_t dst_row_bytes = (uint32_t) (dst->ne[0] * sizeof(int32_t));
+    uint32_t a = dst_row_bytes, b = 128;
+    while (b) { const uint32_t t = a % b; a = b; b = t; }
+    const double rounds = (double) (std::min)((int64_t) (128 / a), nrows);
+    GGML_UNUSED(n_threads);
 #else
+    GGML_UNUSED(dst);
     const double rounds = (double) ((nrows + n_threads - 1) / n_threads);
 #endif
 
@@ -42,9 +49,10 @@ static double htp_estimate_sort_ms(const struct ggml_tensor * src0, int64_t k, u
     }
 
     if (src0->ne[0] % 128 == 0 && k <= 128) {
-        return nrows == 1 ? 0.1e-3 * n / n_threads : 0.1e-3 * n * rounds;
+        return nrows == 1 ? 0.15e-3 * n / n_threads : 0.2e-3 * n * rounds;
     }
-    return 0.8e-3 * n * rounds;
+    // 8193-wide rows with k <= 32 take about 0.16 us per element
+    return (k <= 128 ? 0.3e-3 : 0.8e-3) * n * rounds;
 }
 
 // Matmul FLOP per ms for the op budget when src0 is not a weight (attention keys and values),
@@ -132,9 +140,9 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
 
     switch (op->op) {
         case GGML_OP_ARGSORT:
-            return htp_budget_check(sess, op, htp_estimate_sort_ms(op->src[0], -1, n_threads));
+            return htp_budget_check(sess, op, htp_estimate_sort_ms(op->src[0], op, -1, n_threads));
         case GGML_OP_TOP_K:
-            return htp_budget_check(sess, op, htp_estimate_sort_ms(op->src[0], op->ne[0], n_threads));
+            return htp_budget_check(sess, op, htp_estimate_sort_ms(op->src[0], op, op->ne[0], n_threads));
         case GGML_OP_MUL_MAT:
             return htp_mul_mat_within_budget(sess, op);
         case GGML_OP_GATED_DELTA_NET:
