@@ -93,6 +93,15 @@ CPU-only copies, buffer-clear `memset` and physical DMA/DRAM traffic are outside
 this capture. Initialization and lazy weight loads are included; buffer usage
 and application lifecycle markers are needed to separate them from inference.
 
+When a batch has no response for `GGML_HEXAGON_DIAG_WAIT` seconds (default 10,
+`0` turns it off), the backend asks the DSP where its main thread is and logs a
+warning (and a `dsp_diag` trace record) every that many seconds until the
+batch completes: the phase and how long it has been in it, the batch and op,
+VTCM acquire in progress, release requests and in-op yields so far, and the
+state of the worker and HMX queues. It is a separate FastRPC call, so it
+answers while the main thread is stuck. The words are listed at
+`htp_iface_diag()` in `htp/main.c`.
+
 Queue records pair successful batch submissions with received DSP responses
 (`HTP_STATUS_OK=1`). `batch_submit.queued_ops` counts published descriptors;
 `graph_dispatch.queued_ops` counts enqueue attempts before queue fusion. These

@@ -286,8 +286,15 @@ AEEResult htp_iface_munmap(remote_handle64 handle, uint32 fd) {
     return AEE_SUCCESS;
 }
 
+static inline void diag_phase(struct htp_context * ctx, uint32_t phase) {
+    ctx->diag.phase_us = (uint32_t) HAP_perf_get_time_us();
+    ctx->diag.phase    = phase;
+}
+
 static void vtcm_acquire(struct htp_context * ctx) {
     if (!atomic_load(&ctx->vtcm_valid)) {
+        uint32_t t0 = (uint32_t) HAP_perf_get_time_us();
+        ctx->diag.acquire_us = t0 ? t0 : 1;
         if (ctx->profiler) atomic_store(&ctx->resource_request_us, 0);
         // Clear before asking, not after: a release request can come as soon as the resources
         // are granted, and clearing it afterwards lost it, so the holder kept them until its
@@ -305,8 +312,10 @@ static void vtcm_acquire(struct htp_context * ctx) {
         if (prio < low) qurt_thread_set_priority(self, low);
         int err = 0;
         for (int i = 0; i < 6; i++) {
+            ctx->diag.acquire_tries++;
             err = HAP_compute_res_acquire_cached(ctx->vtcm_rctx, 10000000u);
             if (err == 0) break;
+            ctx->diag.acquire_err = (uint32_t) err;
             FARF(ERROR, "ggml-hex: VTCM not acquired in 10 s (try %d): 0x%08x", i + 1, (unsigned)err);
         }
         if (prio < low) qurt_thread_set_priority(self, prio);
@@ -316,6 +325,7 @@ static void vtcm_acquire(struct htp_context * ctx) {
         }
 
         atomic_store(&ctx->vtcm_valid, true);
+        ctx->diag.acquire_us = 0;
         if (ctx->profiler) {
             ctx->resource_acquired_us = HAP_perf_get_time_us();
         }
@@ -358,6 +368,7 @@ static int vtcm_release_callback(unsigned int rctx, void * state) {
         atomic_compare_exchange_strong(&ctx->resource_request_us, &expected, now);
     }
     atomic_store(&ctx->vtcm_needs_release, true);
+    ctx->diag.n_release_cb++;
     return 0;
 }
 
@@ -895,6 +906,49 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
 #endif
 
 // The host library carries the same ID and refuses a skel from another build.
+// Where the main thread is (see struct htp_diag), for a host whose batch does not complete.
+// Runs on a FastRPC thread while the main thread may be stuck, so it only reads.
+AEEResult htp_iface_diag(remote_handle64 handle, uint32_t * words, int n_words) {
+    struct htp_handle * h = (struct htp_handle *) handle;
+    if (!h || !h->ctx || !words || n_words < HTP_DIAG_WORDS) {
+        return AEE_EBADPARM;
+    }
+    struct htp_context * ctx = h->ctx;
+    const struct htp_diag * d = &ctx->diag;
+
+    memset(words, 0, n_words * sizeof(uint32_t));
+    words[0]  = 1;  // layout version
+    words[1]  = (uint32_t) HAP_perf_get_time_us();
+    words[2]  = d->phase;
+    words[3]  = d->phase_us;
+    words[4]  = d->batch_seq;
+    words[5]  = d->n_ops;
+    words[6]  = d->op_idx;
+    words[7]  = d->opcode;
+    words[8]  = d->n_batches;
+    words[9]  = d->n_yields;
+    words[10] = d->n_release_cb;
+    words[11] = d->acquire_us;
+    words[12] = d->acquire_tries;
+    words[13] = d->acquire_err;
+    words[14] = atomic_load(&ctx->vtcm_valid);
+    words[15] = atomic_load(&ctx->vtcm_needs_release);
+    words[16] = atomic_load(&ctx->killed);
+    if (ctx->work_queue) {
+        work_queue_diag(ctx->work_queue, &words[17]);
+    }
+    if (ctx->hmx_queue) {
+        hmx_queue_t q = ctx->hmx_queue;
+        words[23] = atomic_load(&q->idx_write);
+        words[24] = atomic_load(&q->idx_read);
+        words[25] = q->idx_pop;
+        words[26] = q->hmx_locked;
+        words[27] = atomic_load(&q->seqn);
+    }
+    words[28] = ctx->main_stack ? (uint32_t) qurt_thread_get_priority(ctx->main_thread) : 0;
+    return AEE_SUCCESS;
+}
+
 AEEResult htp_iface_build_id(remote_handle64 handle, char * id, int id_len) {
     (void)handle;
     if (!id || id_len <= 0) {
@@ -1406,6 +1460,11 @@ void htp_vtcm_yield(struct htp_context * ctx) {
         return;
     }
 
+    const uint32_t phase    = ctx->diag.phase;
+    const uint32_t phase_us = ctx->diag.phase_us;
+    ctx->diag.n_yields++;
+    diag_phase(ctx, HTP_DIAG_YIELD_SUSPEND);
+
     // Both queues are woken and suspended together. They are active inside a batch; the
     // mdev barrier at the end of a batch runs after they are suspended, so leave them so.
     const bool active = work_queue_is_active(ctx->work_queue);
@@ -1422,12 +1481,15 @@ void htp_vtcm_yield(struct htp_context * ctx) {
     vtcm_release(ctx);
     vtcm_acquire(ctx);
 
+    diag_phase(ctx, HTP_DIAG_YIELD_WAKEUP);
     if (active) {
         work_queue_wakeup(ctx->work_queue);
         if (ctx->hmx_queue) {
             hmx_queue_wakeup(ctx->hmx_queue);
         }
     }
+    ctx->diag.phase_us = phase_us;
+    ctx->diag.phase    = phase;
 }
 #endif // HTP_YIELD_BETWEEN_OPS
 
@@ -1459,6 +1521,12 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     struct htp_tensor*   tens = (struct htp_tensor*)    m_ptr; m_ptr += t_size;
     struct htp_op_desc*   ops = (struct htp_op_desc*)   m_ptr; m_ptr += o_size;
     struct htp_prof_desc* pds = (struct htp_prof_desc*) m_ptr;
+
+    ctx->diag.batch_seq = (uint32_t) req->seq;
+    ctx->diag.n_ops     = n_ops;
+    ctx->diag.op_idx    = 0;
+    ctx->diag.opcode    = 0;
+    diag_phase(ctx, HTP_DIAG_BATCH_PREP);
 
     struct profile_data batch_prof;
     profile_start(HTP_PROF_BASIC, &batch_prof);
@@ -1503,6 +1571,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 
         profile_start(ctx->profiler, &prof);
 
+        ctx->diag.op_idx = i;
+        ctx->diag.opcode = ops[i].opcode;
+        diag_phase(ctx, HTP_DIAG_OP);
+
         op_status = proc_op_req(octx, bufs, n_bufs, tens, i, &ops[i]);
 
         profile_stop(ctx->profiler, &prof);
@@ -1526,6 +1598,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 #endif
     }
 
+    diag_phase(ctx, HTP_DIAG_BATCH_END);
     if (ctx->hmx_queue) {
         hmx_queue_suspend(ctx->hmx_queue);
         hmx_queue_flush(ctx->hmx_queue);
@@ -1537,6 +1610,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
+    diag_phase(ctx, HTP_DIAG_BARRIER);
     htp_mdev_group_barrier(octx);
 
     profile_stop(HTP_PROF_BASIC, &batch_prof);
@@ -1573,10 +1647,13 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     struct dspqueue_buffer write_dbuf = *dbuf;
     write_dbuf.flags = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
 
+    diag_phase(ctx, HTP_DIAG_RESPONSE);
     err = dspqueue_write(queue, 0, 1, &write_dbuf, sizeof(rsp), (const uint8_t *) &rsp, DSPQUEUE_TIMEOUT_NONE);
     if (err != 0) {
         FARF(ERROR, "dspqueue_write failed: 0x%08x", (unsigned) err);
     }
+    ctx->diag.n_batches++;
+    diag_phase(ctx, HTP_DIAG_POLL);
 }
 
 #define DSPQUEUE_READ_TIMEOUT_USEC 5000
@@ -1589,6 +1666,7 @@ static void process_ops(struct htp_context * ctx) {
 
     uint32_t poll_count = DSPQUEUE_POLL_COUNT;
 
+    diag_phase(ctx, HTP_DIAG_POLL);
     vtcm_acquire(ctx);
 
     while (!atomic_load(&ctx->vtcm_needs_release) && !atomic_load(&ctx->killed)) {
@@ -1655,6 +1733,7 @@ static void htp_main_thread(void * context) {
         uint32_t num_buffers = 0;
         uint32_t message_length = 0;
 
+        if (ctx->diag.phase != HTP_DIAG_IDLE) diag_phase(ctx, HTP_DIAG_IDLE);
         int err = dspqueue_peek(ctx->dsp_queue, &flags, &num_buffers, &message_length, 50000);
         if (err == 0) {
             process_ops(ctx);

@@ -154,6 +154,7 @@ int    opt_optrace   = 0;    // trace buffer size per thread (0 means default)
 int    opt_oppoll    = 0;    // batch completions: 0 = blocking, 1 = spin, 2 = sleep between polls
 int    opt_opfusion  = 1;    // enable/disable op fusion
 static int opt_qrecover = 1; // re-create a dspqueue whose blocking reads busy-wait (0 = off, 2 = after every sync, for testing)
+static int opt_diag_wait = 10; // seconds without a batch response before asking the DSP where it is (0 = never)
 int    opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = quantized only (default), 2 = always
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
@@ -394,6 +395,7 @@ struct ggml_hexagon_session {
     void flush_pending(bool all = true);
     void note_queue_wait(uint64_t wall_ns, uint64_t cpu_ns);
     void requeue();
+    void report_dsp_state(uint64_t waited_ms);
 
     ggml_hexagon_shared_buffer * mmap_tensor(const ggml_tensor * t);
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
@@ -1889,6 +1891,36 @@ void ggml_hexagon_session::requeue() {
                   this->c_name(), this->n_requeue);
 }
 
+// Ask the DSP where its main thread is (htp_iface_diag) while a batch does not complete.
+// The words are the layout of htp_iface_diag() in htp/main.c.
+void ggml_hexagon_session::report_dsp_state(uint64_t waited_ms) {
+    uint32_t w[32] = {};
+    int err = htp_iface_diag(this->handle, w, 32);
+    if (err != 0) {
+        GGML_LOG_WARN("ggml-hex: %s batch %" PRIu64 " not done after %" PRIu64 " ms; DSP state query failed: 0x%08x\n",
+                      this->c_name(), (uint64_t) this->batch_rsp_seq + 1, waited_ms, (unsigned) err);
+        hex_io_trace.record("dsp_diag", c_name(), ",\"waited_ms\":%" PRIu64 ",\"err\":%u", waited_ms, (unsigned) err);
+        return;
+    }
+    const uint32_t now = w[1];
+    const uint32_t phase_ms   = (now - w[3]) / 1000;
+    const uint32_t acquire_ms = w[11] ? (now - w[11]) / 1000 : 0;
+    GGML_LOG_WARN("ggml-hex: %s batch %" PRIu64 " not done after %" PRIu64 " ms; DSP: phase %u for %u ms, batch %u op %u/%u "
+                  "opcode %u, batches %u yields %u release-requests %u, acquire %u ms tries %u err 0x%x, vtcm valid %u "
+                  "needs-release %u, wq active %u seqn %u r %u w %u pending %u busy 0x%x, hmx w %u r %u pop %u locked %u, prio %u\n",
+                  this->c_name(), (uint64_t) this->batch_rsp_seq + 1, waited_ms, w[2], phase_ms, w[4], w[6], w[5], w[7],
+                  w[8], w[9], w[10], acquire_ms, w[12], w[13], w[14], w[15], w[17], w[18], w[19], w[20], w[21], w[22],
+                  w[23], w[24], w[25], w[26], w[28]);
+    hex_io_trace.record("dsp_diag", c_name(),
+                        ",\"waited_ms\":%" PRIu64 ",\"phase\":%u,\"phase_ms\":%u,\"batch_seq\":%u,\"op_idx\":%u,\"n_ops\":%u,"
+                        "\"opcode\":%u,\"n_batches\":%u,\"n_yields\":%u,\"n_release_cb\":%u,\"acquire_ms\":%u,"
+                        "\"acquire_tries\":%u,\"acquire_err\":%u,\"vtcm_valid\":%u,\"needs_release\":%u,\"killed\":%u,"
+                        "\"wq\":[%u,%u,%u,%u,%u,%u],\"hmx\":[%u,%u,%u,%u,%u],\"prio\":%u",
+                        waited_ms, w[2], phase_ms, w[4], w[6], w[5], w[7], w[8], w[9], w[10], acquire_ms, w[12], w[13],
+                        w[14], w[15], w[16], w[17], w[18], w[19], w[20], w[21], w[22], w[23], w[24], w[25], w[26], w[27],
+                        w[28]);
+}
+
 void ggml_hexagon_session::flush_pending(bool all) {
     for (auto & sub : this->mdev.sessions) {
         sub->flush_pending(all);
@@ -1899,6 +1931,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
     // Let very short DSP batches complete without paying a host wake-up delay.
     auto poll_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+    auto wait_start    = std::chrono::steady_clock::now();
+    auto diag_next     = wait_start + std::chrono::seconds(opt_diag_wait);
     while (this->batch_rsp_seq < this->batch_req_seq) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -1925,8 +1959,13 @@ void ggml_hexagon_session::flush_pending(bool all) {
             // a blocking queue read can then busy-loop in FastRPC until the DSP responds.
             // Nonblocking reads avoid that wait path. Sleep only after an empty read,
             // so already-completed batches can still be drained without a delay.
-            if (opt_oppoll == 2 && std::chrono::steady_clock::now() >= poll_deadline) {
+            auto now = std::chrono::steady_clock::now();
+            if (opt_oppoll == 2 && now >= poll_deadline) {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+            if (opt_diag_wait > 0 && now >= diag_next) {
+                report_dsp_state(std::chrono::duration_cast<std::chrono::milliseconds>(now - wait_start).count());
+                diag_next = now + std::chrono::seconds(opt_diag_wait);
             }
             continue;
         }
@@ -1957,6 +1996,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         if (!all) break;
         poll_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+        wait_start    = poll_deadline;
+        diag_next     = wait_start + std::chrono::seconds(opt_diag_wait);
     }
 
     if ((this->queue_stuck || (opt_qrecover == 2 && all && !this->requeue_off)) &&
@@ -3689,6 +3730,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
     const char * str_qrecover = getenv("GGML_HEXAGON_QRECOVER");
+    const char * str_diag_wait = getenv("GGML_HEXAGON_DIAG_WAIT");
     const char * str_rt_repack = getenv("GGML_HEXAGON_RT_REPACK");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
@@ -3755,6 +3797,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
     opt_qrecover  = str_qrecover ? atoi(str_qrecover)                     : opt_qrecover;
+    opt_diag_wait = str_diag_wait ? atoi(str_diag_wait)                   : opt_diag_wait;
     opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;

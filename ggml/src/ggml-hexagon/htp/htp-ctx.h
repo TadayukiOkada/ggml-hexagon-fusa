@@ -85,6 +85,38 @@ struct htp_ops_context {
 // Main context for htp DSP backend
 #define HTP_FA_MASK_CACHE 8
 
+// Where the main thread is, for htp_iface_diag(). The host asks for it when a batch does not
+// complete; the main thread writes it, a FastRPC thread reads it. Times are the low 32 bits of
+// HAP_perf_get_time_us().
+enum htp_diag_phase {
+    HTP_DIAG_IDLE = 0,       // waiting for a packet (dspqueue_peek)
+    HTP_DIAG_POLL,           // polling the queue between batches
+    HTP_DIAG_BATCH_PREP,     // cache clean, buffers, tensors
+    HTP_DIAG_OP,             // running op `op_idx`
+    HTP_DIAG_YIELD_SUSPEND,  // suspending the HMX and work queues to give VTCM away
+    HTP_DIAG_YIELD_WAKEUP,   // waking them after taking VTCM back
+    HTP_DIAG_BATCH_END,      // suspending the queues, cache clean
+    HTP_DIAG_BARRIER,        // mdev barrier at the end of the batch
+    HTP_DIAG_RESPONSE,       // writing the response
+};
+
+#define HTP_DIAG_WORDS 29  // htp_iface_diag() output
+
+struct htp_diag {
+    volatile uint32_t phase;
+    volatile uint32_t phase_us;
+    volatile uint32_t batch_seq;
+    volatile uint32_t n_ops;
+    volatile uint32_t op_idx;
+    volatile uint32_t opcode;
+    volatile uint32_t n_batches;
+    volatile uint32_t n_yields;       // releases inside a batch (htp_vtcm_yield)
+    volatile uint32_t n_release_cb;   // release requests from the resource manager
+    volatile uint32_t acquire_us;     // start of the VTCM acquire in progress, 0 if none
+    volatile uint32_t acquire_tries;
+    volatile uint32_t acquire_err;    // last error of a timed-out acquire
+};
+
 struct htp_context {
     dspqueue_t             dsp_queue;
 
@@ -141,6 +173,8 @@ struct htp_context {
     void *                 main_stack;
     atomic_bool            killed;
     size_t                 footprint;
+
+    struct htp_diag        diag;
 };
 
 static inline void htp_ops_context_reset(struct htp_ops_context * octx, struct htp_context * ctx) {

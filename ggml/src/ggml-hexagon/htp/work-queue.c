@@ -18,6 +18,7 @@
 typedef struct {
     work_queue_t  queue;
     unsigned int  id;
+    atomic_uint   busy;  // inside a job, for work_queue_diag()
 } worker_context_t;
 
 struct work_queue_task_s {
@@ -79,7 +80,9 @@ static void work_queue_thread(void * context) {
             unsigned int n = task->n_threads;
             unsigned int i = me->id;
             if (i < n) {
+                atomic_store_explicit(&me->busy, 1, memory_order_relaxed);
                 task->func(n, i, task->data);
+                atomic_store_explicit(&me->busy, 0, memory_order_relaxed);
 
                 atomic_fetch_sub_explicit(&task->barrier, 1, memory_order_release);
             } else {
@@ -166,6 +169,7 @@ work_queue_t work_queue_init(void * ptr, uint32_t n_threads, uint32_t capacity, 
         q->thread[i] = 0;
         q->context[i].id    = i + 1;
         q->context[i].queue = q;
+        atomic_init(&q->context[i].busy, 0);
     }
 
     atomic_init(&q->idx_read,  0);
@@ -244,4 +248,19 @@ void work_queue_suspend(work_queue_t q) {
 
 bool work_queue_is_active(work_queue_t q) {
     return atomic_load_explicit(&q->active, memory_order_relaxed) != 0;
+}
+
+void work_queue_diag(work_queue_t q, uint32_t out[WORK_QUEUE_DIAG_WORDS]) {
+    const unsigned int ir = atomic_load_explicit(&q->idx_read, memory_order_relaxed);
+    const unsigned int iw = atomic_load_explicit(&q->idx_write, memory_order_relaxed);
+    uint32_t busy = 0;
+    for (unsigned int i = 0; i < q->n_workers; i++) {
+        busy |= (uint32_t) atomic_load_explicit(&q->context[i].busy, memory_order_relaxed) << q->context[i].id;
+    }
+    out[0] = atomic_load_explicit(&q->active, memory_order_relaxed);
+    out[1] = atomic_load_explicit(&q->seqn, memory_order_relaxed);
+    out[2] = ir;
+    out[3] = iw;
+    out[4] = ir != iw ? atomic_load_explicit(&q->queue[ir].barrier, memory_order_relaxed) : 0;  // threads not done
+    out[5] = busy;  // bit i: worker i is inside a job
 }
