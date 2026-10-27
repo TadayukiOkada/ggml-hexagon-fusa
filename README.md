@@ -104,8 +104,11 @@ is stuck. With the I/O trace on, the session also records the state once at
 release (`dsp_diag_release`). The words are listed at `htp_iface_diag()` in
 `htp/main.c`.
 
-The DSP main thread keeps serving its queue after a queue error other than a
-timeout (it used to stop, and the host then waited forever for its next batch).
+The DSP main thread's timed queue wait sometimes returns QuRT's own timeout
+code (`QURT_ETIMEDOUT`, 47) instead of `AEE_EEXPIRED`; the thread took it for a
+failure and stopped, and the host then waited forever for its next batch (seen
+on v73 with two processes using one CDSP). It is now a timeout, and the thread
+keeps serving its queue after any other error too.
 Each batch response carries the count and the last code of these errors; when
 the count grows the host logs a warning and a `dsp_queue_error` trace record.
 

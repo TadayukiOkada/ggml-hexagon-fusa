@@ -1748,12 +1748,14 @@ static void htp_main_thread(void * context) {
         int err = dspqueue_peek(ctx->dsp_queue, &flags, &num_buffers, &message_length, 50000);
         if (err == 0) {
             process_ops(ctx);
-        } else if (err == AEE_EWOULDBLOCK || err == AEE_EEXPIRED) {
+        } else if (err == AEE_EWOULDBLOCK || err == AEE_EEXPIRED || err == QURT_ETIMEDOUT) {
+            // The timed wait sometimes returns QuRT's own timeout code instead of AEE_EEXPIRED
+            // (seen on v73 while another process used the same CDSP)
             continue;
         } else {
             // Keep serving the queue: the host waits for every batch it sent, and nothing else
-            // would answer it once this thread is gone. A wait canceled while another session
-            // shared the CDSP stopped this thread for good.
+            // would answer it once this thread is gone. Treating QURT_ETIMEDOUT as an error
+            // stopped this thread for good.
             ctx->diag.peek_errors++;
             ctx->diag.peek_err = (uint32_t) err;
             FARF(ERROR, "dspqueue_peek failed: 0x%08x", (unsigned) err);
