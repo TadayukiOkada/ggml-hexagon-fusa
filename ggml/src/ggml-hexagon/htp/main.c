@@ -945,7 +945,12 @@ AEEResult htp_iface_diag(remote_handle64 handle, uint32_t * words, int n_words) 
         words[26] = q->hmx_locked;
         words[27] = atomic_load(&q->seqn);
     }
-    words[28] = ctx->main_stack ? (uint32_t) qurt_thread_get_priority(ctx->main_thread) : 0;
+    words[28] = ctx->main_stack ? (uint32_t) qurt_thread_get_priority(ctx->main_thread) : 0;  // -1: no main thread
+    words[29] = d->peek_errors;
+    words[30] = d->peek_err;
+    words[31] = d->read_errors;
+    words[32] = d->read_err;
+    words[33] = d->main_exits;
     return AEE_SUCCESS;
 }
 
@@ -1693,6 +1698,8 @@ static void process_ops(struct htp_context * ctx) {
         }
 
         if (err != 0) {
+            ctx->diag.read_errors++;
+            ctx->diag.read_err = (uint32_t) err;
             FARF(ERROR, "dspqueue_read_noblock failed: 0x%08x", (unsigned) err);
             break;
         }
@@ -1740,10 +1747,16 @@ static void htp_main_thread(void * context) {
         } else if (err == AEE_EWOULDBLOCK || err == AEE_EEXPIRED) {
             continue;
         } else {
+            // Keep serving the queue: the host waits for every batch it sent, and nothing else
+            // would answer it once this thread is gone. A wait canceled while another session
+            // shared the CDSP stopped this thread for good.
+            ctx->diag.peek_errors++;
+            ctx->diag.peek_err = (uint32_t) err;
             FARF(ERROR, "dspqueue_peek failed: 0x%08x", (unsigned) err);
-            break;
+            qurt_sleep(1000);
         }
     }
 
+    ctx->diag.main_exits++;
     FARF(HIGH, "htp-main-thread: stopped");
 }

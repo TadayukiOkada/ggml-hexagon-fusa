@@ -100,7 +100,7 @@ enum htp_diag_phase {
     HTP_DIAG_RESPONSE,       // writing the response
 };
 
-#define HTP_DIAG_WORDS 29  // htp_iface_diag() output
+#define HTP_DIAG_WORDS 34  // htp_iface_diag() output
 
 struct htp_diag {
     volatile uint32_t phase;
@@ -115,6 +115,11 @@ struct htp_diag {
     volatile uint32_t acquire_us;     // start of the VTCM acquire in progress, 0 if none
     volatile uint32_t acquire_tries;
     volatile uint32_t acquire_err;    // last error of a timed-out acquire
+    volatile uint32_t peek_errors;    // dspqueue_peek errors other than a timeout, and the last one
+    volatile uint32_t peek_err;
+    volatile uint32_t read_errors;    // dspqueue_read_noblock errors other than an empty queue
+    volatile uint32_t read_err;
+    volatile uint32_t main_exits;     // main thread exits (a stop or a requeue)
 };
 
 struct htp_context {

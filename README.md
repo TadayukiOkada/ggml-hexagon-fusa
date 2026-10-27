@@ -98,9 +98,11 @@ When a batch has no response for `GGML_HEXAGON_DIAG_WAIT` seconds (default 10,
 warning (and a `dsp_diag` trace record) every that many seconds until the
 batch completes: the phase and how long it has been in it, the batch and op,
 VTCM acquire in progress, release requests and in-op yields so far, and the
-state of the worker and HMX queues. It is a separate FastRPC call, so it
-answers while the main thread is stuck. The words are listed at
-`htp_iface_diag()` in `htp/main.c`.
+state of the worker and HMX queues, and the queue errors the DSP main thread
+has seen. It is a separate FastRPC call, so it answers while the main thread
+is stuck. With the I/O trace on, the session also records the state once at
+release (`dsp_diag_release`). The words are listed at `htp_iface_diag()` in
+`htp/main.c`.
 
 Queue records pair successful batch submissions with received DSP responses
 (`HTP_STATUS_OK=1`). `batch_submit.queued_ops` counts published descriptors;
