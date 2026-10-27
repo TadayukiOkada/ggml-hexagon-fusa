@@ -118,7 +118,14 @@ static bool htp_mul_mat_within_budget(const struct ggml_hexagon_session * sess, 
                             kernel_type == HTP_MM_KERNEL_HVX_BF16_F32_VTCM) && ggml_nrows(src1) > 32;
     const double flops = 2.0 * src0->ne[0] * src0->ne[1] * ggml_nrows(src1);
     const double rate  = src0_weight && !hvx_float ? 5.0e9 : htp_mm_flop_per_ms(kernel_type);
-    const double est   = (std::max)(flops / rate, (double) ggml_nbytes(src0) / 45.0e6);
+    double       est   = (std::max)(flops / rate, (double) ggml_nbytes(src0) / 45.0e6);
+    // With a short K the HVX float kernels are bound by the number of dot products, not by FLOP:
+    // the depthwise 3x3 convolution of NeMo's offline pre-encoder (K = 9, one weight row x 49533 x
+    // 256 activation rows) took 1171 ms, about 92 ns per dot (31 ns with 751 weight rows per
+    // activation row). Count at least 0.1 us per dot.
+    if (hvx_float) {
+        est = (std::max)(est, 0.1e-3 * (double) src0->ne[1] * ggml_nrows(src1));
+    }
     return htp_budget_check(sess, op, est);
 }
 
