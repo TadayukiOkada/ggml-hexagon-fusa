@@ -616,8 +616,9 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
 
     // Rows evenly spaced across heads and positions (Q/K as the matmuls leave them): one DMA pipeline
     // over all rows of the thread, with blocks that may span positions and HTP_ROPE_SPAD_NSLOTS - 1
-    // blocks in flight, instead of a new pipeline for every position.
-    const bool rows_uniform = nb02 == ne1 * nb01 && nb2 == ne1 * nb1 && (ne3 == 1 || (nb03 == ne2 * nb02 && nb3 == ne2 * nb2));
+    // blocks in flight, instead of a new pipeline for every position. One position (decode) keeps the
+    // per-position loop, which is slightly faster there.
+    const bool rows_uniform = ne2 * ne3 > 1 && nb02 == ne1 * nb01 && nb2 == ne1 * nb1 && (ne3 == 1 || (nb03 == ne2 * nb02 && nb3 == ne2 * nb2));
     if (rows_uniform) {
         const uint32_t   B      = HTP_ROPE_SPAD_BLOCK;
         const uint32_t   NS     = HTP_ROPE_SPAD_NSLOTS;
