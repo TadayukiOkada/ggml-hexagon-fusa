@@ -1,8 +1,9 @@
 name: build
 
-# Builds the host side and the v73/v75/v79/v81 skels with the public Snapdragon
-# toolchain containers (Hexagon SDK 6.6), which keeps the other HTP generations
-# building. The FuSa configuration needs an older SDK and the firmware's SWIV
+# Builds the host side and the v73/v75/v79/v81/v85 skels with the public
+# Snapdragon toolchain containers (v0.8, as upstream since llama.cpp 846639535:
+# v85 does not build with the SDK 6.6 of v0.7), which keeps the other HTP
+# generations building. The FuSa configuration needs an older SDK and the firmware's SWIV
 # utility, which these containers do not have; it is built outside CI.
 
 on:
@@ -22,7 +23,7 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ubuntu-24.04
-    container: ghcr.io/snapdragon-toolchain/${{ matrix.image }}:v0.7
+    container: ghcr.io/snapdragon-toolchain/${{ matrix.image }}:v0.8
     strategy:
       fail-fast: false
       matrix:
