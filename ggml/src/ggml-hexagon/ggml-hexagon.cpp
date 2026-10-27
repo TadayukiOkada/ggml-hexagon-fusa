@@ -396,7 +396,14 @@ struct ggml_hexagon_session {
     void flush_pending(bool all = true);
     void note_queue_wait(uint64_t wall_ns, uint64_t cpu_ns);
     void requeue();
-    void report_dsp_state(uint64_t waited_ms, bool at_release = false);
+    struct dsp_state {
+        bool     valid     = false;  // the DSP answered the query
+        bool     main_gone = false;  // its main thread no longer exists
+        bool     idle      = false;  // waiting for a packet or polling the queue
+        uint32_t n_batches = 0;      // batches completed since the session opened
+        uint32_t errors    = 0;      // queue errors the main thread recovered from
+    };
+    dsp_state report_dsp_state(uint64_t waited_ms, bool at_release = false);
 
     ggml_hexagon_shared_buffer * mmap_tensor(const ggml_tensor * t);
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
@@ -1894,15 +1901,21 @@ void ggml_hexagon_session::requeue() {
 
 // Ask the DSP where its main thread is (htp_iface_diag) while a batch does not complete, and
 // once at release with the I/O trace on. The words are the layout of htp_iface_diag() in htp/main.c.
-void ggml_hexagon_session::report_dsp_state(uint64_t waited_ms, bool at_release) {
+ggml_hexagon_session::dsp_state ggml_hexagon_session::report_dsp_state(uint64_t waited_ms, bool at_release) {
     const char * event = at_release ? "dsp_diag_release" : "dsp_diag";
+    dsp_state st;
     uint32_t w[40] = {};
     int err = htp_iface_diag(this->handle, w, 40);
     if (err != 0) {
         GGML_LOG_WARN("ggml-hex: %s DSP state query failed: 0x%08x\n", this->c_name(), (unsigned) err);
         hex_io_trace.record(event, c_name(), ",\"waited_ms\":%" PRIu64 ",\"err\":%u", waited_ms, (unsigned) err);
-        return;
+        return st;
     }
+    st.valid     = true;
+    st.main_gone = (int32_t) w[28] == -1 && !w[16];  // no thread, and not stopped on purpose
+    st.idle      = w[2] == HTP_DIAG_IDLE || w[2] == HTP_DIAG_POLL;
+    st.n_batches = w[8];
+    st.errors    = w[29] + w[31];
     const uint32_t now = w[1];
     const uint32_t phase_ms   = (now - w[3]) / 1000;
     const uint32_t acquire_ms = w[11] ? (now - w[11]) / 1000 : 0;
@@ -1925,6 +1938,28 @@ void ggml_hexagon_session::report_dsp_state(uint64_t waited_ms, bool at_release)
                         waited_ms, w[2], phase_ms, w[4], w[6], w[5], w[7], w[8], w[9], w[10], acquire_ms, w[12], w[13],
                         w[14], w[15], w[16], w[17], w[18], w[19], w[20], w[21], w[22], w[23], w[24], w[25], w[26], w[27],
                         (int) w[28], w[29], w[30], w[31], w[32], w[33]);
+    return st;
+}
+
+// Whether a batch that has no response can still complete, from two successive DSP state queries
+// (opt_diag_wait apart). Waiting on would never end: nothing else answers the host.
+static const char * dsp_lost_reason(const ggml_hexagon_session::dsp_state & prev, const ggml_hexagon_session::dsp_state & cur) {
+    if (!cur.valid) {
+        return nullptr;
+    }
+    if (cur.main_gone) {
+        return "the DSP main thread has stopped";
+    }
+    if (!prev.valid || cur.n_batches != prev.n_batches) {
+        return nullptr;  // progress, or nothing to compare with yet
+    }
+    if (prev.idle && cur.idle) {
+        return "the DSP is idle and does not see the batch";
+    }
+    if (cur.errors > prev.errors) {
+        return "the DSP keeps failing to read its queue";
+    }
+    return nullptr;
 }
 
 void ggml_hexagon_session::flush_pending(bool all) {
@@ -1939,6 +1974,7 @@ void ggml_hexagon_session::flush_pending(bool all) {
     auto poll_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
     auto wait_start    = std::chrono::steady_clock::now();
     auto diag_next     = wait_start + std::chrono::seconds(opt_diag_wait);
+    dsp_state diag_prev;
     while (this->batch_rsp_seq < this->batch_req_seq) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -1970,7 +2006,12 @@ void ggml_hexagon_session::flush_pending(bool all) {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
             }
             if (opt_diag_wait > 0 && now >= diag_next) {
-                report_dsp_state(std::chrono::duration_cast<std::chrono::milliseconds>(now - wait_start).count());
+                const dsp_state st = report_dsp_state(std::chrono::duration_cast<std::chrono::milliseconds>(now - wait_start).count());
+                if (const char * why = dsp_lost_reason(diag_prev, st)) {
+                    GGML_ABORT("ggml-hex: %s batch %" PRIu64 " cannot complete: %s\n", this->c_name(),
+                               (uint64_t) this->batch_rsp_seq + 1, why);
+                }
+                diag_prev = st;
                 diag_next = now + std::chrono::seconds(opt_diag_wait);
             }
             continue;
@@ -2013,6 +2054,7 @@ void ggml_hexagon_session::flush_pending(bool all) {
         poll_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
         wait_start    = poll_deadline;
         diag_next     = wait_start + std::chrono::seconds(opt_diag_wait);
+        diag_prev     = {};
     }
 
     if ((this->queue_stuck || (opt_qrecover == 2 && all && !this->requeue_off)) &&

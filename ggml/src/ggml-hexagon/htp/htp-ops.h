@@ -265,6 +265,23 @@ struct htp_opbatch_req {
     // struct htp_op_desc   ops[];     -- dspqueue buf 0
 };
 
+// Where the DSP main thread is (htp_iface_diag(), layout in htp/main.c). The host asks for it when
+// a batch does not complete; the main thread writes it, a FastRPC thread reads it. Times are the
+// low 32 bits of HAP_perf_get_time_us().
+enum htp_diag_phase {
+    HTP_DIAG_IDLE = 0,       // waiting for a packet (dspqueue_peek)
+    HTP_DIAG_POLL,           // polling the queue between batches
+    HTP_DIAG_BATCH_PREP,     // cache clean, buffers, tensors
+    HTP_DIAG_OP,             // running op `op_idx`
+    HTP_DIAG_YIELD_SUSPEND,  // suspending the HMX and work queues to give VTCM away
+    HTP_DIAG_YIELD_WAKEUP,   // waking them after taking VTCM back
+    HTP_DIAG_BATCH_END,      // suspending the queues, cache clean
+    HTP_DIAG_BARRIER,        // mdev barrier at the end of the batch
+    HTP_DIAG_RESPONSE,       // writing the response
+};
+
+#define HTP_DIAG_WORDS 34  // htp_iface_diag() output
+
 struct htp_opbatch_rsp {
     uint64_t seq;            // Sequence number
     uint64_t cycles_start;   // Start cycle counter

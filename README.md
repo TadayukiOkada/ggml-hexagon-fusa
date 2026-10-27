@@ -109,6 +109,11 @@ code (`QURT_ETIMEDOUT`, 47) instead of `AEE_EEXPIRED`; the thread took it for a
 failure and stopped, and the host then waited forever for its next batch (seen
 on v73 with two processes using one CDSP). It is now a timeout, and the thread
 keeps serving its queue after any other error too.
+
+Waiting on a batch that cannot complete would never end, so with
+`GGML_HEXAGON_DIAG_WAIT` set the host aborts (`cannot complete: ...`) when a
+query finds the DSP main thread gone, or when two successive queries find no
+batch completed and the DSP idle in both or its queue errors growing.
 Each batch response carries the count and the last code of these errors; when
 the count grows the host logs a warning and a `dsp_queue_error` trace record.
 
