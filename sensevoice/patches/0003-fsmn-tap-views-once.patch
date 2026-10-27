@@ -1,0 +1,50 @@
+diff --git a/runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.cpp b/runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.cpp
+index f622940..d92d4ce 100644
+--- a/runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.cpp
++++ b/runtime/llama.cpp/funasr-sensevoice/sensevoice_runtime.cpp
+@@ -59,7 +59,9 @@ static std::vector<float> compute_fbank(std::vector<float> wav,int&T_out){
+ 
+ struct cfg { int d_model=512,n_head=4,num_blocks=50,tp_blocks=20,kernel=11,vocab=25055,blank=0; };
+ struct model { cfg c; ggml_context*ctx_w=nullptr; std::map<std::string,ggml_tensor*> t;
+-  ggml_tensor* g(const std::string&n){auto it=t.find(n);if(it==t.end())throw std::runtime_error("missing tensor "+n);return it->second;} };  // a server must survive a bad model
++  std::map<std::string,std::vector<ggml_tensor*>> taps;  // FSMN tap views of each fsmn_block.weight, made at load
++  ggml_tensor* g(const std::string&n){auto it=t.find(n);if(it==t.end())throw std::runtime_error("missing tensor "+n);return it->second;}  // a server must survive a bad model
++  ggml_tensor* tap(const std::string&n,int j){auto it=taps.find(n);if(it==taps.end()||j>=(int)it->second.size())throw std::runtime_error("missing FSMN tap "+n);return it->second[j];} };
+ 
+ static ggml_tensor* lin(ggml_context*c,ggml_tensor*w,ggml_tensor*b,ggml_tensor*x){auto y=ggml_mul_mat(c,w,x);return b?ggml_add(c,y,b):y;}
+ static ggml_tensor* lnorm(ggml_context*c,ggml_tensor*x,ggml_tensor*g,ggml_tensor*b){return ggml_add(c,ggml_mul(c,ggml_norm(c,x,LN_EPS),g),b);}
+@@ -69,10 +71,10 @@ static ggml_tensor* sanm_attn(ggml_context*c,model&m,const std::string&p,ggml_te
+   ggml_tensor*q=ggml_cont(c,ggml_view_2d(c,qkv,D,T,nb1,0));
+   ggml_tensor*k=ggml_cont(c,ggml_view_2d(c,qkv,D,T,nb1,(size_t)D*sizeof(float)));
+   ggml_tensor*v=ggml_cont(c,ggml_view_2d(c,qkv,D,T,nb1,(size_t)2*D*sizeof(float)));
+-  const int pad=(K-1)/2; ggml_tensor*fk=m.g(p+"fsmn_block.weight");
++  const int pad=(K-1)/2;
+   ggml_tensor*vp=ggml_pad_ext(c,v,0,0,pad,pad,0,0,0,0); ggml_tensor*fsmn=v;
+   for(int j=0;j<K;j++){auto sl=ggml_view_2d(c,vp,D,T,vp->nb[1],(size_t)j*vp->nb[1]);
+-    auto wj=ggml_view_1d(c,fk,D,(size_t)j*fk->nb[1]); fsmn=ggml_add(c,fsmn,ggml_mul(c,sl,wj));}  // vp rows are contiguous: sl needs no copy
++    auto wj=m.tap(p+"fsmn_block.weight",j); fsmn=ggml_add(c,fsmn,ggml_mul(c,sl,wj));}  // vp rows are contiguous: sl needs no copy
+   ggml_tensor*o=funasr::attention(c,q,k,v,H,flash);  // flash attention on the HTP
+   return ggml_add(c,lin(c,m.g(p+"linear_out.weight"),m.g(p+"linear_out.bias"),o),fsmn);
+ }
+@@ -122,8 +124,20 @@ struct sensevoice_runtime::impl {
+   for(int i=0;i<gguf_get_n_tensors(gg);i++){const char*nm=gguf_get_tensor_name(gg,i);m.t[nm]=ggml_get_tensor(m.ctx_w,nm);}
+   gguf_free(gg);
+   runtime.prepare_weights(m.ctx_w,m.t);
+-
++  // FSMN taps are views of the weights. A view made in each graph is initialized again on the weight
++  // buffer, which is never reset, and a backend that keeps metadata per initialized tensor (Hexagon)
++  // holds it until the buffer is freed: 770 views, about 64 KiB, per request. Make them once here.
++  const std::string fsmn="fsmn_block.weight"; size_t n_taps=0;
++  for(auto&e:m.t) if(e.first.size()>=fsmn.size() && !e.first.compare(e.first.size()-fsmn.size(),fsmn.size(),fsmn)) n_taps+=m.c.kernel;
++  ggml_init_params tp={ggml_tensor_overhead()*(n_taps+1),nullptr,true}; taps.reset(ggml_init(tp));
++  if(!taps)throw std::runtime_error("cannot allocate FSMN tap metadata");
++  for(auto&e:m.t){ if(e.first.size()<fsmn.size() || e.first.compare(e.first.size()-fsmn.size(),fsmn.size(),fsmn)) continue;
++    auto fk=e.second; auto&v=m.taps[e.first];
++    for(int j=0;j<m.c.kernel;j++){auto wj=ggml_view_1d(taps.get(),fk,m.c.d_model,(size_t)j*fk->nb[1]);
++      if(ggml_backend_view_init(wj)!=GGML_STATUS_SUCCESS)throw std::runtime_error("cannot initialize FSMN tap "+e.first);
++      v.push_back(wj);} }
+   }
++  std::unique_ptr<ggml_context,decltype(&ggml_free)> taps{nullptr,ggml_free};  // after m: freed first
+   recognition features(const std::vector<float> &fb,int T) {
+     const int F=560,D=m.c.d_model,V=m.c.vocab,nq=qtok.size();
+     const auto *emb=m.g("embed.weight");
