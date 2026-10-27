@@ -3276,6 +3276,13 @@ pipelined_pass: __attribute__((unused));
             if (chunk_dst_cols > 0) {
                 transfer_output_chunk_any(ctx, output_chunk, bias_chunk, vtcm_output_bufs[(n_chunk_cnt - 1) % 2], n_rows, n_cols_last, dst_stride, src2_stride, chunk_dst_cols, n_threads, stage);
             }
+#ifdef HTP_YIELD_IN_OPS
+            // between row chunks: every output of this chunk is stored and no weight DMA is pending
+            if (mr + m_chunk_n_rows < m && atomic_load(&ctx->vtcm_needs_release)) {
+                htp_vtcm_yield(ctx);
+                hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+            }
+#endif
         }
     } else {
         // --- Synchronous loop (m <= 32 or fallback) ---
@@ -3362,6 +3369,13 @@ sync_pass: __attribute__((unused));
                 }
 #endif
             }
+#ifdef HTP_YIELD_IN_OPS
+            // between row chunks: every output of this chunk is stored and no weight DMA is pending
+            if (mr + m_chunk_n_rows < m && atomic_load(&ctx->vtcm_needs_release)) {
+                htp_vtcm_yield(ctx);
+                hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+            }
+#endif
         }
     }
 
