@@ -86,7 +86,7 @@ else
     for f in "$build"/bin/*; do
         name=$(basename "$f")
         case $name in
-            test-*) [[ $name == test-backend-ops || $name == test-backend-ops-hex ]] || continue ;;
+            test-*) [[ $name == test-backend-ops || $name == test-backend-ops-hex || $name == test-hexagon-metadata ]] || continue ;;
         esac
         [ -f "$f" ] || continue
         cp -L "$f" "$out/$name"

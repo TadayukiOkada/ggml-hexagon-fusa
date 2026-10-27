@@ -63,9 +63,15 @@ logs it (`ggml-hex: HTP0 build ...`).
 
 - `test-backend-ops-hex` is upstream `test-backend-ops` with `tests/patches/*.patch`
   applied at configure time (extra cases for this backend).
-- `scripts/device-tests.sh <package> <out> [--ops] [--long] [--bench MODEL]` runs
+- `scripts/device-tests.sh <package> <out> [--ops] [--long] [--leak] [--bench MODEL]` runs
   on the target: per-op tests against the CPU, the long single ops with
-  `GGML_HEXAGON_PROFILE=1`, and `llama-bench`.
+  `GGML_HEXAGON_PROFILE=1`, the tensor metadata check, and `llama-bench`.
+- `test-hexagon-metadata` (`--leak`, seconds) allocates graphs again and again with
+  views of a weight, of a KV-cache-like tensor and scratch views, checks the
+  results, and fails if the backend's tensor metadata of a buffer grows.
+- `scripts/rss-soak.py` sends back-to-back requests to a running
+  `sensevoice-server` (`--pcm`) or `nemo-speech serve` (`--multipart`) and fails
+  if the server's resident memory keeps growing.
 - `scripts/op-budget.py <out>/long_*.log` lists the longest ops against a per-op
   budget (default 25 ms, half of a 50 ms self-test period).
 - `scripts/check-skel.sh` checks a skel for the SWIV CRC section and, given the

@@ -31,3 +31,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_src} ${_patche
 add_executable(test-backend-ops-hex ${_dst})
 target_include_directories(test-backend-ops-hex PRIVATE ${LLAMA_DIR}/tests)
 target_link_libraries(test-backend-ops-hex PRIVATE llama llama-common)
+
+# Metadata of persistent buffers must not grow as graphs are allocated again (run on the target).
+add_executable(test-hexagon-metadata test-hexagon-metadata.cpp)
+target_link_libraries(test-hexagon-metadata PRIVATE ggml)
