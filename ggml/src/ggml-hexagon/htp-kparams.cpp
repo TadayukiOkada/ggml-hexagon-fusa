@@ -630,7 +630,9 @@ static bool htp_matmul_is_hmx_eligible(
         return false;
     }
 
-    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0) {
+    // HMX paths require K aligned to 32. The flat 2D path pads F16/F32 weights with zeros.
+    const bool can_pad_k = (wtype == GGML_TYPE_F16 || wtype == GGML_TYPE_F32) && !is_batched && !is_matmul_id;
+    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0 && !can_pad_k) {
         return false;
     }
 
@@ -893,7 +895,8 @@ static bool htp_kparams_solve_matmul_impl(
 
     const bool is_tiled    = htp_tensor_is_tiled(src0);
     const int  wtype       = (is_tiled && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16)) ? GGML_TYPE_F16 : src0->type;
-    const int  ne00_padded = is_tiled ? hex_round_up(ne00, htp_tensor_get_tile_k(wtype)) : ne00;
+    const bool is_float    = (wtype == GGML_TYPE_F16 || wtype == GGML_TYPE_F32);
+    const int  ne00_padded = is_tiled ? hex_round_up(ne00, htp_tensor_get_tile_k(wtype)) : (is_float ? hex_round_up(ne00, 32) : ne00);
     const int  ne11_padded = hex_round_up(ne11, 32);
     const int  ne01_tiled  = hex_round_up(ne01, 32);
 
@@ -1142,7 +1145,8 @@ bool htp_kparams_solve_mmnx(
     const int  ne01_tiled  = hex_round_up(ne01, 32);
     const bool is_batched  = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
 
-    const bool hmx_enabled = (n_hmx > 0) && (opt_mm_select >= 2);
+    // The fused NX kernel needs K aligned to 32 (no padding).
+    const bool hmx_enabled = (n_hmx > 0) && (opt_mm_select >= 2) && (ne00 % 32 == 0);
     if (hmx_enabled && htp_matmul_is_hmx_eligible(src0, act, nullptr, false, is_batched)) {
         if (htp_kparams_solve_hmx_mm(sess, src0, act, nullptr, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, false, is_batched, 0, vtcm_budget, kparams)) {
             kparams->n_weights = n_weights;
