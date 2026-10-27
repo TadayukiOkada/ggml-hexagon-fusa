@@ -69,6 +69,11 @@ logs it (`ggml-hex: HTP0 build ...`).
 - `test-hexagon-metadata` (`--leak`, seconds) allocates graphs again and again with
   views of a weight, of a KV-cache-like tensor and scratch views, checks the
   results, and fails if the backend's tensor metadata of a buffer grows.
+- `scripts/compare-packages.sh <new> <old|-> <kit> <out> <step>...` compares two
+  packages on the target, step by step (LLM text and speed, `llama-bench`, a
+  12.7k-token prefill, NeMo and SenseVoice outputs, both servers on one HTP), on
+  the fixed models, audio and prompts listed in `tests/test-kit.txt` (not in this
+  repository; `tests/data/long_prompt.txt` is the source of the prompts).
 - `scripts/rss-soak.py` sends back-to-back requests to a running
   `sensevoice-server` (`--pcm`) or `nemo-speech serve` (`--multipart`) and fails
   if the server's resident memory keeps growing.
