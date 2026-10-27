@@ -351,6 +351,7 @@ struct ggml_hexagon_session {
     bool     queue_stuck   = false;
     bool     requeue_off   = false;
     uint32_t n_requeue     = 0;
+    uint32_t queue_errors  = 0;  // DSP queue errors reported so far (htp_opbatch_rsp)
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
@@ -1990,6 +1991,15 @@ void ggml_hexagon_session::flush_pending(bool all) {
             for (auto & sub : this->mdev.sessions) {
                 sub->last_error = rsp.status;
             }
+        }
+
+        if (rsp.peek_errors + rsp.read_errors != this->queue_errors) {
+            GGML_LOG_WARN("ggml-hex: %s DSP main thread recovered from queue errors: peek %u (last 0x%08x), read %u (last 0x%08x)\n",
+                          this->c_name(), rsp.peek_errors, rsp.peek_err, rsp.read_errors, rsp.read_err);
+            hex_io_trace.record("dsp_queue_error", c_name(),
+                                ",\"batch_seq\":%" PRIu64 ",\"peek_errors\":%u,\"peek_err\":%u,\"read_errors\":%u,\"read_err\":%u",
+                                (uint64_t) rsp.seq, rsp.peek_errors, rsp.peek_err, rsp.read_errors, rsp.read_err);
+            this->queue_errors = rsp.peek_errors + rsp.read_errors;
         }
 
         op_queue->pop(rsp, dbuf);

@@ -104,6 +104,11 @@ is stuck. With the I/O trace on, the session also records the state once at
 release (`dsp_diag_release`). The words are listed at `htp_iface_diag()` in
 `htp/main.c`.
 
+The DSP main thread keeps serving its queue after a queue error other than a
+timeout (it used to stop, and the host then waited forever for its next batch).
+Each batch response carries the count and the last code of these errors; when
+the count grows the host logs a warning and a `dsp_queue_error` trace record.
+
 Queue records pair successful batch submissions with received DSP responses
 (`HTP_STATUS_OK=1`). `batch_submit.queued_ops` counts published descriptors;
 `graph_dispatch.queued_ops` counts enqueue attempts before queue fusion. These

@@ -1648,6 +1648,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             rsp.n_traces[t] = ctx->trace[t].count;
         }
     }
+    rsp.peek_errors = ctx->diag.peek_errors;
+    rsp.peek_err    = ctx->diag.peek_err;
+    rsp.read_errors = ctx->diag.read_errors;
+    rsp.read_err    = ctx->diag.read_err;
 
     struct dspqueue_buffer write_dbuf = *dbuf;
     write_dbuf.flags = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;

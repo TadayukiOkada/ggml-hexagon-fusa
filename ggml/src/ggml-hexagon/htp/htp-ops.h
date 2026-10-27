@@ -281,6 +281,11 @@ struct htp_opbatch_rsp {
     uint32_t resource_requests_served;
     uint32_t resource_releases;
     uint32_t resource_pending_us;       // age of a request still unserved at response time
+    // Queue errors the DSP main thread recovered from since session open, and the last of each
+    uint32_t peek_errors;
+    uint32_t peek_err;
+    uint32_t read_errors;
+    uint32_t read_err;
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 
