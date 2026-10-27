@@ -1836,6 +1836,8 @@ void ggml_hexagon_session::note_queue_wait(uint64_t wall_ns, uint64_t cpu_ns) {
     }
     if (this->qwait_cpu_ns * 2 > this->qwait_wall_ns) {
         this->queue_stuck = true;
+        hex_io_trace.record("queue_stuck", c_name(), ",\"wall_ns\":%" PRIu64 ",\"cpu_ns\":%" PRIu64,
+                            this->qwait_wall_ns, this->qwait_cpu_ns);
     }
     this->qwait_wall_ns = 0;
     this->qwait_cpu_ns  = 0;
@@ -1865,6 +1867,8 @@ void ggml_hexagon_session::requeue() {
     }
     if (err != 0) {
         GGML_LOG_WARN("ggml-hex: %s failed to re-create the busy-waiting dspqueue: 0x%08x\n", this->c_name(), (unsigned) err);
+        hex_io_trace.record("requeue_failed", c_name(), ",\"err\":%u,\"batch_seq\":%" PRIu64, (unsigned) err,
+                            (uint64_t) this->batch_req_seq);
         if (new_queue) {
             dspqueue_close(new_queue);
         }
@@ -1879,6 +1883,8 @@ void ggml_hexagon_session::requeue() {
     this->queue    = new_queue;
     this->queue_id = new_id;
     this->n_requeue++;
+    hex_io_trace.record("requeue", c_name(), ",\"n_requeue\":%u,\"batch_seq\":%" PRIu64, this->n_requeue,
+                        (uint64_t) this->batch_req_seq);
     GGML_LOG_WARN("ggml-hex: %s re-created the dspqueue: blocking reads were busy-waiting (%u so far)\n",
                   this->c_name(), this->n_requeue);
 }
@@ -2018,8 +2024,19 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
-    hex_io_trace.record("batch_submit", c_name(), ",\"batch_seq\":%" PRIu64 ",\"queued_ops\":%u,\"descriptor_bytes\":%u",
-                        seq, (unsigned) op_batch->n_ops, (unsigned) dbuf.size);
+    if (hex_io_trace.enabled()) {
+        // the ops of the batch (as many as fit), to find the op of a batch that never completes
+        char ops[480];
+        size_t o = 0;
+        ops[0] = 0;
+        for (unsigned i = 0; i < op_batch->n_ops && o + 48 < sizeof(ops); i++) {
+            const ggml_tensor * t = op_batch->ops[i].node;
+            o += snprintf(ops + o, sizeof(ops) - o, "%s%s:%lld", i ? " " : "", t ? ggml_op_desc(t) : "?",
+                          t ? (long long) ggml_nelements(t) : 0LL);
+        }
+        hex_io_trace.record("batch_submit", c_name(), ",\"batch_seq\":%" PRIu64 ",\"queued_ops\":%u,\"descriptor_bytes\":%u,\"ops\":\"%s\"",
+                            seq, (unsigned) op_batch->n_ops, (unsigned) dbuf.size, ops);
+    }
 
     op_batch->reset();
 }
