@@ -691,6 +691,19 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
     HEX_VERBOSE("ggml-hex: %s init-tensor %s : base %p data %p nbytes %zu\n", sess->c_name(),
                 tensor->name, (void *) sbuf->base(), tensor->data, ggml_nbytes(tensor));
 
+    // A view on a buffer that the graph allocator does not reset (weights, KV cache) shares the
+    // extra of the tensor it views. An extra of its own would stay in this pool until the buffer is
+    // freed, one more each time a graph is allocated or a caller makes a scratch view. Not for views
+    // of a tiled tensor (the view would take the tiled layout) or ops that fusion tags per node.
+    const ggml_tensor * base = tensor->view_src;
+    if (base && base->buffer == buffer && base->extra &&
+        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        !(((const htp_tensor_extra *) base->extra)->flags & HTP_TENSOR_TILED) && !htp_fusion_tags_op(tensor->op)) {
+        HEX_VERBOSE("ggml-hex: %s init-tensor %s : shares the extra of %s\n", sess->c_name(), tensor->name, base->name);
+        tensor->extra = base->extra;
+        return GGML_STATUS_SUCCESS;
+    }
+
     htp_tensor_extra * extra;
     if (sbuf->n_tensor_extra < sbuf->tensor_extra.size()) {
         extra  = sbuf->tensor_extra[sbuf->n_tensor_extra];
@@ -3082,12 +3095,14 @@ static bool ggml_backend_hexagon_cpy_tensor_async(ggml_backend_t backend_src, gg
         ggml_backend_buffer_init_tensor(dst->buffer, dst);
     }
 
-    auto * dst_extra = static_cast<htp_tensor_extra *>(dst->extra);
-    const auto * src_extra = static_cast<const htp_tensor_extra *>(src->extra);
-    dst_extra->flags = src_extra->flags & ~HTP_TENSOR_FUSEABLE;
-    dst_extra->repack_initialized = src_extra->repack_initialized;
-    dst_extra->shadow_buf.clear();
-    dst_extra->shadow_ranges.clear();
+    if (!htp_tensor_extra_is_shared(dst)) {  // a shared extra describes the viewed tensor, not the copy
+        auto * dst_extra = static_cast<htp_tensor_extra *>(dst->extra);
+        const auto * src_extra = static_cast<const htp_tensor_extra *>(src->extra);
+        dst_extra->flags = src_extra->flags & ~HTP_TENSOR_FUSEABLE;
+        dst_extra->repack_initialized = src_extra->repack_initialized;
+        dst_extra->shadow_buf.clear();
+        dst_extra->shadow_ranges.clear();
+    }
 
     auto sess_src = static_cast<ggml_hexagon_session *>(backend_src->context);
     auto sess_dst = static_cast<ggml_hexagon_session *>(backend_dst->context);

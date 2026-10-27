@@ -48,6 +48,12 @@ extern int    opt_rt_repack;
     if (opt_verbose) GGML_LOG_DEBUG(__VA_ARGS__)
 #endif
 
+// A view on a buffer that the graph allocator does not reset shares the extra of the tensor it
+// views (ggml_backend_hexagon_buffer_init_tensor). The extra then describes the storage, not the node.
+static inline bool htp_tensor_extra_is_shared(const struct ggml_tensor * t) {
+    return t->view_src && t->extra && t->extra == t->view_src->extra;
+}
+
 static inline bool htp_tensor_is_fuseable(const struct ggml_tensor * t) {
     if (!t || !t->extra) return false;
     const auto * extra = (const struct htp_tensor_extra *) t->extra;

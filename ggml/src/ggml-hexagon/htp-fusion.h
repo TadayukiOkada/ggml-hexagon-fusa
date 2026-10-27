@@ -33,6 +33,7 @@ static inline bool htp_fusion_enabled(int flag) {
 bool htp_fusion_can_stack(const struct ggml_tensor * a);
 bool htp_fusion_can_stack(const struct ggml_tensor * a, const struct ggml_tensor * b);
 int  htp_fusion_max(const struct ggml_cgraph * graph, int idx);
+bool htp_fusion_tags_op(enum ggml_op op);
 void htp_fusion_tag_graph(struct ggml_cgraph * graph);
 bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_opnode & prev, const struct htp_opnode & cur);
 bool htp_fusion_try_absorb_norm(const struct htp_opnode & norm, struct htp_opnode & nx);

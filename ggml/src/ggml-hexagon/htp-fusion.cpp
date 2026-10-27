@@ -812,19 +812,23 @@ static uint32_t htp_count_mm_uses(const struct ggml_cgraph * graph, int i) {
     return n == (uint32_t) ggml_node_get_use_count(graph, i) ? n : 0;
 }
 
+// Ops whose nodes htp_fusion_tag_graph tags (FUSEABLE, n_mm_uses): their extra holds per-node state.
+bool htp_fusion_tags_op(enum ggml_op op) {
+    return op == GGML_OP_RMS_NORM || op == GGML_OP_SCALE || op == GGML_OP_REPEAT ||
+           op == GGML_OP_UNARY    || op == GGML_OP_ADD   || op == GGML_OP_SUB    ||
+           op == GGML_OP_MUL      || op == GGML_OP_DIV   || op == GGML_OP_MUL_MAT_ID ||
+           op == GGML_OP_SSM_CONV || op == GGML_OP_MUL_MAT;
+}
+
 void htp_fusion_tag_graph(struct ggml_cgraph * graph) {
     for (int i = 0; i < graph->n_nodes; i++) {
         auto * extra = (htp_tensor_extra *) graph->nodes[i]->extra;
-        if (!extra) continue;
+        if (!extra || htp_tensor_extra_is_shared(graph->nodes[i])) continue;  // the viewed tensor's extra
 
         extra->flags &= ~HTP_TENSOR_FUSEABLE;
 
         const ggml_op op = graph->nodes[i]->op;
-        if ((op == GGML_OP_RMS_NORM || op == GGML_OP_SCALE || op == GGML_OP_REPEAT ||
-             op == GGML_OP_UNARY    || op == GGML_OP_ADD   || op == GGML_OP_SUB    ||
-             op == GGML_OP_MUL      || op == GGML_OP_DIV   || op == GGML_OP_MUL_MAT_ID ||
-             op == GGML_OP_SSM_CONV ||
-             (op == GGML_OP_MUL_MAT && !htp_is_hadamard(graph->nodes[i]))) &&
+        if (htp_fusion_tags_op(op) && !(op == GGML_OP_MUL_MAT && htp_is_hadamard(graph->nodes[i])) &&
             ggml_node_has_n_uses(graph, i, 1)) {
             extra->flags |= HTP_TENSOR_FUSEABLE;
         }
