@@ -5230,6 +5230,10 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
+    if (kparams->norm) {  // the norm weight comes from DDR: have it in L2 by the time the rows are in
+        hex_l2fetch((const void *) octx->src[n_weights + 1]->data, act->ne[0] * sizeof(float), act->ne[0] * sizeof(float), 1);
+    }
+
     hvx_mm_transfer_act_dma(octx, kparams, act, mmctx->vtcm_act_raw, mmctx->vtcm_act_raw_stride, 0, act_nrows);
 
     if (kparams->norm) {  // fused RMS_NORM+MUL of the activation rows, in place, as the norm op computes it
