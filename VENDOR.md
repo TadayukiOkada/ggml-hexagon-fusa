@@ -19,6 +19,7 @@ git -C llama.cpp checkout <commit> && git add llama.cpp
 | 2026-10-09 | `3d65c90d0` | Initial import |
 | 2026-10-26 | `caa8191df` | Upstream rebuilt the host side (`htp-fusion`/`htp-kparams`/`htp-repack`/`htp-opnode`); main's commits ported on top in order, each with a "Port to llama.cpp caa8191df" note. Op budget moved to `htp-budget.cpp`. Merge without squashing, so the vendor merge stays the merge-base |
 | 2026-10-27 | `7aca0d2ea` | `GGML_HEXAGON_VTCM_SIZE`; one conflict |
+| 2026-10-28 | `8642541b2` (v0.8.0) | Hexagon backend unchanged from `7aca0d2ea`; only the llama.cpp submodule pin changes, no vendor merge needed |
 
 Upstream fixes taken into `main` ahead of an import. When an import brings
 the commit, its test patch no longer applies (configure stops): delete it.
