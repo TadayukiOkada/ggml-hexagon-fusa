@@ -85,6 +85,10 @@ def main():
                         env, os.path.join(args.out, "base.log"))
     if rc != 0:
         sys.exit(f"base run failed, rc {rc}: see {args.out}/base.log")
+    # "Mean PPL(base)" of a --kl-divergence run comes from the saved log probabilities, which are
+    # clipped 16 below the top logit, so it reads low. Compare PPL with this estimate instead.
+    m = re.search(r"Final estimate: PPL = " + NUM + r" \+/- " + NUM, log)
+    base_final = {"ppl_base_final": float(m.group(1)), "ppl_base_final_unc": float(m.group(2))} if m else {}
 
     records = 0
     failed = 0
@@ -97,7 +101,7 @@ def main():
             name = f"k_{k}_v_{v}_rot_{rotation}"
             cmd = common + ["-ctk", k, "-ctv", v, "--kl-divergence-base", base_kld, "--kl-divergence"]
             rc, log, secs = run(cmd, run_env, os.path.join(args.out, name + ".log"))
-            stats = parse(log)
+            stats = dict(parse(log), **base_final)
             ok = rc == 0 and "kld" in stats
             failed += not ok
             record = dict(meta, kv={"k": k, "v": v, "rotation": rotation}, rc=rc, ok=ok,
