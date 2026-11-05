@@ -138,24 +138,25 @@ static double htp_estimate_gdn_ms(const struct ggml_tensor * op) {
     return 0.7e-3 * (double) v->ne[1] * v->ne[2] * v->ne[3] * s * s;
 }
 
-// Ops added with llama.cpp v0.9.0, not yet timed on v73: deliberately low rates, so that only
-// small instances stay on the HTP until the long-op cases measure them. Data-movement ops at
-// 5 GB/s of src and dst (a ninth of the 45 GB/s the copies reach), HMX convolutions and the
-// lightning indexer at half the batched HMX matmul rate above, HVX depthwise convolutions at
-// 5 GFLOP/s.
-static double htp_estimate_bytes_ms(const struct ggml_tensor * op) {
+// Ops added with llama.cpp v0.9.0. On v73 (QCS9075, one shape each, GGML_HEXAGON_PROFILE): UPSCALE
+// 512x512x64 -> 1024x1024 bilinear 7.7 ms (42 GB/s of src and dst), TOP_K_MASK over 32768 keys x
+// 512 rows 1.3 ms (53 GB/s), CONV_2D 3x3 256 -> 256 channels at 128x128 6.2 ms (3.1 TFLOP/s),
+// LIGHTNING_INDEXER 64 heads x 512 rows x 16384 keys 38 ms (3.6 TFLOP/s). Estimate the data
+// movement at 20 GB/s and the HMX ops at the batched HMX matmul rate above (a fifth of what the
+// one shape reached); the DSV4 hyper-connection ops are not timed yet, at 5 GB/s.
+static double htp_estimate_bytes_ms(const struct ggml_tensor * op, double bytes_per_ms) {
     double bytes = (double) ggml_nbytes(op);
     for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++) {
         bytes += (double) ggml_nbytes(op->src[i]);
     }
-    return bytes / 5.0e6;
+    return bytes / bytes_per_ms;
 }
 
 // CONV_2D: kernel [KW, KH, IC, OC], dst [OW, OH, OC, N]
 static double htp_estimate_conv_2d_ms(const struct ggml_tensor * op) {
     const struct ggml_tensor * w = op->src[0];
     const double flops = 2.0 * w->ne[0] * w->ne[1] * w->ne[2] * (double) ggml_nelements(op);
-    return (std::max)(flops / 0.3e9, htp_estimate_bytes_ms(op) / 9.0);
+    return (std::max)(flops / 0.6e9, htp_estimate_bytes_ms(op, 20.0e6));
 }
 
 // LIGHTNING_INDEXER: q [D, H, n_batch, ne3], k [D, 1, n_kv, ne3]: a score per head, key and row
@@ -163,7 +164,7 @@ static double htp_estimate_lightning_indexer_ms(const struct ggml_tensor * op) {
     const struct ggml_tensor * q = op->src[0];
     const struct ggml_tensor * k = op->src[1];
     const double flops = 2.0 * q->ne[0] * q->ne[1] * q->ne[2] * q->ne[3] * (double) k->ne[2];
-    return (std::max)(flops / 0.3e9, htp_estimate_bytes_ms(op) / 9.0);
+    return (std::max)(flops / 0.6e9, htp_estimate_bytes_ms(op, 20.0e6));
 }
 
 #ifndef GGML_HEXAGON_HTP_YIELD_IN_OPS
@@ -171,7 +172,7 @@ static double htp_estimate_lightning_indexer_ms(const struct ggml_tensor * op) {
 static double htp_estimate_conv_2d_dw_ms(const struct ggml_tensor * op) {
     const struct ggml_tensor * w = op->src[0];
     const double flops = 2.0 * w->ne[0] * w->ne[1] * (double) ggml_nelements(op);
-    return (std::max)(flops / 5.0e6, htp_estimate_bytes_ms(op) / 9.0);
+    return (std::max)(flops / 5.0e6, htp_estimate_bytes_ms(op, 45.0e6));
 }
 #endif
 
@@ -197,9 +198,10 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
             return htp_budget_check(sess, op, htp_estimate_lightning_indexer_ms(op));
         case GGML_OP_UPSCALE:
         case GGML_OP_TOP_K_MASK:
+            return htp_budget_check(sess, op, htp_estimate_bytes_ms(op, 20.0e6));
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
-            return htp_budget_check(sess, op, htp_estimate_bytes_ms(op));
+            return htp_budget_check(sess, op, htp_estimate_bytes_ms(op, 5.0e6));
 #ifndef GGML_HEXAGON_HTP_YIELD_IN_OPS
         case GGML_OP_CONV_2D_DW:
             return htp_budget_check(sess, op, htp_estimate_conv_2d_dw_ms(op));
