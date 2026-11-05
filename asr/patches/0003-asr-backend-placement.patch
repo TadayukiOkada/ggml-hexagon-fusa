@@ -1,8 +1,8 @@
 diff --git a/app/transcribe.cpp b/app/transcribe.cpp
-index 8ba4f1f..007a3f6 100644
+index eef82c5..510ac46 100644
 --- a/app/transcribe.cpp
 +++ b/app/transcribe.cpp
-@@ -144,7 +144,16 @@ parse_options(int argc, char** argv) {
+@@ -147,7 +147,16 @@ parse_options(int argc, char** argv) {
              o.model = required_value(i, argc, argv, arg);
          else if (arg == "--language" || arg == "-l")
              o.language = required_value(i, argc, argv, arg);
@@ -20,29 +20,29 @@ index 8ba4f1f..007a3f6 100644
              o.gpu = parse_device(required_value(i, argc, argv, arg), arg);
              o.device_set = true;
          } else if (arg == "--gpu") {
-@@ -613,7 +622,8 @@ print_transcribe_help(const char* program) {
-         "                            endpointing is enabled by default\n"
- #endif
-         "  -l, --language CODE       Language code or prompt\n"
+@@ -629,7 +638,8 @@ print_transcribe_help(const char* program) {
+         "  -l, --language CODE       Language code (SALM: language hint)\n"
+         "  --instruction TEXT        Speech-LLM: instruction sent with the audio instead of\n"
+         "                            the default prompt, used as written\n"
 -        "  --device, --backend DEVICE\n"
 +        "  --backend cpu|hexagon; --device HTP0; --backend-lib PATH\n"
 +        "  --frontend cpu|backend (legacy device names remain supported)\n"
          "                            auto, cpu, cuda[:N], metal, or vulkan[:N]\n"
          "  -c, --concurrency N       Concurrent utterances; one shared model\n"
          "  -f, --format FORMAT       text, json, srt, or vtt (default: text)\n"
-@@ -709,6 +719,7 @@ command_transcribe(int argc, char** argv) {
+@@ -732,6 +742,7 @@ command_transcribe(int argc, char** argv) {
  
          asr::RecognizerConfig config = options.engine;
          config.log_status = !cli_quiet() && !cli_json();
 +        config.backend.diagnostics = config.backend.diagnostics || cli_verbose();
          if (options.device_set)
              config.backend.gpu = options.gpu;
-         config.model.path =
+         // SALM without an LLM path reaches the backend's own error instead of resolving (and
 diff --git a/include/nemo_speech/asr.h b/include/nemo_speech/asr.h
-index 70ceace..9d7d547 100644
+index 977be39..3fc9d37 100644
 --- a/include/nemo_speech/asr.h
 +++ b/include/nemo_speech/asr.h
-@@ -58,6 +58,13 @@ typedef enum nemo_speech_asr_decoder_kind {
+@@ -63,6 +63,13 @@ typedef enum nemo_speech_asr_decoder_kind {
  typedef struct nemo_speech_asr_backend_config {
      size_t size;
      int32_t gpu;  // -1 = CPU
@@ -57,10 +57,10 @@ index 70ceace..9d7d547 100644
  
  typedef struct nemo_speech_asr_model_config {
 diff --git a/src/asr/c_api.cpp b/src/asr/c_api.cpp
-index 1ea3997..f97eade 100644
+index 83cc258..506fa99 100644
 --- a/src/asr/c_api.cpp
 +++ b/src/asr/c_api.cpp
-@@ -68,6 +68,13 @@ to_config(const nemo_speech_asr_recognizer_config* c) {
+@@ -72,6 +72,13 @@ to_config(const nemo_speech_asr_recognizer_config* c) {
          const auto* b = c->backend;
          if (HAS_FIELD(b, nemo_speech_asr_backend_config, gpu))
              cfg.backend.gpu = b->gpu;
@@ -465,10 +465,10 @@ index 2e8d2d1..d984d57 100644
          const std::string qkv_q8_layout =
              session->gguf_loader->get_str("asr.encoder.qkv_q8_layout");
 diff --git a/src/asr/features/fe.cpp b/src/asr/features/fe.cpp
-index 382a535..5995605 100644
+index 010e269..f21d34a 100644
 --- a/src/asr/features/fe.cpp
 +++ b/src/asr/features/fe.cpp
-@@ -303,7 +303,7 @@ MelSpectrogramExtractor::MelSpectrogramExtractor(
+@@ -327,7 +327,7 @@ MelSpectrogramExtractor::MelSpectrogramExtractor(
      init_mel_basis();
      init_cpu_tables();
  
@@ -478,7 +478,7 @@ index 382a535..5995605 100644
          session_ =
              std::make_unique<ggml_runtime::Session>(*bm_, module_.get(), /*gguf_loader=*/nullptr);
 diff --git a/src/asr/model.cpp b/src/asr/model.cpp
-index e2bcbcd..ae63362 100644
+index 07e14ac..ec260ed 100644
 --- a/src/asr/model.cpp
 +++ b/src/asr/model.cpp
 @@ -121,8 +121,13 @@ class RnntModel::RnntEncoderTail : public ggml_runtime::Module {
@@ -526,7 +526,7 @@ index e2bcbcd..ae63362 100644
      }
  
     private:
-@@ -1688,8 +1693,17 @@ RnntModel::RnntModel(ggml_runtime::BackendManager& bm, Common&& c, const Batchin
+@@ -1689,8 +1694,17 @@ RnntModel::RnntModel(ggml_runtime::BackendManager& bm, Common&& c, const Batchin
      }
      rnnt_decoder_stages_ = std::make_unique<RnntDecoderStages>(
          rnnt_predictor_.get(), rnnt_joint_.get(), decoder_arena_slots_);
@@ -545,7 +545,7 @@ index e2bcbcd..ae63362 100644
      // Bound graph variants across predictor batch and joint time shapes.
      decoder_session_->set_run_cache_capacity(64);
      decoder_session_->setup();
-@@ -1932,6 +1946,23 @@ RnntModel::joint_argmax_device(
+@@ -1933,6 +1947,23 @@ RnntModel::joint_argmax_device(
          throw std::invalid_argument("joint_argmax_device: stream state belongs to another engine");
      if (!enc_proj.valid() || joint_dim != rnnt_cfg_.joint_dim || frame_offset < 0 || T <= 0)
          throw std::runtime_error("joint_argmax_device: invalid projected encoder input");
@@ -569,7 +569,7 @@ index e2bcbcd..ae63362 100644
      auto result = decoder_batchers_->joint_device(
          state->slot, enc_proj, frame_offset, T, logit_bias, rnnt_cfg_.vocab_size);
      std::copy(result.tokens.begin(), result.tokens.end(), token_ids);
-@@ -1952,6 +1983,11 @@ RnntModel::predict_and_joint_rnnt_argmax_device(
+@@ -1953,6 +1984,11 @@ RnntModel::predict_and_joint_rnnt_argmax_device(
      if (active_bank != 0 && active_bank != 1)
          throw std::invalid_argument(
              "predict_and_joint_rnnt_argmax_device: active bank must be 0 or 1");
@@ -581,7 +581,7 @@ index e2bcbcd..ae63362 100644
      auto result = decoder_batchers_->predict_joint_rnnt_device(
          state->slot, static_cast<int32_t>(prev_token), active_bank, enc_proj, frame_offset, T,
          logit_bias, rnnt_cfg_.vocab_size, state->needs_reset);
-@@ -2055,14 +2091,18 @@ RnntModel::zero_decoder_slots(std::vector<int> slots) {
+@@ -2056,14 +2092,18 @@ RnntModel::zero_decoder_slots(std::vector<int> slots) {
                  for (const auto& name : {rnnt_h_state_name(bank, l), rnnt_c_state_name(bank, l)}) {
                      auto t =
                          decoder_session_->model_tensor_container->get_tensor_by_name(name).tensor;
@@ -603,10 +603,10 @@ index e2bcbcd..ae63362 100644
      }
  }
 diff --git a/src/asr/model.h b/src/asr/model.h
-index 9f7aa8c..d3ebd55 100644
+index 6a3c262..d6885a8 100644
 --- a/src/asr/model.h
 +++ b/src/asr/model.h
-@@ -286,6 +286,8 @@ class RnntModel final : public AsrModel, public RnntEngine {
+@@ -292,6 +292,8 @@ class RnntModel final : public AsrModel, public RnntEngine {
      std::unique_ptr<PromptFusionModule> prompt_fusion_;
      std::unique_ptr<RnntEncoderTail> rnnt_encoder_tail_;
      std::unique_ptr<RnntDecoderStages> rnnt_decoder_stages_;
@@ -616,18 +616,18 @@ index 9f7aa8c..d3ebd55 100644
      std::unique_ptr<DecoderBatchers> decoder_batchers_;
      int decoder_arena_slots_ = 0;
 diff --git a/src/asr/recognizer.cpp b/src/asr/recognizer.cpp
-index ce9bdb2..5e50e33 100644
+index e5f7e43..df51659 100644
 --- a/src/asr/recognizer.cpp
 +++ b/src/asr/recognizer.cpp
-@@ -15,6 +15,7 @@
- #include <vector>
+@@ -17,6 +17,7 @@
  
+ #include "gguf.h"
  #include "model.h"
 +#include "model_logging.h"
  #include "silero_vad.h"
  #ifdef NEMO_SPEECH_WITH_FLASHLIGHT
  #include "flashlight_decoder.h"
-@@ -39,7 +40,18 @@ head_name(HeadKind head) {
+@@ -41,7 +42,18 @@ head_name(HeadKind head) {
  
  std::unique_ptr<ggml_runtime::BackendManager>
  make_backend(const BackendConfig& backend) {
@@ -647,10 +647,10 @@ index ce9bdb2..5e50e33 100644
      p.gpu_device_idx = std::max(backend.gpu, 0);
      p.pe_bin_path = const_cast<char*>("");
 diff --git a/src/asr/recognizer.h b/src/asr/recognizer.h
-index 8b7add0..9e4e9c4 100644
+index 12ce79a..eaa9739 100644
 --- a/src/asr/recognizer.h
 +++ b/src/asr/recognizer.h
-@@ -27,9 +27,23 @@ class SileroVadModel;
+@@ -30,9 +30,23 @@ class SileroVadModel;
  class Recognizer;
  
  struct BackendConfig {

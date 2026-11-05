@@ -1,6 +1,8 @@
+diff --git a/server/http/http_server.cpp b/server/http/http_server.cpp
+index 810dea2..f81428f 100644
 --- a/server/http/http_server.cpp
 +++ b/server/http/http_server.cpp
-@@ -375,6 +375,7 @@
+@@ -379,6 +379,7 @@ class TtsPreemptionLease {
  };
  
  struct Server::Impl {
@@ -8,16 +10,16 @@
      EngineRegistry& models;
      ServerConfig config;
      std::unique_ptr<httplib::Server> server;
-@@ -688,6 +689,8 @@
-                     options.speech_contexts.push_back({{prompt}, 10.0f});
-                 apply_speech_contexts(
+@@ -702,6 +703,8 @@ struct Server::Impl {
                      form_value(request, "speech_contexts"), options.speech_contexts);
+                 // A client that disconnects drops its request (speech-LLM backends).
+                 options.cancelled = [&request] { return request.is_connection_closed(); };
 +                std::unique_lock<std::mutex> admission(this->asr_admission, std::try_to_lock);
 +                if (!admission.owns_lock()) { fail(response, 503, "ASR busy"); return; }
                  auto recognizer = this->models.asr();
-                 const auto result = recognizer->recognize(
-                     audio.samples.data(), audio.samples.size(), options, language,
-@@ -1023,6 +1026,12 @@
+                 if (refuse_unknown_model(
+                         request, response,
+@@ -1131,6 +1134,12 @@ struct Server::Impl {
                      return;
                  }
              }
@@ -28,9 +30,9 @@
 +                return;
 +            }
              auto recognizer = this->models.asr();
-             asr::AsrRequestOptions options;
-             options.enable_automatic_punctuation = true;
-@@ -1030,6 +1039,7 @@
+             auto send_error = [&](const RequestError& error) {
+                 Value response(Value::Object{});
+@@ -1158,6 +1167,7 @@ struct Server::Impl {
              std::unique_ptr<asr::RecognitionStream> stream;
              std::string partial_transcript;
              size_t audio_bytes = 0;
@@ -38,7 +40,7 @@
              auto ensure_stream = [&] {
                  if (!stream)
                      stream = recognizer->streaming_recognize(
-@@ -1059,6 +1069,11 @@
+@@ -1187,6 +1197,11 @@ struct Server::Impl {
                                           : alternative.transcript;
                      partial_transcript = alternative.transcript;
                  }
