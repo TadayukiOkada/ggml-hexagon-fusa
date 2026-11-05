@@ -138,6 +138,43 @@ static double htp_estimate_gdn_ms(const struct ggml_tensor * op) {
     return 0.7e-3 * (double) v->ne[1] * v->ne[2] * v->ne[3] * s * s;
 }
 
+// Ops added with llama.cpp v0.9.0, not yet timed on v73: deliberately low rates, so that only
+// small instances stay on the HTP until the long-op cases measure them. Data-movement ops at
+// 5 GB/s of src and dst (a ninth of the 45 GB/s the copies reach), HMX convolutions and the
+// lightning indexer at half the batched HMX matmul rate above, HVX depthwise convolutions at
+// 5 GFLOP/s.
+static double htp_estimate_bytes_ms(const struct ggml_tensor * op) {
+    double bytes = (double) ggml_nbytes(op);
+    for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++) {
+        bytes += (double) ggml_nbytes(op->src[i]);
+    }
+    return bytes / 5.0e6;
+}
+
+// CONV_2D: kernel [KW, KH, IC, OC], dst [OW, OH, OC, N]
+static double htp_estimate_conv_2d_ms(const struct ggml_tensor * op) {
+    const struct ggml_tensor * w = op->src[0];
+    const double flops = 2.0 * w->ne[0] * w->ne[1] * w->ne[2] * (double) ggml_nelements(op);
+    return (std::max)(flops / 0.3e9, htp_estimate_bytes_ms(op) / 9.0);
+}
+
+// LIGHTNING_INDEXER: q [D, H, n_batch, ne3], k [D, 1, n_kv, ne3]: a score per head, key and row
+static double htp_estimate_lightning_indexer_ms(const struct ggml_tensor * op) {
+    const struct ggml_tensor * q = op->src[0];
+    const struct ggml_tensor * k = op->src[1];
+    const double flops = 2.0 * q->ne[0] * q->ne[1] * q->ne[2] * q->ne[3] * (double) k->ne[2];
+    return (std::max)(flops / 0.3e9, htp_estimate_bytes_ms(op) / 9.0);
+}
+
+#ifndef GGML_HEXAGON_HTP_YIELD_IN_OPS
+// CONV_2D_DW: kernel [KW, KH, 1, C]; releases VTCM between task rounds with yield inside ops
+static double htp_estimate_conv_2d_dw_ms(const struct ggml_tensor * op) {
+    const struct ggml_tensor * w = op->src[0];
+    const double flops = 2.0 * w->ne[0] * w->ne[1] * (double) ggml_nelements(op);
+    return (std::max)(flops / 5.0e6, htp_estimate_bytes_ms(op) / 9.0);
+}
+#endif
+
 bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     if (opt_op_budget_ms <= 0) {
         return true;
@@ -154,6 +191,19 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
             return htp_mul_mat_within_budget(sess, op);
         case GGML_OP_GATED_DELTA_NET:
             return htp_budget_check(sess, op, htp_estimate_gdn_ms(op));
+        case GGML_OP_CONV_2D:
+            return htp_budget_check(sess, op, htp_estimate_conv_2d_ms(op));
+        case GGML_OP_LIGHTNING_INDEXER:
+            return htp_budget_check(sess, op, htp_estimate_lightning_indexer_ms(op));
+        case GGML_OP_UPSCALE:
+        case GGML_OP_TOP_K_MASK:
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
+            return htp_budget_check(sess, op, htp_estimate_bytes_ms(op));
+#ifndef GGML_HEXAGON_HTP_YIELD_IN_OPS
+        case GGML_OP_CONV_2D_DW:
+            return htp_budget_check(sess, op, htp_estimate_conv_2d_dw_ms(op));
+#endif
 #ifndef GGML_HEXAGON_HTP_YIELD_IN_OPS
         case GGML_OP_SOFT_MAX:
             // Without rounds the whole op holds VTCM: about 1.7 G elements/s on v73 (attention scores
