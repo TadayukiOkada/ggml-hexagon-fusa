@@ -1,0 +1,26 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 56696f57c..5ced1395e 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10591,6 +10591,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
+     // gated delta net prefill: 16 K heads, 32 V heads, head 128
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2));
+ 
++    // ops the HTP takes since llama.cpp v0.9.0, at sizes that run for tens of ms
++    // depthwise convolutions: NeMo conformer conv module over a long offline input (channels
++    // inner, kernel 9, 1024 channels) and a 2D stride-2 3x3 pre-encoder stage (256 channels)
++    test_cases.emplace_back(new test_conv_2d_dw({ 4096, 1, 1024, 1 }, { 9, 1, 1, 1024 }, GGML_TYPE_F32, 1, 0, 1, true));
++    test_cases.emplace_back(new test_conv_2d_dw({ 64, 3000, 256, 1 }, { 3, 3, 1, 256 }, GGML_TYPE_F32, 2, 1, 1, false));
++    // direct 3x3 convolution, 256 -> 256 channels at 128x128
++    test_cases.emplace_back(new test_conv_2d({ 128, 128, 256, 1 }, { 3, 3, 256, 256 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1, false));
++    // 2x upscale of a 64-channel 512x512 map
++    test_cases.emplace_back(new test_upscale(GGML_TYPE_F32, { 512, 512, 64, 1 }, 2, GGML_SCALE_MODE_BILINEAR));
++    // sparse attention mask over a long KV cache, lightning indexer against it
++    test_cases.emplace_back(new test_top_k_mask(GGML_TYPE_F16, 32768, 4, 2048, 512, 3, true, 512));
++    test_cases.emplace_back(new test_lightning_indexer(128, 64, 16384, 512));
++    // tiled transposed copies of a long KV cache
++    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, { 128, 8, 16384, 1 }, false, { 1, 2, 0, 3 }));
++
+     return test_cases;
+ }
+ 

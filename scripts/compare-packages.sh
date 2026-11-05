@@ -7,6 +7,8 @@
 #   leak     test-hexagon-metadata on HTP0 (new only)
 #   llm      llama-completion, 64 tokens greedy, Qwen3-0.6B and Qwen3.5-0.8B: text and speed, old vs new
 #   bench    llama-bench pp512 / tg128 on the same two models, old vs new
+#   bench-abba  llama-bench pp512 / tg128 -r 5 in the order old, new, new, old per model, so that
+#            drift over time cancels (scripts/verdict.py compares the means)
 #   prefill  Qwen3-0.6B, a 12.7k-token prompt, flash attention on and off (new only)
 #   asr      run-asr.sh (streaming) on HTP0 and HTP1, old vs new, and a 60 s clip (new only)
 #   sv       run-sensevoice.sh --json on HTP0 and HTP1, 4 inputs, old vs new
@@ -71,6 +73,14 @@ for step in "$@"; do
                 > "$out/bench_${v}_$m.md" 2> "$out/bench_${v}_$m.err"
             log "bench $v $m rc=$? $(grep -E '\| *(pp|tg)[0-9]+ ' "$out/bench_${v}_$m.md" | awk -F'|' '{gsub(/ /,"",$8); gsub(/^ +| +$/,"",$9); printf "%s %s  ", $8, $9}')"
             sleep 10; done; done ;;
+    bench-abba)
+        [ "$old" != - ] || { log "bench-abba needs an old package rc=2"; continue; }
+        for m in Q3 Q35; do eval f=\$$m; i=0
+            for v in old new new old; do i=$((i + 1))
+                timeout 900 "$(pkg $v)/run.sh" llama-bench -m "$f" -p 512 -n 128 -r 5 -dev HTP0 -ngl 99 -o md \
+                    > "$out/abba_${m}_${i}_$v.md" 2> "$out/abba_${m}_${i}_$v.err"
+                log "bench $v $m rc=$? $(grep -E '\| *(pp|tg)[0-9]+ ' "$out/abba_${m}_${i}_$v.md" | awk -F'|' '{gsub(/ /,"",$8); gsub(/^ +| +$/,"",$9); printf "%s %s  ", $8, $9}')"
+                sleep 10; done; done ;;
     prefill)
         for fa in on off; do
             timeout 900 "$new/run.sh" llama-completion -m "$Q3" -ngl 99 -dev HTP0 -no-cnv --temp 0 -n 4 -c 13312 -fa $fa \

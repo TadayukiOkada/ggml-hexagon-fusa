@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 6b82498..2c37f59 100644
+index 837c33b37..20fcce2b0 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9903,6 +9903,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
+@@ -10548,6 +10548,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
          test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, kv, 512, 128, { 8, 1 }, { 2, 1 }));
          test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 512, kv, { 8, 1 }, { 2, 1 }));
      }
@@ -13,7 +13,7 @@ index 6b82498..2c37f59 100644
      // F32 attention of a speech encoder (SenseVoice: head 128, 4 heads), the keys padded to a
      // multiple of 32: KQ and KQV with stored src0, and KQ with src0 computed in the graph, which
      // the backend has to estimate as well
-@@ -10121,6 +10125,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10807,6 +10811,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
      test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
      test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));

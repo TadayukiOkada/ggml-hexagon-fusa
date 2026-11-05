@@ -81,7 +81,18 @@ logs it (`ggml-hex: HTP0 build ...`).
   budget (default 25 ms, half of a 50 ms self-test period).
 - `scripts/check-skel.sh` checks a skel for the SWIV CRC section and, given the
   firmware shell, for imports the shell does not export. FuSa builds run it.
-- CI builds the Android and Linux presets for all HTP generations.
+- `scripts/release-build.sh <out>` runs every local check of an import in one go
+  (FuSa build and packages, all HTP generations, the CPU SenseVoice tests, the
+  offline tests) and records each step in `<out>/results.jsonl`.
+- `scripts/target-suite.sh --evk|--fusa <new> <old> <kit> <out>` runs the device
+  regression on a target in a fixed order (all ops, long ops with a VTCM/HMX
+  probe, the package comparison, a 300 s ASR input); `--fusa` refuses the groups
+  that are unsafe on functional-safety firmware. `scripts/verdict.py` turns the
+  results into PASS / REVIEW / FAIL: every expected result must be there, known
+  op failures are listed in `tests/known-failures.txt`, speed may drop by 3 %.
+- `tests/release/` tests these scripts offline (`python3 -m unittest discover -s tests/release`).
+- CI builds the Android and Linux presets for all HTP generations and runs the CPU
+  SenseVoice and offline release tests.
 
 With `GGML_HEXAGON_PROFILE=1`, each batch also logs a `profile-resource` line
 with VTCM/HMX maxima since the session opened (not per batch).
@@ -192,9 +203,9 @@ Separate processes can use the HTP at the same time, each with its own DSP
 session: for example a llama.cpp tool on `HTP0` and `ASR_DEVICE=HTP1`, or both on
 one CDSP, where the sessions hand VTCM and HMX to each other at op boundaries
 through the DSP resource manager, as they do for the firmware's self-test.
-To move the NeMo pin, update the submodule and refresh the patches until
-configure applies them, then rerun `test_backend_storage` and recognition on
-the target.
+To move the NeMo pin, update the submodule and move the patches with
+`scripts/rebase-patches.sh` (or `scripts/llama-release.sh import ... --nemo <rev>`),
+then rerun `test_backend_storage` and recognition on the target.
 
 ## SenseVoice
 
@@ -279,9 +290,11 @@ per wait on the FuSa board's guest).
 The backend sources start from upstream `ggml/src/ggml-hexagon/`. The
 `vendor` branch holds unmodified upstream snapshots; `main` merges them
 and carries the changes for this target. `VENDOR.md` lists the imported
-upstream commits and the steps to import a newer one: update `vendor`
-with `scripts/vendor-update.sh`, merge it, move the submodule to the same
-commit, then build all presets and run the device tests before committing.
+upstream commits and the steps to import a newer one
+(`scripts/llama-release.sh import`): update `vendor` with
+`scripts/vendor-update.sh`, merge it, move the submodule to the same commit,
+move the patch series with `scripts/rebase-patches.sh`, review the ops the HTP
+newly takes, then build all presets and run the device tests before committing.
 
 ## License
 

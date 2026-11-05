@@ -1,7 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 82acba87d..4d0daf01f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -7615,6 +7615,7 @@
+@@ -7987,6 +7987,7 @@ enum mul_mat_add_mode {
      MUL_MAT_ADD_RES_INPLACE, // res += mm
      MUL_MAT_ADD_B_INPLACE,   // b += mm: the sum overwrites the mat-mul input (m == k)
      MUL_MAT_ADD_MM_MM,       // mm2 + mm: the residual is itself a mat-mul output, so both operands are MUL_MAT
@@ -9,7 +10,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  };
  
  static std::string var_to_str(mul_mat_add_mode mode) {
-@@ -7625,6 +7626,7 @@
+@@ -7997,6 +7998,7 @@ static std::string var_to_str(mul_mat_add_mode mode) {
          case MUL_MAT_ADD_RES_INPLACE: return "res+=mm";
          case MUL_MAT_ADD_B_INPLACE:   return "b+=mm";
          case MUL_MAT_ADD_MM_MM:       return "mm2+mm";
@@ -17,7 +18,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
      }
      return "unknown";
  }
-@@ -7660,13 +7662,14 @@
+@@ -8032,13 +8034,14 @@ struct test_mul_mat_add : public test_case {
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a   = ggml_new_tensor_2d(ctx, type_a,        k, m);
          ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
@@ -34,7 +35,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
              case MUL_MAT_ADD_RES_MM:      out = ggml_add(ctx, res, mm);         break;
              case MUL_MAT_ADD_RES_INPLACE: out = ggml_add_inplace(ctx, res, mm); break;
              case MUL_MAT_ADD_B_INPLACE:   out = ggml_add_inplace(ctx, b, mm);   break;
-@@ -10922,7 +10925,7 @@
+@@ -11735,7 +11738,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              }
          }
          for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K, GGML_TYPE_F16}) {

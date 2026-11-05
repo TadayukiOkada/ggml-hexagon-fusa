@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 3a1397c..370f5b4 100644
+index dce0d91..6d7d75d 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -194,6 +194,13 @@ option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (nativ
+@@ -202,6 +202,13 @@ option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (nativ
  # and cmake/llama_cpp.cmake). OFF builds the pristine llama.cpp submodule; the code
  # then uses only stock ggml operations, at some latency cost on CUDA.
  option(NEMO_SPEECH_GGML_PATCHED "Apply patches/ to ggml and llama.cpp and use the patched operations" ON)

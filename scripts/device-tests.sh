@@ -19,7 +19,10 @@
 #   --bench   llama-bench pp512, pp2048 and tg128 on HTP0 for each model
 #
 # Environment: ADSP_LIBRARY_PATH as the board needs it (run.sh puts the package first),
-# TEST_PAUSE seconds between processes after a failure or a model run (default 20).
+# TEST_PAUSE seconds between processes after a failure or a model run (default 20),
+# LONG_ONLY=name,... runs only those --long cases. To time ops the op budget leaves to the CPU
+# (to fit its estimates), run --long with GGML_HEXAGON_OP_BUDGET_MS=0, on a device without the
+# self-test only.
 set -u
 
 pkg=$(cd "${1:?usage: $0 <package dir> <out dir> [--ops] [--long] [--leak] [--bench MODEL]...}" && pwd)
@@ -65,7 +68,7 @@ fi
 if [ $long -eq 1 ]; then
     # The single ops added by tests/patches/0002 and friends.
     for spec in \
-        "cont CONT ne=\[(1024,(768|1152),1,1|32,32,(768|1152),1|128,8,(512,4|4096,1))\]" \
+        "cont CONT ne=\[(1024,(768|1152),1,1|32,32,(768|1152),1|128,8,(512,4|4096,1|16384,1))\]" \
         "lmhead MUL_MAT m=(151936|262144)," \
         "attn32 MUL_MAT type_a=f32,type_b=f32,m=(512|1024|128),n=(504|1004)," \
         "attnact MUL_MAT type=f32,m=(512|1024)," \
@@ -75,9 +78,15 @@ if [ $long -eq 1 ]; then
         "binmul MUL ne=\[(4096,4096|1,1),1,1\],nr=\[(1,1|4096,4096),1,1\]" \
         "argsort ARGSORT ne=\[(151936|262144),1,1,1\]" \
         "repeat REPEAT ne=\[(1,4096,1,1|128,16,512,1)\]" \
-        "fa FLASH_ATTN_EXT hsk=128,hsv=128,nh=8,nr23=\[2,1\],kv=(512|4096|8192|16384),nb=512,"
+        "fa FLASH_ATTN_EXT hsk=128,hsv=128,nh=8,nr23=\[2,1\],kv=(512|4096|8192|16384),nb=512," \
+        "convdw CONV_2D_DW ne_input=\[(4096,1,1024,1|64,3000,256,1)\]" \
+        "conv2d CONV_2D ne_input=\[128,128,256,1\]" \
+        "upscale UPSCALE ne=\[512,512,64,1\]" \
+        "topkmask TOP_K_MASK n_kv=32768," \
+        "indexer LIGHTNING_INDEXER hsk=128,nh=64,kv=16384,"
     do
         set -- $spec
+        case ",${LONG_ONLY:-$1}," in *",$1,"*) ;; *) continue ;; esac
         GGML_TEST_LONG_OPS=1 GGML_HEXAGON_PROFILE=1 run 1800 "$out/long_$1.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$2" -p "$3"
         rc=$?
         echo "long $1 rc=$rc" | tee -a "$summary"

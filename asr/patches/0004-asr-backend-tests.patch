@@ -1,8 +1,8 @@
 diff --git a/tests/cpp/asr/CMakeLists.txt b/tests/cpp/asr/CMakeLists.txt
-index 4f07284..5e07dee 100644
+index 6ad8251..485518b 100644
 --- a/tests/cpp/asr/CMakeLists.txt
 +++ b/tests/cpp/asr/CMakeLists.txt
-@@ -107,3 +107,10 @@ if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
+@@ -111,3 +111,10 @@ if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
      add_test(NAME skinny_q8_dispatch COMMAND test_skinny_q8_dispatch)
      set_tests_properties(skinny_q8_dispatch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
  endif()
@@ -15,7 +15,7 @@ index 4f07284..5e07dee 100644
 +target_link_libraries(test_rnnt_stage_replay PRIVATE nemo_speech_asr)
 diff --git a/tests/cpp/asr/test_backend_storage.cpp b/tests/cpp/asr/test_backend_storage.cpp
 new file mode 100644
-index 0000000..5431fa3
+index 0000000..b6724fa
 --- /dev/null
 +++ b/tests/cpp/asr/test_backend_storage.cpp
 @@ -0,0 +1,307 @@

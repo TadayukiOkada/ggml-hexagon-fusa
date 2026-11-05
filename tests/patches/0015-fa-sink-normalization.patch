@@ -1,7 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1c79358ac..0cd5d58ff 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -8658,6 +8658,38 @@
+@@ -9157,6 +9157,38 @@ struct test_flash_attn_ext_kv_rows : public test_case {
      }
  };
  
@@ -40,7 +41,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -12129,6 +12160,15 @@
+@@ -13063,6 +13095,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
          test_cases.emplace_back(new test_gdn_decay(64, 127, 2, 2, g_lo));
      }
