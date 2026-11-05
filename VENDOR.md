@@ -5,14 +5,23 @@
 holds the unmodified upstream files; `main` merges it. The `llama.cpp`
 submodule always points at the same commit as the latest import.
 
-To import a newer upstream:
+To import a newer upstream release (and new NeMo-Speech.cpp / SenseVoice pins):
 
 ```sh
-scripts/vendor-update.sh <commit>
-git merge vendor
-git -C llama.cpp checkout <commit> && git add llama.cpp
-# build and test, then add a row below
+scripts/llama-release.sh import v0.9.0 ../ggml-hexagon-fusa-import <work dir> [--nemo v0.3.0] [--sensevoice <rev>]
+# a conflict stops it (merge in the worktree, or a patch series in <work dir>/rebase-*/repo):
+# resolve, then run the same command again until it prints "import ready"
+scripts/release-build.sh <out dir>             # in the worktree: every local build and CPU check
+# device regression: scripts/target-suite.sh on the targets, scripts/verdict.py on the results
+# then commit the pins, the patch series and a row below
 ```
+
+`import` runs `scripts/vendor-update.sh`, merges `vendor` into `import/llama-<tag>` without
+squashing, moves the pins, and moves `tests/patches/`, `asr/patches/` and `sensevoice/patches/`
+with `scripts/rebase-patches.sh` (which checks that each series still adds and removes the same
+lines and keeps its braces balanced). Its `review-ops` step lists the ops the HTP newly takes and
+whether the op budget (`htp-budget.cpp`) or a yield point covers each: on functional-safety
+firmware an op that holds VTCM/HMX past the self-test period stops the DSP.
 
 | Date | llama.cpp commit | Notes |
 |---|---|---|
