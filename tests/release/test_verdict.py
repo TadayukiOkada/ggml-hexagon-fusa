@@ -193,6 +193,25 @@ class VerdictTest(unittest.TestCase):
         s = compare_summary(edit=lambda l: l.replace("sv new HTP1 input rc=0 md5=dddd same", "sv new HTP1 input rc=0 md5=eeee DIFFERENT"))
         self.assertEqual(self.compare(s), REVIEW, self.output)
 
+    def test_compare_review_accepted(self):
+        s = compare_summary(edit=lambda l: l.replace("asr new HTP1 input rc=0 text=bbbb same", "asr new HTP1 input rc=0 text=eeee DIFFERENT"))
+        acc = os.path.join(self.d, "accept.txt")
+        write(acc, "# reviewed\nasr.new.HTP1.input new text equals the CPU reference\nnever.matches unused\n")
+        self.assertEqual(self.compare_with(s, "--accept", acc), PASS, self.output)
+        self.assertIn("accept  compare: asr new HTP1 input", self.output)
+        self.assertIn("matched nothing", self.output)
+
+    def test_compare_fail_not_accepted(self):
+        s = compare_summary(edit=lambda l: l.replace("llm old Q3 rc=0", "llm old Q3 rc=127"))
+        acc = os.path.join(self.d, "accept.txt")
+        write(acc, "llm accept everything\n")
+        self.assertEqual(self.compare_with(s, "--accept", acc), FAIL, self.output)
+
+    def compare_with(self, text, *args):
+        p = os.path.join(self.d, "summary.txt")
+        write(p, text)
+        return self.run_verdict("--compare", p, *args)
+
     def test_compare_interrupted_step(self):
         self.assertEqual(self.compare(compare_summary(drop_line="sv new HTP1")), FAIL, self.output)
         self.assertIn("step sv has", self.output)

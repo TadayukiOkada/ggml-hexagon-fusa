@@ -18,6 +18,9 @@
                   stops the DSP at 50 ms); its .log, when present, must report no failure. No CSV
                   at all fails.
   --probe F       older summary lines "probe <name> <n> samples, max=<us> us, timeouts=<n>".
+  --accept F      reviewed differences: lines "<regex> <reason>"; a REVIEW finding that a regex
+                  matches becomes "accepted" (printed with the reason). Only for decisions a reviewer
+                  recorded for this release; a FAIL is never accepted. Unused lines are reported.
   --json OUT      also write the findings as JSON (level, findings with kind/check/message).
 
 Exit 0 PASS, 3 REVIEW, 1 FAIL. Prints one line per finding.
@@ -301,9 +304,10 @@ def check_probe(path, limit_ms, out):
 
 
 class Out:
-    def __init__(self):
+    def __init__(self, accept=()):
         self.level = 0  # 0 pass, 3 review, 1 fail
         self.findings = []
+        self.accept = list(accept)  # [regex, reason, hits]
 
     def _add(self, kind, msg):
         self.findings.append({"kind": kind, "check": msg.split(":", 1)[0], "message": msg})
@@ -313,6 +317,12 @@ class Out:
         self._add("ok", msg)
 
     def review(self, msg):
+        a = next((a for a in self.accept if a[0].search(msg)), None)
+        if a:
+            a[2] += 1
+            print(f"  accept  {msg} ({a[1]})")
+            self._add("accepted", f"{msg} ({a[1]})")
+            return
         print(f"  REVIEW  {msg}")
         self._add("review", msg)
         if self.level == 0:
@@ -334,9 +344,17 @@ def main(argv=None):
     ap.add_argument("--known", default=os.path.join(HERE, "..", "tests", "known-failures.txt"))
     ap.add_argument("--speed-drop", type=float, default=0.03)
     ap.add_argument("--probe-ms", type=float, default=25.0)
+    ap.add_argument("--accept")
     ap.add_argument("--json")
     a = ap.parse_args(argv)
-    out = Out()
+    accept = []
+    if a.accept:
+        for line in open(a.accept):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                pattern, _, reason = line.partition(" ")
+                accept.append([re.compile(pattern), reason.strip() or "accepted", 0])
+    out = Out(accept)
     if not (a.ops or a.long or a.compare or a.probe_dir or a.probe):
         out.fail("nothing to check")
     if a.ops:
@@ -349,6 +367,9 @@ def main(argv=None):
         check_probe_dir(d, a.probe_ms, out)
     for f in a.probe:
         check_probe(f, a.probe_ms, out)
+    for pattern, reason, hits in out.accept:
+        if not hits:
+            out.note(f"accept: {pattern.pattern} matched nothing ({reason})")
     verdict = {0: "PASS", 3: "REVIEW", 1: "FAIL"}[out.level]
     print(verdict)
     if a.json:
