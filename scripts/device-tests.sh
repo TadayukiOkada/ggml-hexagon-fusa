@@ -19,7 +19,10 @@
 #   --bench   llama-bench pp512, pp2048 and tg128 on HTP0 for each model
 #
 # Environment: ADSP_LIBRARY_PATH as the board needs it (run.sh puts the package first),
-# TEST_PAUSE seconds between processes after a failure or a model run (default 20).
+# TEST_PAUSE seconds between processes after a failure or a model run (default 20),
+# LONG_ONLY=name,... runs only those --long cases. To time ops the op budget leaves to the CPU
+# (to fit its estimates), run --long with GGML_HEXAGON_OP_BUDGET_MS=0, on a device without the
+# self-test only.
 set -u
 
 pkg=$(cd "${1:?usage: $0 <package dir> <out dir> [--ops] [--long] [--leak] [--bench MODEL]...}" && pwd)
@@ -83,6 +86,7 @@ if [ $long -eq 1 ]; then
         "indexer LIGHTNING_INDEXER hsk=128,nh=64,kv=16384,"
     do
         set -- $spec
+        case ",${LONG_ONLY:-$1}," in *",$1,"*) ;; *) continue ;; esac
         GGML_TEST_LONG_OPS=1 GGML_HEXAGON_PROFILE=1 run 1800 "$out/long_$1.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$2" -p "$3"
         rc=$?
         echo "long $1 rc=$rc" | tee -a "$summary"
