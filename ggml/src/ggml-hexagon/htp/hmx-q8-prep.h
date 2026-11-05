@@ -5,15 +5,13 @@
 #include "hvx-utils.h"
 #include "hvx-quant.h"
 
-// Same arithmetic as hvx_dequantize_row_flat_q8_0_f16, without a flat F16 store.
-// Copy only the 32 valid code bytes: a full unaligned vector load can overread
-// the last DMA staging row. Keep the staging stride/layout unchanged.
+// Same arithmetic as hvx_dequantize_row_flat_q8_0_f16, without a flat F16 store. The codes are
+// read with the same unaligned vector load as there (up to 96 bytes past the block, inside the
+// VTCM staging, whose rows are laid out for F16): copying only the 32 bytes compiles to 16
+// halfword loads and a serial vinsert chain, several times slower than the whole old prep.
 static inline HVX_Vector hmx_q8_block_f32(const block_q8_0 * src) {
-    HVX_Vector code = Q6_V_vzero();
-    memcpy(&code, src->qs, QK8_0);
-    uint16_t scale;
-    memcpy(&scale, &src->d, sizeof(scale));
-    HVX_VectorPair ds = hvx_vec_f16_to_f32(Q6_Vh_vsplat_R(scale));
+    const HVX_Vector code = *(const HVX_UVector *) src->qs;
+    HVX_VectorPair ds = hvx_vec_f16_to_f32(Q6_Vh_vsplat_R(*(const int16_t *) &src->d));
     HVX_VectorPair i16 = Q6_Wh_vunpack_Vb(code);
     HVX_VectorPair i32 = Q6_Ww_vunpack_Vh(Q6_V_lo_W(i16));
     return hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(Q6_V_lo_W(i32)), Q6_V_lo_W(ds));
