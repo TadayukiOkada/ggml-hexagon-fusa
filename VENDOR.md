@@ -29,6 +29,7 @@ firmware an op that holds VTCM/HMX past the self-test period stops the DSP.
 | 2026-10-26 | `caa8191df` | Upstream rebuilt the host side (`htp-fusion`/`htp-kparams`/`htp-repack`/`htp-opnode`); main's commits ported on top in order, each with a "Port to llama.cpp caa8191df" note. Op budget moved to `htp-budget.cpp`. Merge without squashing, so the vendor merge stays the merge-base |
 | 2026-10-27 | `7aca0d2ea` | `GGML_HEXAGON_VTCM_SIZE`; one conflict |
 | 2026-10-28 | `8642541b2` (v0.8.0) | Hexagon backend unchanged from `7aca0d2ea`; only the llama.cpp submodule pin changes, no vendor merge needed |
+| 2026-11-04 | `cd959bae9` (v0.9.0) | New HTP ops CONV_2D, CONV_2D_DW, UPSCALE, TOP_K_MASK, LIGHTNING_INDEXER, DSV4_HC_PRE/POST and a tiled transposed copy. CONV_2D_DW and the transposed copy release VTCM between rounds; the others are in the op budget, fitted to one shape each on v73 with margin (LIGHTNING_INDEXER took 38 ms at 64 heads x 16k keys, so large ones stay on the CPU). IM2COL keeps its rounds on upstream's block split and gains the KH = 1 gather path. NeMo-Speech.cpp moves to v0.3.0 (`20999cc`) |
 
 Upstream fixes taken into `main` ahead of an import. When an import brings
 the commit, its test patch no longer applies (configure stops): delete it.
