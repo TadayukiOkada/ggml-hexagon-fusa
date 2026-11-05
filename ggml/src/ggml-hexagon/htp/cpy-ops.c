@@ -661,7 +661,24 @@ static int cpy_transpose(struct htp_ops_context * octx, const struct htp_copy_ke
     ct.vtcm_src0 = vtcm_base;
     ct.vtcm_dst  = vtcm_base + (size_t) n_threads * 2 * tp->in_buf_size;
 
+#ifdef HTP_YIELD_IN_CPY
+    // Rounds of about 2 MiB of tiles, with VTCM/HMX given away between them on request: each tile
+    // is staged and written back within its round.
+    const uint32_t tiles_2m = (2u << 20) / MAX(tp->in_buf_size, 1u);
+    const uint32_t round    = MAX(n_threads, tiles_2m / n_threads * n_threads);
+    for (uint32_t done = 0; done < ntiles;) {
+        ct.tile_start       = tile_start + done;
+        ct.ntiles           = MIN(ntiles - done, round);
+        ct.tiles_per_thread = fastdiv(ct.ntiles + n_threads - 1, &octx->n_threads_div);
+        work_queue_run(octx->ctx->work_queue, cpy_thread_transpose, &ct, n_threads);
+        done += ct.ntiles;
+        if (done < ntiles) {
+            htp_vtcm_yield(octx->ctx);
+        }
+    }
+#else
     work_queue_run(octx->ctx->work_queue, cpy_thread_transpose, &ct, n_threads);
+#endif
     return HTP_STATUS_OK;
 }
 

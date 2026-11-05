@@ -3108,6 +3108,17 @@ static void conv2d_dw_dma_thread(unsigned int nth, unsigned int ith, void * data
          ith, nth, kp->w, kp->h, kp->c, kp->n, kp->ow, kp->oh, kp->c, kp->n, first, last);
 }
 
+static void conv2d_dw_load_weights(struct htp_ops_context * octx, const struct htp_tensor * w_vtcm_tensor,
+                                   void * w_vtcm, uint32_t elem_size, uint32_t w_size) {
+    const struct htp_tensor * src0 = octx->src[0];
+    if (src0->nb[0] == elem_size) {
+        dma_cpy_sametype_sameshape(octx->ctx->dma[0], w_vtcm_tensor, src0, elem_size);
+    } else {
+        dma_sync_read(octx->ctx->dma[0], w_vtcm, src0->data, w_size);
+    }
+    dma_queue_flush(octx->ctx->dma[0]);
+}
+
 int op_conv_2d_dw(struct htp_ops_context * octx) {
     const struct htp_conv2d_dw_kernel_params * kp =
         (const struct htp_conv2d_dw_kernel_params *) octx->kernel_params;
@@ -3139,12 +3150,7 @@ int op_conv_2d_dw(struct htp_ops_context * octx) {
     struct htp_tensor w_vtcm_tensor = *src0;
     w_vtcm_tensor.data = (dma_addr_t) w_vtcm;
 
-    if (src0->nb[0] == elem_size) {
-        dma_cpy_sametype_sameshape(octx->ctx->dma[0], &w_vtcm_tensor, src0, elem_size);
-    } else {
-        dma_sync_read(octx->ctx->dma[0], w_vtcm, src0->data, w_size);
-    }
-    dma_queue_flush(octx->ctx->dma[0]);
+    conv2d_dw_load_weights(octx, &w_vtcm_tensor, w_vtcm, elem_size, w_size);
 
     uint32_t task_start = 0;
     uint32_t task_count = kp->total_tasks;
@@ -3159,7 +3165,6 @@ int op_conv_2d_dw(struct htp_ops_context * octx) {
     }
 
     const uint32_t nth = MIN(kp->n_threads, task_count);
-    const uint32_t tasks_per_thread = (task_count + nth - 1) / nth;
 
     struct conv2d_dw_dma_context ctx = {
         .octx             = octx,
@@ -3167,11 +3172,32 @@ int op_conv_2d_dw(struct htp_ops_context * octx) {
         .layout           = layout,
         .w_vtcm           = w_vtcm,
         .compute_fn       = conv2d_dw_kernels[kp->kernel_type][kp->is_f16 ? 1 : 0],
-        .task_start       = task_start,
-        .task_count       = task_count,
-        .tasks_per_thread = tasks_per_thread,
     };
 
-    work_queue_run(octx->ctx->work_queue, conv2d_dw_dma_thread, &ctx, nth);
+    // With yield inside ops the tasks run in rounds of about 2 MiB of output, so VTCM/HMX can be
+    // given away between rounds when a release is requested (e.g. by a functional-safety
+    // self-test): the offline NeMo pre-encoder convolves the whole input at once. The weights in
+    // VTCM are loaded again after a release.
+#ifdef HTP_YIELD_IN_OPS
+    const uint32_t tasks_2m = (2u << 20) / MAX(max_dst_bytes, 1u);
+    const uint32_t round    = MAX(nth, tasks_2m / nth * nth);
+#else
+    const uint32_t round = task_count;
+#endif
+    for (uint32_t done = 0; done < task_count;) {
+        const uint32_t n = MIN(round, task_count - done);
+        const uint32_t t = MIN(nth, n);
+        ctx.task_start       = task_start + done;
+        ctx.task_count       = n;
+        ctx.tasks_per_thread = (n + t - 1) / t;
+        work_queue_run(octx->ctx->work_queue, conv2d_dw_dma_thread, &ctx, t);
+        done += n;
+#ifdef HTP_YIELD_IN_OPS
+        if (done < task_count && atomic_load(&octx->ctx->vtcm_needs_release)) {
+            htp_vtcm_yield(octx->ctx);
+            conv2d_dw_load_weights(octx, &w_vtcm_tensor, w_vtcm, elem_size, w_size);
+        }
+#endif
+    }
     return HTP_STATUS_OK;
 }
