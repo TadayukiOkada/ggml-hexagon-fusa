@@ -431,6 +431,9 @@ static bool htp_kparams_solve_flash_attn(
         int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size, causal);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
+            if (opt_fa_q8_prep) {
+                kparams->flags |= HTP_FA_FLAG_FUSED_Q8_PREP;
+            }
             if (!opt_fa_mh) {
                 kparams->flags |= HTP_FA_FLAG_NO_MH;
             }

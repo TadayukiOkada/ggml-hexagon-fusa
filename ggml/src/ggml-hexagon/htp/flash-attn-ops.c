@@ -35,6 +35,7 @@
 #include "flash-attn-ops.h"
 #include "hvx-fa-kernels.h"
 #include "hmx-fa-kernels.h"
+#include "hmx-q8-prep.h"
 
 // Must be multiple of 32
 #define FLASH_ATTN_BLOCK_SIZE (32 * 2)
@@ -123,6 +124,7 @@ struct hmx_fa_context {
     const struct htp_tensor *      sinks;  // attention sinks (src[4]), NULL if absent
     const struct htp_tensor *      k;
     const struct htp_tensor *      v;
+    bool         fused_q8_prep;
     bool         pipeline;  // true when n_kv_blocks >= FA_MIN_KV_BLOCKS && n_threads >= 2
     uint32_t     n_threads;
 
@@ -815,6 +817,13 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+    if (factx->fused_q8_prep && factx->k->type == HTP_TYPE_Q8_0) {
+        hmx_q8_k_to_tiles(factx->vtcm_k_tiles[args->buf_idx], args->curr_k, args->src_stride * sizeof(__fp16),
+                          factx->DK, factx->DK_pad, start, end);
+        hvx_gather_sync(factx->vtcm_k_tiles[args->buf_idx]);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+        return;
+    }
     if (factx->k->type == HTP_TYPE_Q8_0) {
         for (uint32_t r = start; r < end; ++r) {
             __fp16 * row_k = (__fp16 *)((char *)args->curr_k + r * args->src_stride * sizeof(__fp16));
@@ -872,6 +881,12 @@ static void fa_v_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
+    if (factx->fused_q8_prep && factx->v->type == HTP_TYPE_Q8_0) {
+        hmx_q8_v_to_tiles(v_tiles_dst, args->v_src, args->src_stride * sizeof(__fp16),
+                          factx->DV, factx->DV_pad, args->n_col_tiles, start, end);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
+        return;
+    }
     if (factx->v->type == HTP_TYPE_Q8_0) {
         for (uint32_t r = start; r < end; ++r) {
             __fp16 * row_v = (__fp16 *)((char *)args->v_src + r * args->src_stride * sizeof(__fp16));
@@ -2691,6 +2706,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // ======== Build context ========
     struct hmx_fa_context factx;
     memset(&factx, 0, sizeof(factx));
+    factx.fused_q8_prep = (kparams->flags & HTP_FA_FLAG_FUSED_Q8_PREP) != 0;
     factx.octx           = octx;
     factx.sinks          = octx->src[4];  // NULL if this op has no attention sinks
     factx.k              = k;

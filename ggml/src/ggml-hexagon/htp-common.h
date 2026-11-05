@@ -32,6 +32,7 @@ extern int    opt_mm_select;
 extern int    opt_fa_select;
 extern int    opt_fa_split;
 extern int    opt_fa_mh;
+extern int    opt_fa_q8_prep;
 extern int    opt_gdn_select;
 extern int    opt_ar_select;
 extern int    opt_ar_scatter;

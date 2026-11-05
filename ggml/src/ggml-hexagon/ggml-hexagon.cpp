@@ -137,6 +137,7 @@ size_t opt_mbuf_total  = 0;                        // total buffer space limit (
 int    opt_mm_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
+int    opt_fa_q8_prep    = 0; // experimental fused Q8 HMX prep, opt in
 int    opt_fa_mh         = 1; // 1 = HMX decode runs all KV heads per KV block, 0 = a head at a time
 int    opt_gdn_select    = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
 int    opt_ar_select     = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
@@ -3818,6 +3819,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
     const char * str_fa_mh     = getenv("GGML_HEXAGON_FA_MH");
+    const char * str_fa_q8_prep = getenv("GGML_HEXAGON_FA_Q8_PREP");
     const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
     const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
@@ -3891,6 +3893,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
+    opt_fa_q8_prep = str_fa_q8_prep ? atoi(str_fa_q8_prep) : opt_fa_q8_prep;
     opt_fa_mh     = str_fa_mh     ? atoi(str_fa_mh)                      : opt_fa_mh;
     opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
     opt_ar_select     = str_ar_select     ? atoi(str_ar_select)           : opt_ar_select;
