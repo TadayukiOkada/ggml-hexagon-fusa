@@ -49,6 +49,7 @@ COMPARE_LINES = {
     "leak":    (0, 1),
     "llm":     (2, 0),
     "bench":   (2, 0),
+    "bench-abba": (4, 0),
     "prefill": (0, 2),
     "asr":     (4, 1),
     "sv":      (8, 0),
@@ -222,7 +223,7 @@ def check_compare(path, drop, out):
         want = per_version * (2 if two else 1) + new_only
         if n < want:
             out.fail(f"compare: step {step} has {n} of {want} result lines (interrupted?)")
-        elif n > want and step != "bench":
+        elif n > want and not step.startswith("bench"):
             out.fail(f"compare: step {step} has {n} result lines, expected {want}")
     for (model, test, v), new in sorted(bench.items()):
         if v != "new":
