@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8f45d04..5e866e9 100644
+index b9e4a2c92..849573831 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -5615,6 +5615,71 @@ struct test_mul_mat_glu : public test_case {
+@@ -5955,6 +5955,71 @@ struct test_mul_mat_glu : public test_case {
      }
  };
  
@@ -74,7 +74,7 @@ index 8f45d04..5e866e9 100644
  // GGML_OP_OUT_PROD
  struct test_out_prod : public test_case {
      const ggml_type type_a;
-@@ -11972,6 +12037,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12924,6 +12989,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  

@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 422e78b..fc9afba 100644
+index 377c6db3d..e8c4ac8f2 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10812,6 +10812,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11639,6 +11639,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
      // GQA broadcast with more than one weight chunk (hexagon)
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 3072, 512, 128, { 8,  1}, {2, 1}));
