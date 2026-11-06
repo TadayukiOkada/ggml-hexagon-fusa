@@ -35,6 +35,7 @@
 #include "flash-attn-ops.h"
 #include "hvx-fa-kernels.h"
 #include "hmx-fa-kernels.h"
+#include "hmx-q8-prep.h"
 
 // Must be multiple of 32
 #define FLASH_ATTN_BLOCK_SIZE (32 * 2)
@@ -123,6 +124,7 @@ struct hmx_fa_context {
     const struct htp_tensor *      sinks;  // attention sinks (src[4]), NULL if absent
     const struct htp_tensor *      k;
     const struct htp_tensor *      v;
+    bool         fused_q8_prep;
     bool         pipeline;  // true when n_kv_blocks >= FA_MIN_KV_BLOCKS && n_threads >= 2
     uint32_t     n_threads;
 
@@ -815,6 +817,13 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+    if (factx->fused_q8_prep && factx->k->type == HTP_TYPE_Q8_0) {
+        hmx_q8_k_to_tiles(factx->vtcm_k_tiles[args->buf_idx], args->curr_k, args->src_stride * sizeof(__fp16),
+                          factx->DK, factx->DK_pad, start, end);
+        hvx_gather_sync(factx->vtcm_k_tiles[args->buf_idx]);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+        return;
+    }
     if (factx->k->type == HTP_TYPE_Q8_0) {
         for (uint32_t r = start; r < end; ++r) {
             __fp16 * row_k = (__fp16 *)((char *)args->curr_k + r * args->src_stride * sizeof(__fp16));
@@ -872,6 +881,12 @@ static void fa_v_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
+    if (factx->fused_q8_prep && factx->v->type == HTP_TYPE_Q8_0) {
+        hmx_q8_v_to_tiles(v_tiles_dst, args->v_src, args->src_stride * sizeof(__fp16),
+                          factx->DV, factx->DV_pad, args->n_col_tiles, start, end);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
+        return;
+    }
     if (factx->v->type == HTP_TYPE_Q8_0) {
         for (uint32_t r = start; r < end; ++r) {
             __fp16 * row_v = (__fp16 *)((char *)args->v_src + r * args->src_stride * sizeof(__fp16));
@@ -2231,9 +2246,10 @@ struct fa_mh_layout {
     size_t total;
 };
 
+// k_row / v_row: bytes of one head's K / V row in DDR (F16 or Q8_0), as the DMA stages them
 static void fa_mh_layout_build(struct fa_mh_layout * L, size_t g_br, size_t DK, size_t DV, size_t Bc, size_t n_h,
                                size_t n_rows_q, bool is_q_fp32, bool has_sinks, size_t n_heads, size_t n_threads,
-                               size_t head_bytes) {
+                               size_t head_bytes, size_t k_row, size_t v_row) {
     const size_t T = HTP_FA_HMX_TILE_SIZE;
     L->q_tile_bytes   = hex_align_up(g_br * DK * sizeof(__fp16), T);
     L->o_tile_bytes   = hex_align_up(g_br * DV * sizeof(__fp16), T);
@@ -2269,9 +2285,10 @@ static void fa_mh_layout_build(struct fa_mh_layout * L, size_t g_br, size_t DK, 
     L->heads     = off; off += hex_round_up(n_h * head_bytes, 128);
     for (int b = 0; b < 2; b++) {
         L->mask[b] = off; off += n_rows_q * L->m_line_bytes;
-        L->k[b]    = off; off += Bc * n_h * DK * sizeof(__fp16);
-        L->v[b]    = off; off += Bc * n_h * DV * sizeof(__fp16);
+        L->k[b]    = off; off += hex_align_up(Bc * n_h * k_row, 128);
+        L->v[b]    = off; off += hex_align_up(Bc * n_h * v_row, 128);
     }
+    off += 128;  // the Q8_0 prep reads a vector from the start of the last block pair
     L->total = off;
 }
 
@@ -2352,7 +2369,7 @@ static void fa_mh_push_block(const struct hmx_fa_context * f, dma_queue * dq, co
                              uint8_t * kb, uint8_t * vb, uint8_t * mb, size_t m_line) {
     const struct htp_tensor * k = f->k;
     const struct htp_tensor * v = f->v;
-    const size_t kd = f->DK * sizeof(__fp16), vd = f->DV * sizeof(__fp16);
+    const size_t kd = htp_tensor_get_row_size(k->type, f->DK), vd = htp_tensor_get_row_size(v->type, f->DV);
     const size_t k_row = n_h * kd, v_row = n_h * vd;
 
     if (k->nb[2] == kd) {
@@ -2392,6 +2409,9 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     const uint32_t nek1     = proto->n_kv;
     const uint32_t n_thr    = ctx->n_threads;  // the step loop may run on one thread; every phase here uses all
     const size_t   n_rows_g = (size_t) n_rows_q * G;
+    // one head's K / V row as staged (F16, or Q8_0 for the fused prep, which reads it in place)
+    const size_t   kd       = htp_tensor_get_row_size(k->type, DK);
+    const size_t   vd       = htp_tensor_get_row_size(v->type, DV);
 
     // largest KV block (multiple of 64, at most 1024) whose buffers fit
     struct fa_mh_layout L;
@@ -2401,7 +2421,7 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     }
     for (;; Bc /= 2) {
         fa_mh_layout_build(&L, g_br, DK, DV, Bc, n_h, n_rows_q, proto->is_q_fp32, proto->sinks != NULL, proto->n_heads, n_thr,
-                           sizeof(fa_mh_head_t));
+                           sizeof(fa_mh_head_t), kd, vd);
         if (L.total <= ctx->vtcm_size) {
             break;
         }
@@ -2529,8 +2549,8 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     const size_t n_row_tiles      = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS) / HMX_FP16_TILE_N_ROWS;
     const size_t n_row_tiles_g_br = g_br / HMX_FP16_TILE_N_ROWS;
     const size_t n_tiles_per_bc   = Bc / HMX_FP16_TILE_N_COLS;
-    const size_t k_src_stride     = n_h * DK;  // elements
-    const size_t v_src_stride     = n_h * DV;
+    const size_t k_src_stride     = n_h * kd / sizeof(__fp16);  // in F16 elements, as the phases take it
+    const size_t v_src_stride     = n_h * vd / sizeof(__fp16);
 
     // softmax without the mask (no mask, or a block whose mask is all zero) and with it
     const worker_callback_t softmax_nomask = proto->has_softcap ? fa_softmax_thread : fa_softmax_thread_nomask;
@@ -2545,7 +2565,7 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
         fa_mh_push_block(&hd[0].f, dq, mask, q_start, n_rows_q, kvh0, n_h, kv0, MIN(Bc, nek1 - kv0), base + L.k[b], base + L.v[b],
                          base + L.mask[b], L.m_line_bytes);
     }
-    const uint32_t n_desc = (k->nb[2] == DK * sizeof(__fp16) ? 1 : n_h) + (v->nb[2] == DV * sizeof(__fp16) ? 1 : n_h) + (mask ? 1 : 0);
+    const uint32_t n_desc = (k->nb[2] == kd ? 1 : n_h) + (v->nb[2] == vd ? 1 : n_h) + (mask ? 1 : 0);
 
     for (uint32_t ib = 0, b = 0; ib < n_blk; ib++, b ^= 1) {
         const uint32_t blk         = blks[ib];
@@ -2560,13 +2580,18 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
         // and the products must not see what an earlier op left in VTCM.
         const uint32_t v_rows = hex_align_up(kv_rows, HMX_FP16_TILE_N_COLS);
         if (v_rows > kv_rows) {
-            const size_t v_row_bytes = (size_t) n_h * DV * sizeof(__fp16);
-            hvx_splat_u8_a((char *) (base + L.v[b] + kv_rows * v_row_bytes), 0, (v_rows - kv_rows) * v_row_bytes);
+            const size_t v_row_bytes = (size_t) n_h * vd;  // zero codes and scales decode to +0 for Q8_0
+            char *       v_end       = (char *) (base + L.v[b] + kv_rows * v_row_bytes);  // Q8_0 rows: not 128-aligned
+            if (hex_is_aligned(v_end, 128)) {
+                hvx_splat_u8_a(v_end, 0, (v_rows - kv_rows) * v_row_bytes);
+            } else {
+                hvx_splat_u8_u(v_end, 0, (v_rows - kv_rows) * v_row_bytes);
+            }
         }
         const uint32_t rows_per_t = hex_align_up(hmx_ceil_div(kv_rows, n_thr), 2);
         for (uint32_t h = 0; h < n_h; h++) {
-            hd[h].k = (fa_k_int_args_t) { &hd[h].f, kv_rows, k_src_stride, base + L.k[b] + h * DK * sizeof(__fp16), kv_start, rows_per_t, 0 };
-            hd[h].v = (fa_v_int_args_t) { &hd[h].f, v_rows, v_src_stride, base + L.v[b] + h * DV * sizeof(__fp16), hd[h].f.vtcm_v_tiles[0],
+            hd[h].k = (fa_k_int_args_t) { &hd[h].f, kv_rows, k_src_stride, base + L.k[b] + h * kd, kv_start, rows_per_t, 0 };
+            hd[h].v = (fa_v_int_args_t) { &hd[h].f, v_rows, v_src_stride, base + L.v[b] + h * vd, hd[h].f.vtcm_v_tiles[0],
                                         n_tiles_per_bc, kv_start, hex_align_up(hmx_ceil_div(v_rows, n_thr), 2) };
         }
         work_queue_run(ctx->work_queue, fa_mh_kv_thread, &a, n_thr);
@@ -2691,6 +2716,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // ======== Build context ========
     struct hmx_fa_context factx;
     memset(&factx, 0, sizeof(factx));
+    factx.fused_q8_prep = (kparams->flags & HTP_FA_FLAG_FUSED_Q8_PREP) != 0;
     factx.octx           = octx;
     factx.sinks          = octx->src[4];  // NULL if this op has no attention sinks
     factx.k              = k;
@@ -2793,9 +2819,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     }
 
     // Decode with several KV heads: all of them per KV block (fa_mh_run). One head keeps the step
-    // loop, which pipelines the blocks.
+    // loop, which pipelines the blocks. Q8_0 K/V need the fused prep (the staged rows are packed per
+    // head, there is no room to dequantize them in place).
+    const bool mh_k_ok = k->type == HTP_TYPE_F16 || (k->type == HTP_TYPE_Q8_0 && factx.fused_q8_prep);
+    const bool mh_v_ok = v->type == HTP_TYPE_F16 || (v->type == HTP_TYPE_Q8_0 && factx.fused_q8_prep);
     if (!(kparams->flags & HTP_FA_FLAG_NO_MH) && n_q_blocks == 1 && neq3 == 1 && kparams->max_bias == 0.0f && DK == DK_pad &&
-        DV == DV_pad && k->type == HTP_TYPE_F16 && v->type == HTP_TYPE_F16 && k->ne[3] == 1 && v->ne[3] == 1 &&
+        DV == DV_pad && mh_k_ok && mh_v_ok && k->ne[3] == 1 && v->ne[3] == 1 &&
         (!mask || (factx.mask_broadcast && mask->ne[3] == 1)) && kv_head_max - kv_head_min >= 2 &&
         kv_head_max - kv_head_min <= FA_MH_MAX_HEADS &&
         q_start_min < q_start_max && q_start_max - q_start_min <= FA_MH_MAX_ROWS &&

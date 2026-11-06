@@ -312,8 +312,10 @@ static bool htp_flash_attn_is_hmx_eligible(
         return true;
     }
 
-    // Several KV heads of head dim 64 run together on HMX (fa_mh_run), ahead of HVX at any depth (v73)
-    if (opt_fa_mh && DK == 64 && DV == 64 && k->ne[2] >= 2 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) {
+    // Several KV heads of head dim 64 run together on HMX (fa_mh_run), ahead of HVX at any depth (v73);
+    // Q8_0 K/V take that path with the fused prep
+    const bool mh_types = (k->type == GGML_TYPE_F16 || opt_fa_q8_prep) && (v->type == GGML_TYPE_F16 || opt_fa_q8_prep);
+    if (opt_fa_mh && DK == 64 && DV == 64 && k->ne[2] >= 2 && mh_types) {
         return true;
     }
 
@@ -443,6 +445,9 @@ static bool htp_kparams_solve_flash_attn(
         int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size, causal);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
+            if (opt_fa_q8_prep) {
+                kparams->flags |= HTP_FA_FLAG_FUSED_Q8_PREP;
+            }
             if (!opt_fa_mh) {
                 kparams->flags |= HTP_FA_FLAG_NO_MH;
             }
