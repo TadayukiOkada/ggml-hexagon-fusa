@@ -137,7 +137,7 @@ size_t opt_mbuf_total  = 0;                        // total buffer space limit (
 int    opt_mm_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
-int    opt_fa_q8_prep    = 0; // experimental fused Q8 HMX prep, opt in
+int    opt_fa_q8_prep    = 1; // Q8_0 K/V decoded straight into the HMX FA tiles (0: dequantize to F16 first)
 int    opt_fa_mh         = 1; // 1 = HMX decode runs all KV heads per KV block, 0 = a head at a time
 int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
 int    opt_gdn_select    = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
