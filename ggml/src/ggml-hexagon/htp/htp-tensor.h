@@ -179,6 +179,9 @@ static inline uint32_t htp_tensor_get_row_size(int type, uint32_t ne00) {
         case HTP_TYPE_F16:
         case HTP_TYPE_BF16:   return ne00 * 2;
         case HTP_TYPE_Q8_0:   return (ne00 / 32) * 34;
+        case HTP_TYPE_Q5_0:   return (ne00 / 32) * 22;
+        case HTP_TYPE_Q5_1:   return (ne00 / 32) * 24;
+        case HTP_TYPE_F8_E4M3: return ne00;
         case HTP_TYPE_Q4_0:
         case HTP_TYPE_IQ4_NL: return (ne00 / 32) * 18;
         case HTP_TYPE_Q4_1:   return (ne00 / 32) * 20;

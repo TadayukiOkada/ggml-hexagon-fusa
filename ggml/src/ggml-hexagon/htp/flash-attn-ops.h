@@ -32,6 +32,13 @@ enum htp_fa_kernel_type {
     HTP_FA_KERNEL_HMX
 };
 
+// These are the flat cache types, not the backend's repacked weight formats.
+static inline bool htp_fa_cache_type(int type) {
+    return type == HTP_TYPE_F16 || type == HTP_TYPE_Q8_0 || type == HTP_TYPE_Q4_0 ||
+           type == HTP_TYPE_Q4_1 || type == HTP_TYPE_Q5_0 || type == HTP_TYPE_Q5_1 ||
+           type == HTP_TYPE_IQ4_NL || type == HTP_TYPE_F8_E4M3;
+}
+
 // Multicore: gcd(n_kv_heads, N) teams own the KV heads, team members share the Q-blocks
 #define HTP_FA_FLAG_TEAM_SPLIT 0x01
 #define HTP_FA_FLAG_FUSED_Q8_PREP 0x02
