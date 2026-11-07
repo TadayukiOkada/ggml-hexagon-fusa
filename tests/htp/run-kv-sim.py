@@ -70,7 +70,7 @@ def main():
     (out / "q6ss.cfg").write_text(f"{tools}/lib/iss/qtimer.so --csr_base=0xFC900000 --irq_p=1 --freq=19200000 --cnttid=1\n{tools}/lib/iss/l2vic.so 32 0xab010000\n")
     (out / "osam.cfg").write_text(f"{sdk}/rtos/qurt/computev73/debugger/lnx64/qurt_model.so\n")
     runner = next((sdk / "libs/run_main_on_hexagon/ship").glob("hexagon_*_v73/run_main_on_hexagon_sim"))
-    for name in ("test-kv-prep", "test-kv-write"):
+    for name in ("test-kv-prep", "test-kv-write", "test-kv-wrand", "test-kv-k16"):
         obj, so = out / (name + ".o"), out / (name + ".so")
         cmd = list(flags)
         cmd[cmd.index("-o") + 1] = str(obj)

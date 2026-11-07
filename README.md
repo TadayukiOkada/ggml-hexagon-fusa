@@ -191,9 +191,20 @@ The HVX attention path retains F16 logits; long KV or large query magnitudes can
 exceed tight FP32-reference tolerances even with F16/Q8 caches. Prefer the default
 HMX selection for the evaluated inference path and validate the intended workload.
 
+Cache writes (SET_ROWS) are HVX kernels whose output equals upstream's
+`quantize_row_*_ref` for finite inputs: codes near a rounding point are written by
+the scalar reference, which is kept out of auto-vectorization (HVX float arithmetic
+is qfloat, not IEEE). On v73 the low-bit caches run at about the speed of F16 in
+prefill and decode.
+
 `test-backend-ops-hex test -p kv_types` covers all ordered cache type pairs plus
-cache writes. `GGML_HEXAGON_FA_SELECT=1` selects the HVX path; the default `2`
-allows HMX. ISA simulator oracles are in `tests/htp/` (`run-kv-sim.py --help`).
+cache writes, and `-p kv_grid` checks the writes for exact equality on inputs that
+put half of the codes on a rounding point (the regular SET_ROWS tests accept one
+code off by one). `test-backend-ops-hex perf -p kv_types` times decode, prefill
+and cache writes per type pair. `GGML_HEXAGON_FA_SELECT=1` selects the HVX path; the
+default `2` allows HMX. ISA simulator oracles are in `tests/htp/`
+(`run-kv-sim.py --help`); `tests/htp/gen-kv-ctrl.py` regenerates the permutation
+tables of the kernels.
 `quant/eval_kv.py` compares saved F16 logits, PPL and KLD; `quant/eval_kv_tasks.py`
 checks retrieval and draft acceptance. `quant/bench_kv.py` compares cache types in
 forward/reverse order between F16 reference runs. The in-process adapters retain

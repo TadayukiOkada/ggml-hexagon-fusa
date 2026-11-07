@@ -18,7 +18,7 @@
 // The product of an int8 code and an F16 scale is exact in qf32 (8 x 11 bits), so converting the
 // code to hf, multiplying in qf32 and rounding once with the qf32 -> hf conversion gives the same
 // bits as hvx_dequantize_row_flat_q8_0_f16 (which forms the same exact product in F32 and rounds it
-// with the same conversion); zeros are made +0 as there.
+// with the same conversion), except that a zero result keeps the sign of the product.
 //
 // The load reads up to 128 bytes from the start of a pair (at most 94 past its last block); the
 // caller keeps that inside VTCM. Rows go innermost, two pairs per iteration with the four decodes
@@ -46,14 +46,30 @@ static const uint8_t hmx_q8_scale_ctrl[128] __attribute__((aligned(128))) = {
     0x02, 0x02, 0x10, 0x10, 0x02, 0x02, 0x04, 0x04, 0x02, 0x02, 0x08, 0x08, 0x02, 0x02, 0x04, 0x04,
 };
 
+// K tiles put the 32 words of a row (pairs of columns) into one word lane of 32 tile vectors: address
+// j * 128 + r * 4 for word j of tile row r. A scatter of one row has address bits 3..6 equal in all lanes,
+// and lanes j and j + 16 equal in bits 3..10; the v73 HVX PRM (3.9.8) asks for distinct bits 3..10 per
+// scatter. For four rows r .. r + 3 (r % 4 == 0, one tile row) lanes 0..15 come from row r (r + 1) and lanes
+// 16..31 from row r + 2 (r + 3), and the other way round: the same words, fewer bank conflicts.
+static inline void hmx_k_scatter4(size_t tile, uint32_t lr, HVX_Vector a, HVX_Vector b, HVX_Vector c, HVX_Vector d) {
+    const HVX_VectorPred lo16 = Q6_Q_vsetq_R(64);
+    const HVX_Vector     o    = Q6_Vw_vadd_VwVw(hvx_vmem(hmx_transpose_scatter_offsets), Q6_V_vsplat_R(lr * 4));
+    const HVX_Vector     o_ac = Q6_Vw_vadd_VwVw(o, Q6_V_vmux_QVV(lo16, Q6_V_vzero(), Q6_V_vsplat_R(8)));
+    const HVX_Vector     o_ca = Q6_Vw_vadd_VwVw(o, Q6_V_vmux_QVV(lo16, Q6_V_vsplat_R(8), Q6_V_vzero()));
+    const HVX_Vector     four = Q6_V_vsplat_R(4);
+    Q6_vscatter_RMVwV(tile, 4095, o_ac, Q6_V_vmux_QVV(lo16, a, c));
+    Q6_vscatter_RMVwV(tile, 4095, Q6_Vw_vadd_VwVw(o_ac, four), Q6_V_vmux_QVV(lo16, b, d));
+    Q6_vscatter_RMVwV(tile, 4095, o_ca, Q6_V_vmux_QVV(lo16, c, a));
+    Q6_vscatter_RMVwV(tile, 4095, Q6_Vw_vadd_VwVw(o_ca, four), Q6_V_vmux_QVV(lo16, d, b));
+}
+
 static inline HVX_Vector hmx_q8x2_f16(const uint8_t * blk, HVX_Vector cc, HVX_Vector cs) {
     const HVX_Vector v       = *(const HVX_UVector *) blk;
     const HVX_Vector codes   = Q6_V_vrdelta_VV(v, cc);
     const HVX_Vector scale   = Q6_V_vdelta_VV(v, cs);
     const HVX_Vector code_hf = Q6_Vhf_equals_Vh(Q6_V_lo_W(Q6_Wh_vunpack_Vb(codes)));
-    const HVX_Vector r       = Q6_Vhf_equals_Wqf32(Q6_Wqf32_vmpy_VhfVhf(code_hf, scale));
-    const HVX_VectorPred z   = Q6_Q_vcmp_eq_VhVh(Q6_V_vand_VV(r, Q6_Vh_vsplat_R(0x7fff)), Q6_V_vzero());
-    return Q6_V_vmux_QVV(z, Q6_V_vzero(), r);
+    // A zero result may be -0 (code 0 with a negative scale): the HMX dot products do not see the sign.
+    return Q6_Vhf_equals_Wqf32(Q6_Wqf32_vmpy_VhfVhf(code_hf, scale));
 }
 
 static inline HVX_Vector hmx_q8x1_f16(const uint8_t * blk, HVX_Vector cc, HVX_Vector cs, HVX_VectorPred lo) {
@@ -200,6 +216,30 @@ static inline void hmx_q8_v_to_tiles(__fp16 * dst, const uint8_t * src, size_t s
             t0[0] = Q6_V_lo_W(pair);
             *(HVX_Vector *) ((__fp16 *) t0 + t1o) = Q6_V_hi_W(pair);
         }
+    }
+}
+
+// F16 K rows (128-byte aligned staging) of flash attention into its K tiles, four rows per hmx_k_scatter4.
+// The rows of [start, end) are valid; the tail keeps hmx_interleave_rows_to_tiles (row end zero-filled when
+// end is odd and the last row of the block).
+static inline void hmx_f16_k_to_tiles(__fp16 * dst, const __fp16 * src, uint32_t n_rows, uint32_t padded,
+                                      size_t src_stride, uint32_t start, uint32_t end) {
+    const size_t tstride = (size_t) (padded / 32) * 1024;
+    uint32_t     r       = start;
+    if (r % 4 != 0 && r + 2 <= end) {
+        hmx_interleave_rows_to_tiles(dst, src, n_rows, padded, src_stride, r, r + 2);
+        r += 2;
+    }
+    for (; r + 4 <= end; r += 4) {
+        const __fp16 * s  = src + (size_t) r * src_stride;
+        __fp16 *       tb = dst + (size_t) (r / 32) * tstride;
+        for (uint32_t c = 0; c < padded; c += 64) {
+            hmx_k_scatter4((size_t) (tb + (size_t) (c / 32) * 1024), r % 32, hvx_vmem(s + c), hvx_vmem(s + src_stride + c),
+                           hvx_vmem(s + 2 * src_stride + c), hvx_vmem(s + 3 * src_stride + c));
+        }
+    }
+    if (r < end) {
+        hmx_interleave_rows_to_tiles(dst, src, n_rows, padded, src_stride, r, end);
     }
 }
 

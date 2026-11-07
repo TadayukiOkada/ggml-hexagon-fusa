@@ -275,10 +275,11 @@ int op_set_rows(struct htp_ops_context * octx) {
     // requested. Each round stages its own rows.
     const size_t   row_bytes = MAX((size_t) htp_tensor_get_row_size(octx->dst->type, ne00) * ne02 * ne03, (size_t) 1);
     size_t         max_rows  = MAX((size_t) 1, MIN((size_t) 32768 / ((size_t) ne02 * ne03), (8u << 20) / row_bytes));
-    // Reference-format Q4/Q5/FP8 conversions do more work per byte of output.
-    // Limit each round by input as well, before joining workers and yielding.
+    // The Q4/Q5/IQ4_NL/FP8 writers do more work per output byte than Q8_0, and a block that needs the scalar
+    // reference costs about 4000 cycles: limit each round to 1 MiB of input as well (about 5 ms if every
+    // block took the reference, well under 1 ms otherwise), before joining workers and yielding.
     if (dst->type != HTP_TYPE_F32 && dst->type != HTP_TYPE_F16 && dst->type != HTP_TYPE_Q8_0) {
-        max_rows = MIN(max_rows, MAX((size_t) 1, (128u << 10) / ((size_t) ne00 * 4 * ne02 * ne03)));
+        max_rows = MIN(max_rows, MAX((size_t) 1, (1u << 20) / ((size_t) ne00 * 4 * ne02 * ne03)));
     }
     const uint32_t round     = MAX(n_threads, (uint32_t) MIN((size_t) tasks, max_rows) / n_threads * n_threads);
     if (round < tasks) {
