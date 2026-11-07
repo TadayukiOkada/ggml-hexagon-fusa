@@ -27,6 +27,44 @@ option(LLAMA_BUILD_EXAMPLES "llama: build examples"             OFF)
 
 add_subdirectory(${LLAMA_DIR} llama.cpp)
 
+# v0.9.0 has FP8 tensor/CPU kernels but omits it from the common CLI's KV whitelist.
+# Opt in for evaluation, without editing the pinned submodule. All four cache-type
+# options (target/draft, K/V) use this same whitelist. No model/graph code is patched.
+option(GGML_HEXAGON_EXPERIMENTAL_FP8_KV "Expose f8_e4m3 in llama.cpp's KV cache CLI" OFF)
+if(GGML_HEXAGON_EXPERIMENTAL_FP8_KV)
+    file(READ ${LLAMA_DIR}/common/arg.cpp _arg)
+    set(_old "const std::vector<ggml_type> kv_cache_types = {\n")
+    string(FIND "${_arg}" "${_old}" _pos)
+    if(_pos LESS 0)
+        message(FATAL_ERROR "FP8 KV: upstream CLI whitelist changed; review the adapter")
+    endif()
+    string(REPLACE "${_old}" "${_old}    GGML_TYPE_F8_E4M3,\n" _arg "${_arg}")
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/arg-fp8-kv.cpp.tmp "${_arg}")
+    configure_file(${CMAKE_CURRENT_BINARY_DIR}/arg-fp8-kv.cpp.tmp ${CMAKE_CURRENT_BINARY_DIR}/arg-fp8-kv.cpp COPYONLY)
+    file(REMOVE ${CMAKE_CURRENT_BINARY_DIR}/arg-fp8-kv.cpp.tmp)
+    get_target_property(_common_sources llama-common SOURCES)
+    list(FILTER _common_sources EXCLUDE REGEX "(^|/)arg\\.cpp$")
+    set_property(TARGET llama-common PROPERTY SOURCES ${_common_sources} ${CMAKE_CURRENT_BINARY_DIR}/arg-fp8-kv.cpp)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LLAMA_DIR}/common/arg.cpp)
+    # llama-bench has its own parser rather than common/arg.cpp.
+    if(TARGET llama-bench-impl)
+        file(READ ${LLAMA_DIR}/tools/llama-bench/llama-bench.cpp _bench)
+        set(_old_bench "static ggml_type ggml_type_from_name(const std::string & s) {\n")
+        string(FIND "${_bench}" "${_old_bench}" _pos_bench)
+        if(_pos_bench LESS 0)
+            message(FATAL_ERROR "FP8 KV: upstream benchmark type parser changed; review the adapter")
+        endif()
+        string(REPLACE "${_old_bench}" "${_old_bench}    if (s == \"f8_e4m3\") return GGML_TYPE_F8_E4M3;\n" _bench "${_bench}")
+        file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/bench-fp8-kv.cpp.tmp "${_bench}")
+        configure_file(${CMAKE_CURRENT_BINARY_DIR}/bench-fp8-kv.cpp.tmp ${CMAKE_CURRENT_BINARY_DIR}/bench-fp8-kv.cpp COPYONLY)
+        file(REMOVE ${CMAKE_CURRENT_BINARY_DIR}/bench-fp8-kv.cpp.tmp)
+        get_target_property(_bench_sources llama-bench-impl SOURCES)
+        list(FILTER _bench_sources EXCLUDE REGEX "(^|/)llama-bench\\.cpp$")
+        set_property(TARGET llama-bench-impl PROPERTY SOURCES ${_bench_sources} ${CMAKE_CURRENT_BINARY_DIR}/bench-fp8-kv.cpp)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LLAMA_DIR}/tools/llama-bench/llama-bench.cpp)
+    endif()
+endif()
+
 # The vendored backend CMakeLists calls ggml_add_backend_library() as it would
 # inside ggml/src. Redefine it for a backend that lives outside the ggml tree:
 # a module that links ggml-base and sees the ggml internal headers.

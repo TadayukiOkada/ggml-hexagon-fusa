@@ -3784,6 +3784,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_Q4_1 == (unsigned int) GGML_TYPE_Q4_1,
                   "please update hexagon_type to match ggml_type");
+    static_assert((unsigned int) HTP_TYPE_Q5_0 == (unsigned int) GGML_TYPE_Q5_0, "Q5_0 type mismatch");
+    static_assert((unsigned int) HTP_TYPE_Q5_1 == (unsigned int) GGML_TYPE_Q5_1, "Q5_1 type mismatch");
+    static_assert((unsigned int) HTP_TYPE_F8_E4M3 == (unsigned int) GGML_TYPE_F8_E4M3, "F8_E4M3 type mismatch");
     static_assert((unsigned int) HTP_TYPE_Q8_0 == (unsigned int) GGML_TYPE_Q8_0,
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_MXFP4 == (unsigned int) GGML_TYPE_MXFP4,

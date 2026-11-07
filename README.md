@@ -162,6 +162,45 @@ keys; SOFT_MAX by element count, in builds without
 `unknown` (the kernel parameter checks of the op reject it: a type, shape,
 layout or VTCM size the kernels do not cover).
 
+## KV cache formats
+
+Flash Attention accepts independently selected K and V caches in `f16`, `q8_0`,
+`q4_0`, `q4_1`, `q5_0`, `q5_1`, and `iq4_nl`. Compressed rows are decoded directly
+into HMX tiles, including the multi-head decode path; the HVX path and cache writes
+are supported too. Quantized head dimensions must be multiples of 32.
+
+```sh
+./run.sh llama-completion -m model.gguf -ngl 99 -fa on -ctk q8_0 -ctv q4_0
+# A tokenizer-compatible draft uses the same kernels and independent cache choices:
+./run.sh llama-server -m target.gguf -md draft.gguf -ngl 99 -ngld 99 -fa on \
+    --spec-type draft-simple -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q4_0
+```
+
+For FP8 evaluation, configure with `-DGGML_HEXAGON_EXPERIMENTAL_FP8_KV=ON` and use
+`f8_e4m3`. The pinned llama.cpp has FP8 kernels but omits this type from its CLI
+whitelists; this option compiles copies of the common argument parser and benchmark
+parser with FP8 exposed, leaving the submodule unchanged. FP8 uses the upstream
+saturating conversion, with maximum magnitude 448 and no per-block scale.
+
+The upstream graph applies Hadamard rotation to quantized K/V for eligible head
+dimensions. FP8 is a floating-point type and does not trigger that rotation. This
+is not full TurboQuant: there is no QJL residual correction or per-vector norm
+side channel. Cache quality is model- and context-dependent; a low-bit V with a
+higher-precision K is a candidate to evaluate, rather than a universal default.
+The HVX attention path retains F16 logits; long KV or large query magnitudes can
+exceed tight FP32-reference tolerances even with F16/Q8 caches. Prefer the default
+HMX selection for the evaluated inference path and validate the intended workload.
+
+`test-backend-ops-hex test -p kv_types` covers all ordered cache type pairs plus
+cache writes. `GGML_HEXAGON_FA_SELECT=1` selects the HVX path; the default `2`
+allows HMX. ISA simulator oracles are in `tests/htp/` (`run-kv-sim.py --help`).
+`quant/eval_kv.py` compares saved F16 logits, PPL and KLD; `quant/eval_kv_tasks.py`
+checks retrieval and draft acceptance. `quant/bench_kv.py` compares cache types in
+forward/reverse order between F16 reference runs. The in-process adapters retain
+one backend registry across cache pairs and call the pinned, unmodified Linux tool
+shared libraries. Run them sequentially with an outer timeout; the exported C++
+entry points are version-specific.
+
 ## Speech recognition
 
 `GGML_HEXAGON_ASR=ON` (the `arm64-oe-linux-v73-fusa-asr` preset) also builds

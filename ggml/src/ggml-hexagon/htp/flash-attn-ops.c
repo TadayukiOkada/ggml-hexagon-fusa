@@ -35,7 +35,7 @@
 #include "flash-attn-ops.h"
 #include "hvx-fa-kernels.h"
 #include "hmx-fa-kernels.h"
-#include "hmx-q8-prep.h"
+#include "hmx-kv-prep.h"
 
 // Must be multiple of 32
 #define FLASH_ATTN_BLOCK_SIZE (32 * 2)
@@ -502,19 +502,21 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             uint8_t * v_base = (void *) dma_queue_pop(dma_q).dst; // V
             __fp16  * m_base = mask ? (__fp16 *) dma_queue_pop(dma_q).dst : NULL; // M
 
-            if (factx->k->type == HTP_TYPE_Q8_0) {
+            if (factx->k->type != HTP_TYPE_F16) {
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, ir);
                 for (uint32_t r = 0; r < current_block_size; ++r) {
                     __fp16 * row_k = (__fp16 *)(k_base + r * factx->size_k_row_padded);
-                    hvx_dequantize_row_flat_q8_0_f16(row_k, row_k, DK);
+                    if (factx->k->type == HTP_TYPE_Q8_0) hvx_dequantize_row_flat_q8_0_f16(row_k, row_k, DK);
+                    else hmx_kv_row_to_f16(row_k, row_k, DK, factx->k->type);
                 }
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, ir);
             }
-            if (factx->v->type == HTP_TYPE_Q8_0) {
+            if (factx->v->type != HTP_TYPE_F16) {
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, ir);
                 for (uint32_t r = 0; r < current_block_size; ++r) {
                     __fp16 * row_v = (__fp16 *)(v_base + r * factx->size_v_row_padded);
-                    hvx_dequantize_row_flat_q8_0_f16(row_v, row_v, DV);
+                    if (factx->v->type == HTP_TYPE_Q8_0) hvx_dequantize_row_flat_q8_0_f16(row_v, row_v, DV);
+                    else hmx_kv_row_to_f16(row_v, row_v, DV, factx->v->type);
                 }
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, ir);
             }
@@ -817,6 +819,13 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+    if (factx->k->type != HTP_TYPE_F16 && factx->k->type != HTP_TYPE_Q8_0) {
+        hmx_kv_k_to_tiles(factx->vtcm_k_tiles[args->buf_idx], args->curr_k, args->src_stride * sizeof(__fp16),
+                          factx->DK, factx->DK_pad, factx->k->type, start, end);
+        hvx_gather_sync(factx->vtcm_k_tiles[args->buf_idx]);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+        return;
+    }
     if (factx->fused_q8_prep && factx->k->type == HTP_TYPE_Q8_0) {
         hmx_q8_k_to_tiles(factx->vtcm_k_tiles[args->buf_idx], args->curr_k, args->src_stride * sizeof(__fp16),
                           factx->DK, factx->DK_pad, start, end);
@@ -824,10 +833,11 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
         return;
     }
-    if (factx->k->type == HTP_TYPE_Q8_0) {
+    if (factx->k->type != HTP_TYPE_F16) {
         for (uint32_t r = start; r < end; ++r) {
             __fp16 * row_k = (__fp16 *)((char *)args->curr_k + r * args->src_stride * sizeof(__fp16));
-            hvx_dequantize_row_flat_q8_0_f16(row_k, row_k, factx->DK);
+            if (factx->k->type == HTP_TYPE_Q8_0) hvx_dequantize_row_flat_q8_0_f16(row_k, row_k, factx->DK);
+            else hmx_kv_row_to_f16(row_k, row_k, factx->DK, factx->k->type);
         }
     }
     hmx_interleave_rows_to_tiles(factx->vtcm_k_tiles[args->buf_idx], (const __fp16 *) args->curr_k, total_rows, factx->DK_pad,
@@ -881,16 +891,23 @@ static void fa_v_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
+    if (factx->v->type != HTP_TYPE_F16 && factx->v->type != HTP_TYPE_Q8_0) {
+        hmx_kv_v_to_tiles(v_tiles_dst, args->v_src, args->src_stride * sizeof(__fp16),
+                          factx->DV, factx->DV_pad, args->n_col_tiles, factx->v->type, start, end);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
+        return;
+    }
     if (factx->fused_q8_prep && factx->v->type == HTP_TYPE_Q8_0) {
         hmx_q8_v_to_tiles(v_tiles_dst, args->v_src, args->src_stride * sizeof(__fp16),
                           factx->DV, factx->DV_pad, args->n_col_tiles, start, end);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
         return;
     }
-    if (factx->v->type == HTP_TYPE_Q8_0) {
+    if (factx->v->type != HTP_TYPE_F16) {
         for (uint32_t r = start; r < end; ++r) {
             __fp16 * row_v = (__fp16 *)((char *)args->v_src + r * args->src_stride * sizeof(__fp16));
-            hvx_dequantize_row_flat_q8_0_f16(row_v, row_v, factx->DV);
+            if (factx->v->type == HTP_TYPE_Q8_0) hvx_dequantize_row_flat_q8_0_f16(row_v, row_v, factx->DV);
+            else hmx_kv_row_to_f16(row_v, row_v, factx->DV, factx->v->type);
         }
     }
     hmx_interleave_cols_to_tiles(v_tiles_dst, (const __fp16 *) args->v_src, total_rows, factx->DV_pad,
@@ -2819,10 +2836,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     }
 
     // Decode with several KV heads: all of them per KV block (fa_mh_run). One head keeps the step
-    // loop, which pipelines the blocks. Q8_0 K/V need the fused prep (the staged rows are packed per
+    // loop, which pipelines the blocks. Compressed K/V use fused prep (staged rows are packed per
     // head, there is no room to dequantize them in place).
-    const bool mh_k_ok = k->type == HTP_TYPE_F16 || (k->type == HTP_TYPE_Q8_0 && factx.fused_q8_prep);
-    const bool mh_v_ok = v->type == HTP_TYPE_F16 || (v->type == HTP_TYPE_Q8_0 && factx.fused_q8_prep);
+    const bool mh_k_ok = k->type != HTP_TYPE_Q8_0 || factx.fused_q8_prep;
+    const bool mh_v_ok = v->type != HTP_TYPE_Q8_0 || factx.fused_q8_prep;
     if (!(kparams->flags & HTP_FA_FLAG_NO_MH) && n_q_blocks == 1 && neq3 == 1 && kparams->max_bias == 0.0f && DK == DK_pad &&
         DV == DV_pad && mh_k_ok && mh_v_ok && k->ne[3] == 1 && v->ne[3] == 1 &&
         (!mask || (factx.mask_broadcast && mask->ne[3] == 1)) && kv_head_max - kv_head_min >= 2 &&
@@ -3400,11 +3417,15 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
 
     // Check support
     if ((q->type != HTP_TYPE_F16 && q->type != HTP_TYPE_F32) ||
-        (k->type != HTP_TYPE_F16 && k->type != HTP_TYPE_Q8_0) ||
-        (v->type != HTP_TYPE_F16 && v->type != HTP_TYPE_Q8_0)) {
+        !htp_fa_cache_type(k->type) ||
+        !htp_fa_cache_type(v->type)) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
+    if ((k->type != HTP_TYPE_F16 && k->ne[0] % 32 != 0) ||
+        (v->type != HTP_TYPE_F16 && v->ne[0] % 32 != 0)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
     if (htp_tensor_is_extended(dst)) {
         return HTP_STATUS_NO_SUPPORT;
     }

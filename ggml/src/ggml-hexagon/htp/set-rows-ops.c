@@ -14,6 +14,7 @@
 #include "hex-utils.h"
 #include "hvx-copy.h"
 #include "hvx-quant.h"
+#include "kv-cache-quant.h"
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
@@ -186,6 +187,19 @@ SET_ROWS_THREAD_DMA_FN(f16,  int64_t, { hvx_copy_f16_f32_uu((uint8_t *)dst_spad,
 SET_ROWS_THREAD_DMA_FN(q8_0, int32_t, { hvx_quantize_row_q8_0_f32(dst_spad, (const float *)src_spad, ne00); })
 SET_ROWS_THREAD_DMA_FN(q8_0, int64_t, { hvx_quantize_row_q8_0_f32(dst_spad, (const float *)src_spad, ne00); })
 
+SET_ROWS_THREAD_DMA_FN(q4_0, int32_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_Q4_0); })
+SET_ROWS_THREAD_DMA_FN(q4_0, int64_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_Q4_0); })
+SET_ROWS_THREAD_DMA_FN(q4_1, int32_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_Q4_1); })
+SET_ROWS_THREAD_DMA_FN(q4_1, int64_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_Q4_1); })
+SET_ROWS_THREAD_DMA_FN(q5_0, int32_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_Q5_0); })
+SET_ROWS_THREAD_DMA_FN(q5_0, int64_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_Q5_0); })
+SET_ROWS_THREAD_DMA_FN(q5_1, int32_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_Q5_1); })
+SET_ROWS_THREAD_DMA_FN(q5_1, int64_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_Q5_1); })
+SET_ROWS_THREAD_DMA_FN(f8_e4m3, int32_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_F8_E4M3); })
+SET_ROWS_THREAD_DMA_FN(f8_e4m3, int64_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_F8_E4M3); })
+SET_ROWS_THREAD_DMA_FN(iq4_nl, int32_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_IQ4_NL); })
+SET_ROWS_THREAD_DMA_FN(iq4_nl, int64_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_IQ4_NL); })
+
 int op_set_rows(struct htp_ops_context * octx) {
     const struct htp_set_rows_kernel_params * kparams = (const struct htp_set_rows_kernel_params *)octx->kernel_params;
     set_rows_preamble;
@@ -237,6 +251,12 @@ int op_set_rows(struct htp_ops_context * octx) {
         case HTP_TYPE_F32:  q_func = is_i32 ? set_rows_thread_dma_f32_int32_t  : set_rows_thread_dma_f32_int64_t;  break;
         case HTP_TYPE_F16:  q_func = is_i32 ? set_rows_thread_dma_f16_int32_t  : set_rows_thread_dma_f16_int64_t;  break;
         case HTP_TYPE_Q8_0: q_func = is_i32 ? set_rows_thread_dma_q8_0_int32_t : set_rows_thread_dma_q8_0_int64_t; break;
+        case HTP_TYPE_Q4_0: q_func = is_i32 ? set_rows_thread_dma_q4_0_int32_t : set_rows_thread_dma_q4_0_int64_t; break;
+        case HTP_TYPE_Q4_1: q_func = is_i32 ? set_rows_thread_dma_q4_1_int32_t : set_rows_thread_dma_q4_1_int64_t; break;
+        case HTP_TYPE_Q5_0: q_func = is_i32 ? set_rows_thread_dma_q5_0_int32_t : set_rows_thread_dma_q5_0_int64_t; break;
+        case HTP_TYPE_Q5_1: q_func = is_i32 ? set_rows_thread_dma_q5_1_int32_t : set_rows_thread_dma_q5_1_int64_t; break;
+        case HTP_TYPE_F8_E4M3: q_func = is_i32 ? set_rows_thread_dma_f8_e4m3_int32_t : set_rows_thread_dma_f8_e4m3_int64_t; break;
+        case HTP_TYPE_IQ4_NL: q_func = is_i32 ? set_rows_thread_dma_iq4_nl_int32_t : set_rows_thread_dma_iq4_nl_int64_t; break;
         default:            return HTP_STATUS_NO_SUPPORT;
     }
 
@@ -254,7 +274,12 @@ int op_set_rows(struct htp_ops_context * octx) {
     // and about 8 MiB of output, and VTCM can be given away between rounds when a release is
     // requested. Each round stages its own rows.
     const size_t   row_bytes = MAX((size_t) htp_tensor_get_row_size(octx->dst->type, ne00) * ne02 * ne03, (size_t) 1);
-    const size_t   max_rows  = MAX((size_t) 1, MIN((size_t) 32768 / ((size_t) ne02 * ne03), (8u << 20) / row_bytes));
+    size_t         max_rows  = MAX((size_t) 1, MIN((size_t) 32768 / ((size_t) ne02 * ne03), (8u << 20) / row_bytes));
+    // Reference-format Q4/Q5/FP8 conversions do more work per byte of output.
+    // Limit each round by input as well, before joining workers and yielding.
+    if (dst->type != HTP_TYPE_F32 && dst->type != HTP_TYPE_F16 && dst->type != HTP_TYPE_Q8_0) {
+        max_rows = MIN(max_rows, MAX((size_t) 1, (128u << 10) / ((size_t) ne00 * 4 * ne02 * ne03)));
+    }
     const uint32_t round     = MAX(n_threads, (uint32_t) MIN((size_t) tasks, max_rows) / n_threads * n_threads);
     if (round < tasks) {
         for (uint32_t done = 0; done < tasks;) {

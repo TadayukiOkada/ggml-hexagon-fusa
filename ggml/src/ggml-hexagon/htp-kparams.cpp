@@ -289,8 +289,8 @@ static bool htp_flash_attn_is_hmx_eligible(
         return false;
     }
 
-    if ((k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0) ||
-        (v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_Q8_0)) {
+    if (!htp_fa_cache_type(k->type) ||
+        !htp_fa_cache_type(v->type)) {
         return false;
     }
 
@@ -314,7 +314,7 @@ static bool htp_flash_attn_is_hmx_eligible(
 
     // Several KV heads of head dim 64 run together on HMX (fa_mh_run), ahead of HVX at any depth (v73);
     // Q8_0 K/V take that path with the fused prep
-    const bool mh_types = (k->type == GGML_TYPE_F16 || opt_fa_q8_prep) && (v->type == GGML_TYPE_F16 || opt_fa_q8_prep);
+    const bool mh_types = (k->type != GGML_TYPE_Q8_0 || opt_fa_q8_prep) && (v->type != GGML_TYPE_Q8_0 || opt_fa_q8_prep);
     if (opt_fa_mh && DK == 64 && DV == 64 && k->ne[2] >= 2 && mh_types) {
         return true;
     }
@@ -374,8 +374,12 @@ static bool htp_kparams_solve_flash_attn(
     const struct ggml_tensor * dst   = op;
 
     if ((q->type != GGML_TYPE_F16 && q->type != GGML_TYPE_F32) ||
-        (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0) ||
-        (v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_Q8_0)) {
+        !htp_fa_cache_type(k->type) ||
+        !htp_fa_cache_type(v->type)) {
+        return false;
+    }
+    if ((k->type != GGML_TYPE_F16 && k->ne[0] % 32 != 0) ||
+        (v->type != GGML_TYPE_F16 && v->ne[0] % 32 != 0)) {
         return false;
     }
     if (mask && mask->type != GGML_TYPE_F16) {
@@ -1809,7 +1813,7 @@ static bool htp_kparams_solve_set_rows(
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst  = op->src[2] ? op->src[2] : op;
 
-    if (dst->type == GGML_TYPE_Q8_0 && src0->ne[0] < 32) {
+    if (ggml_is_quantized(dst->type) && (src0->ne[0] < 32 || src0->ne[0] % 32 != 0)) {
         return false;
     }
     if (src0->type != GGML_TYPE_F32) {
@@ -1818,7 +1822,9 @@ static bool htp_kparams_solve_set_rows(
     if (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) {
         return false;
     }
-    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_Q8_0) {
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_Q8_0 &&
+        dst->type != GGML_TYPE_Q4_0 && dst->type != GGML_TYPE_Q4_1 && dst->type != GGML_TYPE_Q5_0 &&
+        dst->type != GGML_TYPE_Q5_1 && dst->type != GGML_TYPE_F8_E4M3 && dst->type != GGML_TYPE_IQ4_NL) {
         return false;
     }
 

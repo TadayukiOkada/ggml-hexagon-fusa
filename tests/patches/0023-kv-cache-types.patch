@@ -1,0 +1,40 @@
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10610,9 +10610,37 @@
+ }
+ 
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
++// Explicit matrix for flat cache formats, selectable with -p kv_types.
++struct test_fa_kv_types : test_flash_attn_ext {
++    using test_flash_attn_ext::test_flash_attn_ext;
++    std::string vars() override { return test_flash_attn_ext::vars() + ",kv_types=1"; }
++};
++struct test_set_kv_types : test_set_rows {
++    using test_set_rows::test_set_rows;
++    std::string vars() override { return test_set_rows::vars() + ",kv_types=1"; }
++};
++
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+     std::default_random_engine rng(0);
++    const std::vector<ggml_type> kv_types = { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
++        GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL, GGML_TYPE_F8_E4M3 };
++    for (ggml_type k : kv_types) for (ggml_type v : kv_types) {
++        // Single-row multi-head decode, prefill, tail tile (96 cols / 113 tokens),
++        // and short single-head HVX fallback. Mixed types in both directions.
++        test_cases.emplace_back(new test_fa_kv_types(64, 64, 2, {4, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, k, v));
++        test_cases.emplace_back(new test_fa_kv_types(128, 128, 2, {4, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, k, v));
++        test_cases.emplace_back(new test_fa_kv_types(96, 96, 2, {2, 1}, 113, 3, true, true, 0, 2, GGML_PREC_F32, k, v));
++        test_cases.emplace_back(new test_fa_kv_types(128, 64, 1, {4, 1}, 96, 1, true, false, 8, 0, GGML_PREC_F32, k, v));
++    }
++    for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL, GGML_TYPE_F8_E4M3}) {
++        for (ggml_type idx : {GGML_TYPE_I32, GGML_TYPE_I64}) for (bool view : {false, true}) {
++            test_cases.emplace_back(new test_set_kv_types(GGML_TYPE_F32, t, idx, {96, 11, 2, 1}, {2, 1}, 8, view));
++            test_cases.emplace_back(new test_set_kv_types(GGML_TYPE_F32, t, idx, {256, 11, 1, 2}, {1, 2}, 8, view));
++        }
++    }
++
++
+ 
+     // unary ops
+     // TODO: add GGML_UNARY_OP_SOFTPLUS test that is sensitive to using `log1p(exp(x))` vs `log(exp(x) + 1)`
