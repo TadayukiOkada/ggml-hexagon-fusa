@@ -877,6 +877,133 @@ bool htp_fusion_try_absorb_norm(const struct htp_opnode & norm, struct htp_opnod
     return true;
 }
 
+// The compute nodes of the graph that read t, or a view of it, other than the node `user`; -1 when t
+// is not a node of the graph (its uses are then not known)
+static int htp_count_other_users(const struct ggml_cgraph * graph, const ggml_tensor * t, const ggml_tensor * user) {
+    bool found = false;
+    int  n     = 0;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const ggml_tensor * c = graph->nodes[i];
+        if (c == t) {
+            found = true;
+            continue;
+        }
+        // a view of t is checked through the nodes that read it; a node without elements reads nothing
+        // (the copy of the states of further sequences, with one sequence)
+        if (c == user || ggml_op_is_empty(c->op) || ggml_is_empty(c)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = c->src[s];
+            if (src && !ggml_is_empty(src) && (src == t || src->view_src == t)) {
+                n++;
+            }
+        }
+    }
+    return found ? n : -1;
+}
+
+// The recurrent state of a GATED_DELTA_NET comes from a GET_ROWS that picks the state row of the
+// sequence out of the cache: a copy of the whole state (1 MB per layer and token for a 0.8B model)
+// that the op then reads once. For one sequence, the GET_ROWS is dropped and the op takes the cache
+// and the row index (src[5], src[6]) and reads the row itself.
+// The new state may go back to the same row (the fused CPY): the op reads the state of a head before
+// it writes that head, and with one sequence and one snapshot no other head's state is at that place.
+void htp_fusion_elide_gdn_state_rows(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph,
+                                     std::vector<struct htp_opnode> & nodes) {
+    if (!htp_fusion_enabled(HTP_FUSE_GDN_STATE_ROWS) || htp_session_mdev_count(sess) > 1) {
+        return;
+    }
+
+    for (size_t j = 0; j < nodes.size(); j++) {
+        htp_opnode & gdn = nodes[j];
+        if (gdn.opcode != HTP_OP_GATED_DELTA_NET || gdn.inputs.size() != 6 || gdn.outputs.size() != 1) {
+            continue;
+        }
+        const ggml_tensor * v     = gdn.inputs[2];
+        const ggml_tensor * state = gdn.inputs[5];
+        if (!v || !state || v->ne[3] != 1) {  // one sequence
+            continue;
+        }
+        const int64_t n_tokens = v->ne[2];
+        const int64_t K        = ggml_get_op_params_i32(gdn.node, 0);
+        if (std::min<int64_t>(n_tokens, K) != 1) {  // one state snapshot
+            continue;
+        }
+        const size_t row_bytes = (size_t) v->ne[0] * v->ne[0] * v->ne[1] * sizeof(float);
+        if (state->type != GGML_TYPE_F32 || !ggml_is_contiguous(state) || ggml_nbytes(state) != row_bytes ||
+            (state->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+
+        // the op that wrote the state last
+        size_t i = j;
+        bool   found = false;
+        while (i-- > 0 && !found) {
+            for (const ggml_tensor * out : nodes[i].outputs) {
+                if (out && htp_tensors_overlap(out, state)) {
+                    found = true;
+                }
+            }
+            if (found) {
+                break;
+            }
+        }
+        if (!found) {
+            continue;
+        }
+        const htp_opnode & gr = nodes[i];
+        if (gr.opcode != HTP_OP_GET_ROWS || !gr.node || gr.node->op != GGML_OP_GET_ROWS || gr.inputs.size() != 2 ||
+            gr.outputs.size() != 1 || !gr.fused.empty()) {
+            continue;
+        }
+        const ggml_tensor * cache = gr.inputs[0];
+        const ggml_tensor * idx   = gr.inputs[1];
+        const ggml_tensor * rows  = gr.dst();
+        if (!cache || !idx || rows != gr.node || rows->data != state->data || ggml_nbytes(rows) != row_bytes ||
+            (state != rows && state->view_src != rows)) {
+            continue;
+        }
+        if (cache->type != GGML_TYPE_F32 || rows->type != GGML_TYPE_F32 || idx->type != GGML_TYPE_I32 ||
+            ggml_nelements(idx) != 1 || !ggml_is_contiguous(cache) || !ggml_is_contiguous(rows) ||
+            (size_t) cache->ne[0] * sizeof(float) != row_bytes || cache->ne[2] != 1 || cache->ne[3] != 1 ||
+            (rows->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        // the rows have no other reader
+        if (htp_count_other_users(graph, rows, gdn.node) != 0 ||
+            (state != rows && htp_count_other_users(graph, state, gdn.node) != 0)) {
+            continue;
+        }
+        // nothing writes the cache or the index before the op reads them
+        bool written = htp_tensors_overlap(gdn.dst(), cache) || htp_tensors_overlap(gdn.dst(), idx);
+        for (size_t k = i + 1; k < j && !written; k++) {
+            for (const ggml_tensor * out : nodes[k].outputs) {
+                if (out && (htp_tensors_overlap(out, cache) || htp_tensors_overlap(out, idx))) {
+                    written = true;
+                }
+            }
+        }
+        if (written) {
+            continue;
+        }
+        // a CPY that may be fused into the op writes whole rows of the cache, or outside of it
+        if (j + 1 < nodes.size() && nodes[j + 1].opcode == HTP_OP_CPY) {
+            const ggml_tensor * cd = nodes[j + 1].dst();
+            if (cd && htp_tensors_overlap(cd, cache) &&
+                (ggml_nbytes(cd) != row_bytes || ((uintptr_t) cd->data - (uintptr_t) cache->data) % row_bytes != 0)) {
+                continue;
+            }
+        }
+
+        gdn.inputs[5] = cache;
+        gdn.inputs.push_back(idx);
+        HEX_VERBOSE("ggml-hex: %s state rows of %s from %s\n", htp_session_name(sess), gdn.name().c_str(), cache->name);
+        nodes.erase(nodes.begin() + (std::ptrdiff_t) i);
+        j--;
+    }
+}
+
 bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_opnode & prev, const struct htp_opnode & cur) {
     if (!opt_opfusion) return false;
 

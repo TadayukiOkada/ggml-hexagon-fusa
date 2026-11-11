@@ -3,6 +3,8 @@
 
 #include "htp-common.h"
 
+#include <vector>
+
 enum htp_fusion_flags {
     HTP_FUSE_ALLREDUCE_ADD   = (1 << 1),  // 2
     HTP_FUSE_RMS_NORM_MUL    = (1 << 2),  // 4
@@ -22,6 +24,7 @@ enum htp_fusion_flags {
     HTP_FUSE_RMS_NORM_ADD    = (1 << 16), // 65536
     HTP_FUSE_RMS_NORM_ADD_MUL = (1 << 17), // 131072
     HTP_FUSE_MUL_MAT_POST    = (1 << 18), // 262144
+    HTP_FUSE_GDN_STATE_ROWS  = (1 << 19), // 524288
 };
 
 static inline bool htp_fusion_enabled(int flag) {
@@ -37,5 +40,7 @@ bool htp_fusion_tags_op(enum ggml_op op);
 void htp_fusion_tag_graph(struct ggml_cgraph * graph);
 bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_opnode & prev, const struct htp_opnode & cur);
 bool htp_fusion_try_absorb_norm(const struct htp_opnode & norm, struct htp_opnode & nx);
+void htp_fusion_elide_gdn_state_rows(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph,
+                                     std::vector<struct htp_opnode> & nodes);
 
 #endif // HTP_FUSION_H
