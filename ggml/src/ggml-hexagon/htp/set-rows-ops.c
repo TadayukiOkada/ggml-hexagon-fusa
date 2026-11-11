@@ -200,6 +200,62 @@ SET_ROWS_THREAD_DMA_FN(f8_e4m3, int64_t, { kv_quantize_row(dst_spad, (const floa
 SET_ROWS_THREAD_DMA_FN(iq4_nl, int32_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_IQ4_NL); })
 SET_ROWS_THREAD_DMA_FN(iq4_nl, int64_t, { kv_quantize_row(dst_spad, (const float *)src_spad, ne00, HTP_TYPE_IQ4_NL); })
 
+// The rows that the op writes, as one address range. The output is the whole K or V cache while a
+// decode writes one row of it, and the next op to read the cache flushes what is marked dirty.
+#define SET_ROWS_RANGE_MAX_INDICES 4096
+
+bool op_set_rows_written_range(const struct htp_ops_context * octx, uint32_t * start, uint32_t * end) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * idx  = octx->src[1];
+    const struct htp_tensor * dst  = octx->dsts[0];
+    if (!src0 || !idx || !dst || htp_tensor_is_extended(idx) || htp_tensor_is_extended(dst)) {
+        return false;
+    }
+    // Small caches do not amortize the index scan and partial-range bookkeeping.
+    // Keep whole-output tracking there, including the short-context decode path.
+    if (dst->size < HTP_DCACHE_PARTIAL_MIN_BYTES) {
+        return false;
+    }
+    if (idx->type != HTP_TYPE_I32 && idx->type != HTP_TYPE_I64) {
+        return false;
+    }
+    const uint64_t n_idx = (uint64_t) idx->ne[0] * idx->ne[1] * idx->ne[2];
+    if (n_idx == 0 || n_idx > SET_ROWS_RANGE_MAX_INDICES || src0->ne[2] == 0 || src0->ne[3] == 0) {
+        return false;
+    }
+
+    const uint32_t ne1 = dst->ne[1];
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (uint32_t i2 = 0; i2 < idx->ne[2]; i2++) {
+        for (uint32_t i1 = 0; i1 < idx->ne[1]; i1++) {
+            const uint8_t * p = (const uint8_t *) (uintptr_t) idx->data + (size_t) i1 * idx->nb[1] + (size_t) i2 * idx->nb[2];
+            for (uint32_t i0 = 0; i0 < idx->ne[0]; i0++, p += idx->nb[0]) {
+                const uint64_t r = idx->type == HTP_TYPE_I32 ? (uint64_t) (int64_t) * (const int32_t *) p
+                                                             : (uint64_t) * (const int64_t *) p;
+                if (r < ne1) {  // the op skips the other rows
+                    lo = MIN(lo, (uint32_t) r);
+                    hi = MAX(hi, (uint32_t) r);
+                }
+            }
+        }
+    }
+    if (lo > hi) {  // nothing is written
+        *start = *end = 0;
+        return true;
+    }
+
+    const uint64_t row_size = htp_tensor_get_row_size(dst->type, src0->ne[0]);
+    const uint64_t first    = dst->data + (uint64_t) lo * dst->nb[1];
+    const uint64_t last     = dst->data + (uint64_t) hi * dst->nb[1] + (uint64_t) (src0->ne[2] - 1) * dst->nb[2] +
+                              (uint64_t) (src0->ne[3] - 1) * dst->nb[3] + row_size;
+    if (last > dst->data + dst->size || last > UINT32_MAX) {
+        return false;
+    }
+    *start = (uint32_t) first;
+    *end   = (uint32_t) last;
+    return true;
+}
+
 int op_set_rows(struct htp_ops_context * octx) {
     const struct htp_set_rows_kernel_params * kparams = (const struct htp_set_rows_kernel_params *)octx->kernel_params;
     set_rows_preamble;
