@@ -1449,7 +1449,13 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
-    htp_dcache_mark_dirty_tensors(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
+    // SET_ROWS writes a few rows of an output that can be megabytes (the K/V caches)
+    uint32_t w_start = 0, w_end = 0;
+    if (op->opcode == HTP_OP_SET_ROWS && op_set_rows_written_range(octx, &w_start, &w_end)) {
+        htp_dcache_mark_dirty_range(octx->ctx, w_start, w_end);
+    } else {
+        htp_dcache_mark_dirty_tensors(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
+    }
 
     // an op writing over a mask whose flash-attention flags are cached invalidates them
     struct htp_context * ctx = octx->ctx;
@@ -1571,7 +1577,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
     hex_l2fetch_block(ctx, ctx->footprint);
-    memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
+    htp_dcache_reset(ctx);
     ctx->fa_mask_n = 0;  // the host rewrites the masks between batches
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 

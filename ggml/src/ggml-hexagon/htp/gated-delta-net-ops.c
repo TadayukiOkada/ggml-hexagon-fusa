@@ -2243,6 +2243,27 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         return HTP_STATUS_INVAL_PARAMS;
     }
 
+    // src[6]: the state is a row of the state cache src[5] (one sequence; the host dropped the
+    // GET_ROWS that copied the row). The row is read by DMA like a state tensor of its own.
+    struct htp_tensor state_row;
+    if (octx->src[6]) {
+        const struct htp_tensor * cache = octx->src[5];
+        const struct htp_tensor * idx   = octx->src[6];
+        if (htp_tensor_is_extended(idx) || idx->type != HTP_TYPE_I32 || kparams->n_seqs != 1 ||
+            cache->nb[1] != (uint64_t) kparams->S_v * kparams->S_v * kparams->H * sizeof(float)) {
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+        const int32_t row = *(const int32_t *) (uintptr_t) idx->data;
+        if (row < 0 || (uint32_t) row >= cache->ne[1]) {
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+        state_row       = *cache;
+        state_row.data += (uint64_t) row * cache->nb[1];
+        state_row.size  = cache->nb[1];
+        state_row.ne[1] = 1;
+        octx->src[5]    = &state_row;
+    }
+
     const uint32_t S_v        = kparams->S_v;
     const uint32_t n_tokens   = kparams->n_tokens;
     const uint32_t total_rows = kparams->total_rows;

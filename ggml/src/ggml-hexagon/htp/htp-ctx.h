@@ -141,6 +141,7 @@ struct htp_context {
 
     uint64_t               max_vmem;
     struct htp_dirty_range dirty_ranges[HTP_MAX_DIRTY_RANGES];
+    uint32_t               n_dirty_ranges;  // the ranges in use are the first ones
     bool                   mm_out_writeback;  // HMX matmul output stores write their lines back
 
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
@@ -228,6 +229,8 @@ int op_add_id(struct htp_ops_context * octx);
 int op_rope(struct htp_ops_context * octx);
 int op_flash_attn_ext(struct htp_ops_context * octx);
 int op_set_rows(struct htp_ops_context * octx);
+// The part of the output that SET_ROWS writes, when it is known before the op runs
+bool op_set_rows_written_range(const struct htp_ops_context * octx, uint32_t * start, uint32_t * end);
 int op_get_rows(struct htp_ops_context * octx);
 int op_cpy(struct htp_ops_context * octx);
 int op_repeat(struct htp_ops_context * octx);

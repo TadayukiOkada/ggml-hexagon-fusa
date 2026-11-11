@@ -2788,6 +2788,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             computed_nodes.push_back(std::move(node));
         }
 
+        htp_fusion_elide_gdn_state_rows(sess, graph, computed_nodes);
+
         if (graph->uid != 0) {
             sess->cached_uid   = graph->uid;
             sess->cached_nodes = std::move(computed_nodes);
