@@ -802,7 +802,30 @@ typedef struct {
     uint32_t                kv_start;
     uint32_t                rows_per_t;
     size_t                  buf_idx;
+    uint32_t                act_row_tiles;  // not 0: K as the activation of K Q^T, tiles [dim][key] of this many key tiles
 } fa_k_int_args_t;
+
+// Cache rows (keys) [start, end) of K or V into tiles with the keys as tile rows: the weight of P V,
+// or the activation of K Q^T. Adjacent keys interleave in a tile vector, no transpose.
+static inline void fa_rows_to_key_tiles(const struct hmx_fa_context * factx, int type, uint32_t dim, uint32_t dim_pad,
+                                        __fp16 * tiles, void * src, size_t src_stride, uint32_t row_tiles,
+                                        uint32_t total_rows, uint32_t start, uint32_t end) {
+    if (type != HTP_TYPE_F16 && type != HTP_TYPE_Q8_0) {
+        hmx_kv_v_to_tiles(tiles, src, src_stride * sizeof(__fp16), dim, dim_pad, row_tiles, type, start, end);
+        return;
+    }
+    if (factx->fused_q8_prep && type == HTP_TYPE_Q8_0) {
+        hmx_q8_v_to_tiles(tiles, src, src_stride * sizeof(__fp16), dim, dim_pad, row_tiles, start, end);
+        return;
+    }
+    if (type != HTP_TYPE_F16) {
+        for (uint32_t r = start; r < end; ++r) {
+            __fp16 * row = (__fp16 *) ((char *) src + r * src_stride * sizeof(__fp16));
+            hvx_dequantize_row_flat_q8_0_f16(row, row, dim);
+        }
+    }
+    hmx_interleave_cols_to_tiles(tiles, (const __fp16 *) src, total_rows, dim_pad, src_stride, row_tiles, start, end);
+}
 
 static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) {
     fa_k_int_args_t *       args  = (fa_k_int_args_t *) data;
@@ -819,6 +842,12 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+    if (args->act_row_tiles) {
+        fa_rows_to_key_tiles(factx, factx->k->type, factx->DK, factx->DK_pad, factx->vtcm_k_tiles[args->buf_idx], args->curr_k,
+                             args->src_stride, args->act_row_tiles, total_rows, start, end);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+        return;
+    }
     if (factx->k->type != HTP_TYPE_F16 && factx->k->type != HTP_TYPE_Q8_0) {
         hmx_kv_k_to_tiles(factx->vtcm_k_tiles[args->buf_idx], args->curr_k, args->src_stride * sizeof(__fp16),
                           factx->DK, factx->DK_pad, factx->k->type, start, end);
@@ -848,7 +877,8 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
 }
 
-static void fa_phase_k_interleave(struct hmx_fa_context * factx, uint32_t kv_rows, size_t src_stride, void * curr_k, uint32_t kv_start, size_t buf_idx) {
+static void fa_phase_k_interleave(struct hmx_fa_context * factx, uint32_t kv_rows, size_t src_stride, void * curr_k, uint32_t kv_start, size_t buf_idx,
+                                  uint32_t act_row_tiles) {
     work_queue_t wp = factx->octx->ctx->work_queue;
     uint32_t n = 1;
     if (factx->n_threads > 1 && kv_rows >= factx->n_threads * 2) {
@@ -856,7 +886,7 @@ static void fa_phase_k_interleave(struct hmx_fa_context * factx, uint32_t kv_row
     }
     // K slices of four rows: the K tile scatters take four rows at a time (hmx_k_scatter4)
     uint32_t rows_per_t = hex_align_up(hmx_ceil_div(kv_rows, n), 4);
-    fa_k_int_args_t args = { factx, kv_rows, src_stride, curr_k, kv_start, rows_per_t, buf_idx };
+    fa_k_int_args_t args = { factx, kv_rows, src_stride, curr_k, kv_start, rows_per_t, buf_idx, act_row_tiles };
     if (n > 1) {
         work_queue_run(wp, fa_k_interleave_thread, &args, n);
     } else {
@@ -892,27 +922,8 @@ static void fa_v_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
-    if (factx->v->type != HTP_TYPE_F16 && factx->v->type != HTP_TYPE_Q8_0) {
-        hmx_kv_v_to_tiles(v_tiles_dst, args->v_src, args->src_stride * sizeof(__fp16),
-                          factx->DV, factx->DV_pad, args->n_col_tiles, factx->v->type, start, end);
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
-        return;
-    }
-    if (factx->fused_q8_prep && factx->v->type == HTP_TYPE_Q8_0) {
-        hmx_q8_v_to_tiles(v_tiles_dst, args->v_src, args->src_stride * sizeof(__fp16),
-                          factx->DV, factx->DV_pad, args->n_col_tiles, start, end);
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
-        return;
-    }
-    if (factx->v->type != HTP_TYPE_F16) {
-        for (uint32_t r = start; r < end; ++r) {
-            __fp16 * row_v = (__fp16 *)((char *)args->v_src + r * args->src_stride * sizeof(__fp16));
-            if (factx->v->type == HTP_TYPE_Q8_0) hvx_dequantize_row_flat_q8_0_f16(row_v, row_v, factx->DV);
-            else hmx_kv_row_to_f16(row_v, row_v, factx->DV, factx->v->type);
-        }
-    }
-    hmx_interleave_cols_to_tiles(v_tiles_dst, (const __fp16 *) args->v_src, total_rows, factx->DV_pad,
-                             args->src_stride, (uint32_t) args->n_col_tiles, start, end);
+    fa_rows_to_key_tiles(factx, factx->v->type, factx->DV, factx->DV_pad, v_tiles_dst, args->v_src, args->src_stride,
+                         (uint32_t) args->n_col_tiles, total_rows, start, end);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
 }
 
@@ -1288,6 +1299,7 @@ typedef struct {
     const __fp16 *            mask_vtcm;             // VTCM mask buffer base (NULL = DDR fallback)
     size_t                    mask_vtcm_row_stride;  // elements (__fp16) per row in VTCM mask buffer
     struct fastdiv_values     thread_div;
+    bool                      s_by_word;  // S tiles from fa_tile_transpose_*: a query row is a word lane
 } fa_softmax_args_t;
 
 // 2^x in fp16 for the softmax: hvx_vec_exp2_f16 with a degree-4 polynomial instead of degree 6.
@@ -1350,6 +1362,8 @@ static inline void fa_softmax_impl(
     const size_t n_tiles_per_bc = args->n_tiles_per_bc;
     const size_t n_row_vec_cnt  = hmx_ceil_div(n_rows_g, 64);
     const uint32_t im3          = has_mask ? fastmodulo(args->ib3, args->mask->ne[3], &factx->src3_div3) : 0;
+    // rows 2i and 2i + 1 of a tile vector alternate by halfword, or by word after fa_tile_transpose_*
+    const int      s_deal       = args->s_by_word ? -4 : -2;
 
     size_t vec_start = 0;
     size_t vec_end   = n_row_vec_cnt;
@@ -1405,7 +1419,7 @@ static inline void fa_softmax_impl(
                     const HVX_Vector * pv_s_in0 = ((const HVX_Vector *) in_dtile) + r1 / 2;
                     const HVX_Vector * pv_s_in1 = pv_s_in0 + 16;
 
-                    HVX_VectorPair vp_s_drow = Q6_W_vdeal_VVR(*pv_s_in1, *pv_s_in0, -2);
+                    HVX_VectorPair vp_s_drow = Q6_W_vdeal_VVR(*pv_s_in1, *pv_s_in0, s_deal);
                     HVX_Vector     v_s_row0  = Q6_V_lo_W(vp_s_drow);
                     HVX_Vector     v_s_row1  = Q6_V_hi_W(vp_s_drow);
 
@@ -1427,11 +1441,11 @@ static inline void fa_softmax_impl(
                     const HVX_Vector * pv_s_in0_1 = ((const HVX_Vector *) in_dtile1) + r1 / 2;
                     const HVX_Vector * pv_s_in1_1 = pv_s_in0_1 + 16;
 
-                    HVX_VectorPair vp_s_drow0 = Q6_W_vdeal_VVR(*pv_s_in1_0, *pv_s_in0_0, -2);
+                    HVX_VectorPair vp_s_drow0 = Q6_W_vdeal_VVR(*pv_s_in1_0, *pv_s_in0_0, s_deal);
                     my_row_buf0[ci0]          = Q6_V_lo_W(vp_s_drow0);
                     my_row_buf1[ci0]          = Q6_V_hi_W(vp_s_drow0);
 
-                    HVX_VectorPair vp_s_drow1 = Q6_W_vdeal_VVR(*pv_s_in1_1, *pv_s_in0_1, -2);
+                    HVX_VectorPair vp_s_drow1 = Q6_W_vdeal_VVR(*pv_s_in1_1, *pv_s_in0_1, s_deal);
                     my_row_buf0[ci1]          = Q6_V_lo_W(vp_s_drow1);
                     my_row_buf1[ci1]          = Q6_V_hi_W(vp_s_drow1);
                 }
@@ -1441,7 +1455,7 @@ static inline void fa_softmax_impl(
                     const HVX_Vector * pv_s_in0 = ((const HVX_Vector *) in_dtile) + r1 / 2;
                     const HVX_Vector * pv_s_in1 = pv_s_in0 + 16;
 
-                    HVX_VectorPair vp_s_drow = Q6_W_vdeal_VVR(*pv_s_in1, *pv_s_in0, -2);
+                    HVX_VectorPair vp_s_drow = Q6_W_vdeal_VVR(*pv_s_in1, *pv_s_in0, s_deal);
                     my_row_buf0[ci]          = Q6_V_lo_W(vp_s_drow);
                     my_row_buf1[ci]          = Q6_V_hi_W(vp_s_drow);
                 }
@@ -2255,8 +2269,436 @@ static const uint8_t * fa_mask_flags_get(struct htp_context * ctx, const fa_kv_r
 // the step loop, which can: n_kv * n_kv_heads * (DK + DV) up to this is about 8 ms on v73
 #define FA_MH_MAX_WORK   (100u * 1000 * 1000)
 
+// K on the row side (one row tile of queries, n_rows_g <= 32). S = Q K^T takes K as the HMX weight,
+// tiles with the keys as columns: every K vector is scattered. S^T = K Q^T takes K as the activation,
+// tiles with the keys as rows, written like the V tiles (adjacent keys interleaved, plain stores), and
+// Q^T as the weight (scattered once per op). The S^T tiles, keys by queries, come back to S tiles
+// with a transpose of the 64-bit elements of the 16 tile vectors (fa_tile_transpose_*): only the first
+// n_rows_g / 2 result vectors are needed, 15 to 32 shuffles per 32 keys.
+
+// fa_tile_transpose_<n_out>: d[i] element j (64-bit) = s[j] element i, for i < n_out. Four stages of
+// vshuff(-8) on the pairs (k, k + 8). For a tile X[a][b] (vector a / 2, halfword
+// 2 b + a % 2) into the tile of the transpose, except that the halfwords of an element are
+// (b, a), (b + 1, a), (b, a + 1), (b + 1, a + 1): rows 2i and 2i + 1 alternate by word, not by halfword.
+// Straight-line networks of the shuffles that the first n_out outputs need (generated, the other
+// outputs pruned): an array version keeps the 16 + 16 vectors on the stack. All 16 loads come
+// before the stores, so d may be s (in place).
+static inline __attribute__((always_inline)) void fa_tile_transpose_2(HVX_Vector * d, const HVX_Vector * s) {
+    const HVX_Vector a0_0 = s[0];
+    const HVX_Vector a0_1 = s[1];
+    const HVX_Vector a0_2 = s[2];
+    const HVX_Vector a0_3 = s[3];
+    const HVX_Vector a0_4 = s[4];
+    const HVX_Vector a0_5 = s[5];
+    const HVX_Vector a0_6 = s[6];
+    const HVX_Vector a0_7 = s[7];
+    const HVX_Vector a0_8 = s[8];
+    const HVX_Vector a0_9 = s[9];
+    const HVX_Vector a0_10 = s[10];
+    const HVX_Vector a0_11 = s[11];
+    const HVX_Vector a0_12 = s[12];
+    const HVX_Vector a0_13 = s[13];
+    const HVX_Vector a0_14 = s[14];
+    const HVX_Vector a0_15 = s[15];
+    const HVX_VectorPair p1_0 = Q6_W_vshuff_VVR(a0_8, a0_0, -8);
+    const HVX_Vector a1_0 = Q6_V_lo_W(p1_0);
+    const HVX_VectorPair p1_1 = Q6_W_vshuff_VVR(a0_9, a0_1, -8);
+    const HVX_Vector a1_2 = Q6_V_lo_W(p1_1);
+    const HVX_VectorPair p1_2 = Q6_W_vshuff_VVR(a0_10, a0_2, -8);
+    const HVX_Vector a1_4 = Q6_V_lo_W(p1_2);
+    const HVX_VectorPair p1_3 = Q6_W_vshuff_VVR(a0_11, a0_3, -8);
+    const HVX_Vector a1_6 = Q6_V_lo_W(p1_3);
+    const HVX_VectorPair p1_4 = Q6_W_vshuff_VVR(a0_12, a0_4, -8);
+    const HVX_Vector a1_8 = Q6_V_lo_W(p1_4);
+    const HVX_VectorPair p1_5 = Q6_W_vshuff_VVR(a0_13, a0_5, -8);
+    const HVX_Vector a1_10 = Q6_V_lo_W(p1_5);
+    const HVX_VectorPair p1_6 = Q6_W_vshuff_VVR(a0_14, a0_6, -8);
+    const HVX_Vector a1_12 = Q6_V_lo_W(p1_6);
+    const HVX_VectorPair p1_7 = Q6_W_vshuff_VVR(a0_15, a0_7, -8);
+    const HVX_Vector a1_14 = Q6_V_lo_W(p1_7);
+    const HVX_VectorPair p2_0 = Q6_W_vshuff_VVR(a1_8, a1_0, -8);
+    const HVX_Vector a2_0 = Q6_V_lo_W(p2_0);
+    const HVX_VectorPair p2_2 = Q6_W_vshuff_VVR(a1_10, a1_2, -8);
+    const HVX_Vector a2_4 = Q6_V_lo_W(p2_2);
+    const HVX_VectorPair p2_4 = Q6_W_vshuff_VVR(a1_12, a1_4, -8);
+    const HVX_Vector a2_8 = Q6_V_lo_W(p2_4);
+    const HVX_VectorPair p2_6 = Q6_W_vshuff_VVR(a1_14, a1_6, -8);
+    const HVX_Vector a2_12 = Q6_V_lo_W(p2_6);
+    const HVX_VectorPair p3_0 = Q6_W_vshuff_VVR(a2_8, a2_0, -8);
+    const HVX_Vector a3_0 = Q6_V_lo_W(p3_0);
+    const HVX_VectorPair p3_4 = Q6_W_vshuff_VVR(a2_12, a2_4, -8);
+    const HVX_Vector a3_8 = Q6_V_lo_W(p3_4);
+    const HVX_VectorPair p4_0 = Q6_W_vshuff_VVR(a3_8, a3_0, -8);
+    const HVX_Vector a4_0 = Q6_V_lo_W(p4_0);
+    const HVX_Vector a4_1 = Q6_V_hi_W(p4_0);
+    d[0] = a4_0;
+    d[1] = a4_1;
+}
+
+static inline __attribute__((always_inline)) void fa_tile_transpose_4(HVX_Vector * d, const HVX_Vector * s) {
+    const HVX_Vector a0_0 = s[0];
+    const HVX_Vector a0_1 = s[1];
+    const HVX_Vector a0_2 = s[2];
+    const HVX_Vector a0_3 = s[3];
+    const HVX_Vector a0_4 = s[4];
+    const HVX_Vector a0_5 = s[5];
+    const HVX_Vector a0_6 = s[6];
+    const HVX_Vector a0_7 = s[7];
+    const HVX_Vector a0_8 = s[8];
+    const HVX_Vector a0_9 = s[9];
+    const HVX_Vector a0_10 = s[10];
+    const HVX_Vector a0_11 = s[11];
+    const HVX_Vector a0_12 = s[12];
+    const HVX_Vector a0_13 = s[13];
+    const HVX_Vector a0_14 = s[14];
+    const HVX_Vector a0_15 = s[15];
+    const HVX_VectorPair p1_0 = Q6_W_vshuff_VVR(a0_8, a0_0, -8);
+    const HVX_Vector a1_0 = Q6_V_lo_W(p1_0);
+    const HVX_VectorPair p1_1 = Q6_W_vshuff_VVR(a0_9, a0_1, -8);
+    const HVX_Vector a1_2 = Q6_V_lo_W(p1_1);
+    const HVX_VectorPair p1_2 = Q6_W_vshuff_VVR(a0_10, a0_2, -8);
+    const HVX_Vector a1_4 = Q6_V_lo_W(p1_2);
+    const HVX_VectorPair p1_3 = Q6_W_vshuff_VVR(a0_11, a0_3, -8);
+    const HVX_Vector a1_6 = Q6_V_lo_W(p1_3);
+    const HVX_VectorPair p1_4 = Q6_W_vshuff_VVR(a0_12, a0_4, -8);
+    const HVX_Vector a1_8 = Q6_V_lo_W(p1_4);
+    const HVX_VectorPair p1_5 = Q6_W_vshuff_VVR(a0_13, a0_5, -8);
+    const HVX_Vector a1_10 = Q6_V_lo_W(p1_5);
+    const HVX_VectorPair p1_6 = Q6_W_vshuff_VVR(a0_14, a0_6, -8);
+    const HVX_Vector a1_12 = Q6_V_lo_W(p1_6);
+    const HVX_VectorPair p1_7 = Q6_W_vshuff_VVR(a0_15, a0_7, -8);
+    const HVX_Vector a1_14 = Q6_V_lo_W(p1_7);
+    const HVX_VectorPair p2_0 = Q6_W_vshuff_VVR(a1_8, a1_0, -8);
+    const HVX_Vector a2_0 = Q6_V_lo_W(p2_0);
+    const HVX_VectorPair p2_2 = Q6_W_vshuff_VVR(a1_10, a1_2, -8);
+    const HVX_Vector a2_4 = Q6_V_lo_W(p2_2);
+    const HVX_VectorPair p2_4 = Q6_W_vshuff_VVR(a1_12, a1_4, -8);
+    const HVX_Vector a2_8 = Q6_V_lo_W(p2_4);
+    const HVX_VectorPair p2_6 = Q6_W_vshuff_VVR(a1_14, a1_6, -8);
+    const HVX_Vector a2_12 = Q6_V_lo_W(p2_6);
+    const HVX_VectorPair p3_0 = Q6_W_vshuff_VVR(a2_8, a2_0, -8);
+    const HVX_Vector a3_0 = Q6_V_lo_W(p3_0);
+    const HVX_Vector a3_1 = Q6_V_hi_W(p3_0);
+    const HVX_VectorPair p3_4 = Q6_W_vshuff_VVR(a2_12, a2_4, -8);
+    const HVX_Vector a3_8 = Q6_V_lo_W(p3_4);
+    const HVX_Vector a3_9 = Q6_V_hi_W(p3_4);
+    const HVX_VectorPair p4_0 = Q6_W_vshuff_VVR(a3_8, a3_0, -8);
+    const HVX_Vector a4_0 = Q6_V_lo_W(p4_0);
+    const HVX_Vector a4_1 = Q6_V_hi_W(p4_0);
+    const HVX_VectorPair p4_1 = Q6_W_vshuff_VVR(a3_9, a3_1, -8);
+    const HVX_Vector a4_2 = Q6_V_lo_W(p4_1);
+    const HVX_Vector a4_3 = Q6_V_hi_W(p4_1);
+    d[0] = a4_0;
+    d[1] = a4_1;
+    d[2] = a4_2;
+    d[3] = a4_3;
+}
+
+static inline __attribute__((always_inline)) void fa_tile_transpose_8(HVX_Vector * d, const HVX_Vector * s) {
+    const HVX_Vector a0_0 = s[0];
+    const HVX_Vector a0_1 = s[1];
+    const HVX_Vector a0_2 = s[2];
+    const HVX_Vector a0_3 = s[3];
+    const HVX_Vector a0_4 = s[4];
+    const HVX_Vector a0_5 = s[5];
+    const HVX_Vector a0_6 = s[6];
+    const HVX_Vector a0_7 = s[7];
+    const HVX_Vector a0_8 = s[8];
+    const HVX_Vector a0_9 = s[9];
+    const HVX_Vector a0_10 = s[10];
+    const HVX_Vector a0_11 = s[11];
+    const HVX_Vector a0_12 = s[12];
+    const HVX_Vector a0_13 = s[13];
+    const HVX_Vector a0_14 = s[14];
+    const HVX_Vector a0_15 = s[15];
+    const HVX_VectorPair p1_0 = Q6_W_vshuff_VVR(a0_8, a0_0, -8);
+    const HVX_Vector a1_0 = Q6_V_lo_W(p1_0);
+    const HVX_VectorPair p1_1 = Q6_W_vshuff_VVR(a0_9, a0_1, -8);
+    const HVX_Vector a1_2 = Q6_V_lo_W(p1_1);
+    const HVX_VectorPair p1_2 = Q6_W_vshuff_VVR(a0_10, a0_2, -8);
+    const HVX_Vector a1_4 = Q6_V_lo_W(p1_2);
+    const HVX_VectorPair p1_3 = Q6_W_vshuff_VVR(a0_11, a0_3, -8);
+    const HVX_Vector a1_6 = Q6_V_lo_W(p1_3);
+    const HVX_VectorPair p1_4 = Q6_W_vshuff_VVR(a0_12, a0_4, -8);
+    const HVX_Vector a1_8 = Q6_V_lo_W(p1_4);
+    const HVX_VectorPair p1_5 = Q6_W_vshuff_VVR(a0_13, a0_5, -8);
+    const HVX_Vector a1_10 = Q6_V_lo_W(p1_5);
+    const HVX_VectorPair p1_6 = Q6_W_vshuff_VVR(a0_14, a0_6, -8);
+    const HVX_Vector a1_12 = Q6_V_lo_W(p1_6);
+    const HVX_VectorPair p1_7 = Q6_W_vshuff_VVR(a0_15, a0_7, -8);
+    const HVX_Vector a1_14 = Q6_V_lo_W(p1_7);
+    const HVX_VectorPair p2_0 = Q6_W_vshuff_VVR(a1_8, a1_0, -8);
+    const HVX_Vector a2_0 = Q6_V_lo_W(p2_0);
+    const HVX_Vector a2_1 = Q6_V_hi_W(p2_0);
+    const HVX_VectorPair p2_2 = Q6_W_vshuff_VVR(a1_10, a1_2, -8);
+    const HVX_Vector a2_4 = Q6_V_lo_W(p2_2);
+    const HVX_Vector a2_5 = Q6_V_hi_W(p2_2);
+    const HVX_VectorPair p2_4 = Q6_W_vshuff_VVR(a1_12, a1_4, -8);
+    const HVX_Vector a2_8 = Q6_V_lo_W(p2_4);
+    const HVX_Vector a2_9 = Q6_V_hi_W(p2_4);
+    const HVX_VectorPair p2_6 = Q6_W_vshuff_VVR(a1_14, a1_6, -8);
+    const HVX_Vector a2_12 = Q6_V_lo_W(p2_6);
+    const HVX_Vector a2_13 = Q6_V_hi_W(p2_6);
+    const HVX_VectorPair p3_0 = Q6_W_vshuff_VVR(a2_8, a2_0, -8);
+    const HVX_Vector a3_0 = Q6_V_lo_W(p3_0);
+    const HVX_Vector a3_1 = Q6_V_hi_W(p3_0);
+    const HVX_VectorPair p3_1 = Q6_W_vshuff_VVR(a2_9, a2_1, -8);
+    const HVX_Vector a3_2 = Q6_V_lo_W(p3_1);
+    const HVX_Vector a3_3 = Q6_V_hi_W(p3_1);
+    const HVX_VectorPair p3_4 = Q6_W_vshuff_VVR(a2_12, a2_4, -8);
+    const HVX_Vector a3_8 = Q6_V_lo_W(p3_4);
+    const HVX_Vector a3_9 = Q6_V_hi_W(p3_4);
+    const HVX_VectorPair p3_5 = Q6_W_vshuff_VVR(a2_13, a2_5, -8);
+    const HVX_Vector a3_10 = Q6_V_lo_W(p3_5);
+    const HVX_Vector a3_11 = Q6_V_hi_W(p3_5);
+    const HVX_VectorPair p4_0 = Q6_W_vshuff_VVR(a3_8, a3_0, -8);
+    const HVX_Vector a4_0 = Q6_V_lo_W(p4_0);
+    const HVX_Vector a4_1 = Q6_V_hi_W(p4_0);
+    const HVX_VectorPair p4_1 = Q6_W_vshuff_VVR(a3_9, a3_1, -8);
+    const HVX_Vector a4_2 = Q6_V_lo_W(p4_1);
+    const HVX_Vector a4_3 = Q6_V_hi_W(p4_1);
+    const HVX_VectorPair p4_2 = Q6_W_vshuff_VVR(a3_10, a3_2, -8);
+    const HVX_Vector a4_4 = Q6_V_lo_W(p4_2);
+    const HVX_Vector a4_5 = Q6_V_hi_W(p4_2);
+    const HVX_VectorPair p4_3 = Q6_W_vshuff_VVR(a3_11, a3_3, -8);
+    const HVX_Vector a4_6 = Q6_V_lo_W(p4_3);
+    const HVX_Vector a4_7 = Q6_V_hi_W(p4_3);
+    d[0] = a4_0;
+    d[1] = a4_1;
+    d[2] = a4_2;
+    d[3] = a4_3;
+    d[4] = a4_4;
+    d[5] = a4_5;
+    d[6] = a4_6;
+    d[7] = a4_7;
+}
+
+static inline __attribute__((always_inline)) void fa_tile_transpose_16(HVX_Vector * d, const HVX_Vector * s) {
+    const HVX_Vector a0_0 = s[0];
+    const HVX_Vector a0_1 = s[1];
+    const HVX_Vector a0_2 = s[2];
+    const HVX_Vector a0_3 = s[3];
+    const HVX_Vector a0_4 = s[4];
+    const HVX_Vector a0_5 = s[5];
+    const HVX_Vector a0_6 = s[6];
+    const HVX_Vector a0_7 = s[7];
+    const HVX_Vector a0_8 = s[8];
+    const HVX_Vector a0_9 = s[9];
+    const HVX_Vector a0_10 = s[10];
+    const HVX_Vector a0_11 = s[11];
+    const HVX_Vector a0_12 = s[12];
+    const HVX_Vector a0_13 = s[13];
+    const HVX_Vector a0_14 = s[14];
+    const HVX_Vector a0_15 = s[15];
+    const HVX_VectorPair p1_0 = Q6_W_vshuff_VVR(a0_8, a0_0, -8);
+    const HVX_Vector a1_0 = Q6_V_lo_W(p1_0);
+    const HVX_Vector a1_1 = Q6_V_hi_W(p1_0);
+    const HVX_VectorPair p1_1 = Q6_W_vshuff_VVR(a0_9, a0_1, -8);
+    const HVX_Vector a1_2 = Q6_V_lo_W(p1_1);
+    const HVX_Vector a1_3 = Q6_V_hi_W(p1_1);
+    const HVX_VectorPair p1_2 = Q6_W_vshuff_VVR(a0_10, a0_2, -8);
+    const HVX_Vector a1_4 = Q6_V_lo_W(p1_2);
+    const HVX_Vector a1_5 = Q6_V_hi_W(p1_2);
+    const HVX_VectorPair p1_3 = Q6_W_vshuff_VVR(a0_11, a0_3, -8);
+    const HVX_Vector a1_6 = Q6_V_lo_W(p1_3);
+    const HVX_Vector a1_7 = Q6_V_hi_W(p1_3);
+    const HVX_VectorPair p1_4 = Q6_W_vshuff_VVR(a0_12, a0_4, -8);
+    const HVX_Vector a1_8 = Q6_V_lo_W(p1_4);
+    const HVX_Vector a1_9 = Q6_V_hi_W(p1_4);
+    const HVX_VectorPair p1_5 = Q6_W_vshuff_VVR(a0_13, a0_5, -8);
+    const HVX_Vector a1_10 = Q6_V_lo_W(p1_5);
+    const HVX_Vector a1_11 = Q6_V_hi_W(p1_5);
+    const HVX_VectorPair p1_6 = Q6_W_vshuff_VVR(a0_14, a0_6, -8);
+    const HVX_Vector a1_12 = Q6_V_lo_W(p1_6);
+    const HVX_Vector a1_13 = Q6_V_hi_W(p1_6);
+    const HVX_VectorPair p1_7 = Q6_W_vshuff_VVR(a0_15, a0_7, -8);
+    const HVX_Vector a1_14 = Q6_V_lo_W(p1_7);
+    const HVX_Vector a1_15 = Q6_V_hi_W(p1_7);
+    const HVX_VectorPair p2_0 = Q6_W_vshuff_VVR(a1_8, a1_0, -8);
+    const HVX_Vector a2_0 = Q6_V_lo_W(p2_0);
+    const HVX_Vector a2_1 = Q6_V_hi_W(p2_0);
+    const HVX_VectorPair p2_1 = Q6_W_vshuff_VVR(a1_9, a1_1, -8);
+    const HVX_Vector a2_2 = Q6_V_lo_W(p2_1);
+    const HVX_Vector a2_3 = Q6_V_hi_W(p2_1);
+    const HVX_VectorPair p2_2 = Q6_W_vshuff_VVR(a1_10, a1_2, -8);
+    const HVX_Vector a2_4 = Q6_V_lo_W(p2_2);
+    const HVX_Vector a2_5 = Q6_V_hi_W(p2_2);
+    const HVX_VectorPair p2_3 = Q6_W_vshuff_VVR(a1_11, a1_3, -8);
+    const HVX_Vector a2_6 = Q6_V_lo_W(p2_3);
+    const HVX_Vector a2_7 = Q6_V_hi_W(p2_3);
+    const HVX_VectorPair p2_4 = Q6_W_vshuff_VVR(a1_12, a1_4, -8);
+    const HVX_Vector a2_8 = Q6_V_lo_W(p2_4);
+    const HVX_Vector a2_9 = Q6_V_hi_W(p2_4);
+    const HVX_VectorPair p2_5 = Q6_W_vshuff_VVR(a1_13, a1_5, -8);
+    const HVX_Vector a2_10 = Q6_V_lo_W(p2_5);
+    const HVX_Vector a2_11 = Q6_V_hi_W(p2_5);
+    const HVX_VectorPair p2_6 = Q6_W_vshuff_VVR(a1_14, a1_6, -8);
+    const HVX_Vector a2_12 = Q6_V_lo_W(p2_6);
+    const HVX_Vector a2_13 = Q6_V_hi_W(p2_6);
+    const HVX_VectorPair p2_7 = Q6_W_vshuff_VVR(a1_15, a1_7, -8);
+    const HVX_Vector a2_14 = Q6_V_lo_W(p2_7);
+    const HVX_Vector a2_15 = Q6_V_hi_W(p2_7);
+    const HVX_VectorPair p3_0 = Q6_W_vshuff_VVR(a2_8, a2_0, -8);
+    const HVX_Vector a3_0 = Q6_V_lo_W(p3_0);
+    const HVX_Vector a3_1 = Q6_V_hi_W(p3_0);
+    const HVX_VectorPair p3_1 = Q6_W_vshuff_VVR(a2_9, a2_1, -8);
+    const HVX_Vector a3_2 = Q6_V_lo_W(p3_1);
+    const HVX_Vector a3_3 = Q6_V_hi_W(p3_1);
+    const HVX_VectorPair p3_2 = Q6_W_vshuff_VVR(a2_10, a2_2, -8);
+    const HVX_Vector a3_4 = Q6_V_lo_W(p3_2);
+    const HVX_Vector a3_5 = Q6_V_hi_W(p3_2);
+    const HVX_VectorPair p3_3 = Q6_W_vshuff_VVR(a2_11, a2_3, -8);
+    const HVX_Vector a3_6 = Q6_V_lo_W(p3_3);
+    const HVX_Vector a3_7 = Q6_V_hi_W(p3_3);
+    const HVX_VectorPair p3_4 = Q6_W_vshuff_VVR(a2_12, a2_4, -8);
+    const HVX_Vector a3_8 = Q6_V_lo_W(p3_4);
+    const HVX_Vector a3_9 = Q6_V_hi_W(p3_4);
+    const HVX_VectorPair p3_5 = Q6_W_vshuff_VVR(a2_13, a2_5, -8);
+    const HVX_Vector a3_10 = Q6_V_lo_W(p3_5);
+    const HVX_Vector a3_11 = Q6_V_hi_W(p3_5);
+    const HVX_VectorPair p3_6 = Q6_W_vshuff_VVR(a2_14, a2_6, -8);
+    const HVX_Vector a3_12 = Q6_V_lo_W(p3_6);
+    const HVX_Vector a3_13 = Q6_V_hi_W(p3_6);
+    const HVX_VectorPair p3_7 = Q6_W_vshuff_VVR(a2_15, a2_7, -8);
+    const HVX_Vector a3_14 = Q6_V_lo_W(p3_7);
+    const HVX_Vector a3_15 = Q6_V_hi_W(p3_7);
+    const HVX_VectorPair p4_0 = Q6_W_vshuff_VVR(a3_8, a3_0, -8);
+    const HVX_Vector a4_0 = Q6_V_lo_W(p4_0);
+    const HVX_Vector a4_1 = Q6_V_hi_W(p4_0);
+    const HVX_VectorPair p4_1 = Q6_W_vshuff_VVR(a3_9, a3_1, -8);
+    const HVX_Vector a4_2 = Q6_V_lo_W(p4_1);
+    const HVX_Vector a4_3 = Q6_V_hi_W(p4_1);
+    const HVX_VectorPair p4_2 = Q6_W_vshuff_VVR(a3_10, a3_2, -8);
+    const HVX_Vector a4_4 = Q6_V_lo_W(p4_2);
+    const HVX_Vector a4_5 = Q6_V_hi_W(p4_2);
+    const HVX_VectorPair p4_3 = Q6_W_vshuff_VVR(a3_11, a3_3, -8);
+    const HVX_Vector a4_6 = Q6_V_lo_W(p4_3);
+    const HVX_Vector a4_7 = Q6_V_hi_W(p4_3);
+    const HVX_VectorPair p4_4 = Q6_W_vshuff_VVR(a3_12, a3_4, -8);
+    const HVX_Vector a4_8 = Q6_V_lo_W(p4_4);
+    const HVX_Vector a4_9 = Q6_V_hi_W(p4_4);
+    const HVX_VectorPair p4_5 = Q6_W_vshuff_VVR(a3_13, a3_5, -8);
+    const HVX_Vector a4_10 = Q6_V_lo_W(p4_5);
+    const HVX_Vector a4_11 = Q6_V_hi_W(p4_5);
+    const HVX_VectorPair p4_6 = Q6_W_vshuff_VVR(a3_14, a3_6, -8);
+    const HVX_Vector a4_12 = Q6_V_lo_W(p4_6);
+    const HVX_Vector a4_13 = Q6_V_hi_W(p4_6);
+    const HVX_VectorPair p4_7 = Q6_W_vshuff_VVR(a3_15, a3_7, -8);
+    const HVX_Vector a4_14 = Q6_V_lo_W(p4_7);
+    const HVX_Vector a4_15 = Q6_V_hi_W(p4_7);
+    d[0] = a4_0;
+    d[1] = a4_1;
+    d[2] = a4_2;
+    d[3] = a4_3;
+    d[4] = a4_4;
+    d[5] = a4_5;
+    d[6] = a4_6;
+    d[7] = a4_7;
+    d[8] = a4_8;
+    d[9] = a4_9;
+    d[10] = a4_10;
+    d[11] = a4_11;
+    d[12] = a4_12;
+    d[13] = a4_13;
+    d[14] = a4_14;
+    d[15] = a4_15;
+}
+
+// S^T tiles (keys by queries) of n_col_tiles key tiles into the S tiles of the softmax (may be in place)
+static void fa_st_to_s_tiles(__fp16 * s_tiles, const __fp16 * st_tiles, size_t n_col_tiles, size_t n_rows_g) {
+    for (size_t c = 0; c < n_col_tiles; c++) {
+        HVX_Vector *       d = (HVX_Vector *) (s_tiles + c * HMX_FP16_TILE_N_ELMS);
+        const HVX_Vector * t = (const HVX_Vector *) (st_tiles + c * HMX_FP16_TILE_N_ELMS);
+        if (n_rows_g <= 4) {
+            fa_tile_transpose_2(d, t);
+        } else if (n_rows_g <= 8) {
+            fa_tile_transpose_4(d, t);
+        } else if (n_rows_g <= 16) {
+            fa_tile_transpose_8(d, t);
+        } else {
+            fa_tile_transpose_16(d, t);
+        }
+    }
+}
+
+// Q^T weight tiles (head dimension by queries) from the Q activation tiles of one row tile: the
+// rows of Q scatter like K rows do into the K weight tiles, and the rows past n_rows_g as zeros
+// (every word of the tiles is scattered). dim_pad is a multiple of 64. In place (qt_tiles ==
+// q_tiles) with scratch: each pair of Q tiles (4 KiB) is copied there first.
+static void fa_q_to_weight_tiles(__fp16 * qt_tiles, const __fp16 * q_tiles, size_t dim_pad, size_t n_rows_g,
+                                 HVX_Vector * scratch) {
+    const HVX_Vector offsets = hvx_vmem(hmx_transpose_scatter_offsets);
+    for (size_t c = 0; c < dim_pad; c += 64) {
+        const HVX_Vector * in = (const HVX_Vector *) (q_tiles + (c / 32) * HMX_FP16_TILE_N_ELMS);
+        if (scratch) {
+            for (int i = 0; i < 32; i++) {
+                scratch[i] = in[i];
+            }
+            in = scratch;
+        }
+        const size_t t = (size_t) (qt_tiles + (c / 32) * HMX_FP16_TILE_N_ELMS);
+        for (size_t r = 0; r < HMX_FP16_TILE_N_ROWS; r += 2) {
+            const HVX_Vector     o0  = Q6_Vw_vadd_VwVw(offsets, Q6_V_vsplat_R(r * 4));
+            const HVX_Vector     o1  = Q6_Vw_vadd_VwVw(o0, Q6_V_vsplat_R(4));
+            const HVX_VectorPair row = r < n_rows_g ? Q6_W_vdeal_VVR(in[r / 2 + 16], in[r / 2], -2) :  // rows r, r + 1
+                                                      Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+            const HVX_Vector     hi  = r + 1 < n_rows_g ? Q6_V_hi_W(row) : Q6_V_vzero();
+            Q6_vscatter_RMVwV(t, 4095, o0, Q6_V_lo_W(row));
+            Q6_vscatter_RMVwV(t, 4095, o1, hi);
+        }
+        if (scratch) {
+            hvx_gather_sync((void *) t);  // the next pair reuses the scratch
+        }
+    }
+    hvx_gather_sync(qt_tiles);
+}
+
+typedef struct {
+    const __fp16 * k_tiles;   // [dim tile][key tile]
+    const __fp16 * qt_tiles;  // [dim tile]
+    __fp16 *       st_tiles;  // [key tile]
+    size_t         n_col_tiles;
+    size_t         n_dot_tiles;
+    size_t         n_tiles_per_bc;
+    uint8_t *      hmx_scales;
+} hmx_fa_kq_job_t;
+
+static void hmx_fa_kq_dot_worker(void * data) {
+    const hmx_fa_kq_job_t * job      = (const hmx_fa_kq_job_t *) data;
+    const size_t            n_dot    = job->n_dot_tiles;
+    const size_t            k_stride = job->n_tiles_per_bc * HMX_FP16_TILE_N_ELMS;
+    __builtin_assume(n_dot > 0);
+
+    // n_dot is even (DK % 64 == 0): four or two products per asm statement, as in hmx_fa_qk_dot_tile
+    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int) job->hmx_scales));
+    for (size_t c = 0; c < job->n_col_tiles; ++c) {
+        const __fp16 * k = job->k_tiles + c * HMX_FP16_TILE_N_ELMS;
+        const __fp16 * q = job->qt_tiles;
+        size_t         d = 0;
+        for (; d + 4 <= n_dot; d += 4) {
+            asm volatile(HMX_LOAD_MPY_F16("%1", "%2", "%0")
+                         HMX_LOAD_MPY_F16("%3", "%4", "%0")
+                         HMX_LOAD_MPY_F16("%5", "%6", "%0")
+                         HMX_LOAD_MPY_F16("%7", "%8", "%0")
+                         :
+                         : "r"(2047), "r"(k), "r"(q), "r"(k + k_stride), "r"(q + HMX_FP16_TILE_N_ELMS),
+                           "r"(k + 2 * k_stride), "r"(q + 2 * HMX_FP16_TILE_N_ELMS), "r"(k + 3 * k_stride),
+                           "r"(q + 3 * HMX_FP16_TILE_N_ELMS));
+            k += 4 * k_stride;
+            q += 4 * HMX_FP16_TILE_N_ELMS;
+        }
+        if (d < n_dot) {
+            asm volatile(HMX_LOAD_MPY_F16("%1", "%2", "%0")
+                         HMX_LOAD_MPY_F16("%3", "%4", "%0")
+                         :
+                         : "r"(2047), "r"(k), "r"(q), "r"(k + k_stride), "r"(q + HMX_FP16_TILE_N_ELMS));
+        }
+        asm volatile(HMX_STORE_AFTER_F16("%0", "%1") :: "r"(job->st_tiles + c * HMX_FP16_TILE_N_ELMS), "r"(0) : "memory");
+    }
+}
+
 struct fa_mh_layout {
-    size_t q_tiles, q_dma, o_tiles[2], d_tiles, d_inv_l, k_tiles, v_tiles, s_tiles, p_tiles;
+    size_t q_tiles, q_dma, o_tiles[2], d_tiles, d_inv_l, k_tiles, v_tiles, s_tiles, p_tiles, qt_tiles, st_tiles;
     size_t m_vec, l_vec, s_rowmax, p_rowsum, slopes;
     size_t slot;                // bytes per head
     size_t row_bufs, scales_id, scales_qk, sinks, mask[2], k[2], v[2], heads;  // shared, after the slots
@@ -2267,7 +2709,7 @@ struct fa_mh_layout {
 // k_row / v_row: bytes of one head's K / V row in DDR (F16 or Q8_0), as the DMA stages them
 static void fa_mh_layout_build(struct fa_mh_layout * L, size_t g_br, size_t DK, size_t DV, size_t Bc, size_t n_h,
                                size_t n_rows_q, bool is_q_fp32, bool has_sinks, size_t n_heads, size_t n_threads,
-                               size_t head_bytes, size_t k_row, size_t v_row) {
+                               size_t head_bytes, size_t k_row, size_t v_row, bool k_rows) {
     const size_t T = HTP_FA_HMX_TILE_SIZE;
     L->q_tile_bytes   = hex_align_up(g_br * DK * sizeof(__fp16), T);
     L->o_tile_bytes   = hex_align_up(g_br * DV * sizeof(__fp16), T);
@@ -2287,6 +2729,8 @@ static void fa_mh_layout_build(struct fa_mh_layout * L, size_t g_br, size_t DK, 
     L->v_tiles    = off; off += hex_align_up(Bc * DV * sizeof(__fp16), T);
     L->s_tiles    = off; off += hex_align_up(g_br * Bc * sizeof(__fp16), T);
     L->p_tiles    = off; off += hex_align_up(g_br * Bc * sizeof(__fp16), T);
+    L->qt_tiles   = off; off += k_rows ? L->q_tile_bytes : 0;
+    L->st_tiles   = off; off += k_rows ? Bc * HMX_FP16_TILE_N_ROWS * sizeof(__fp16) : 0;
     L->q_dma      = off; off += hex_align_up(g_br * DK * (is_q_fp32 ? sizeof(float) : sizeof(__fp16)), 128);
     L->m_vec      = off; off += L->col_vec_bytes;
     L->l_vec      = off; off += L->col_vec_bytes;
@@ -2318,6 +2762,9 @@ typedef struct {
     fa_softmax_args_t     s;
     fa_o_store_args_t     o;
     hmx_fa_qk_job_t       qk;
+    hmx_fa_kq_job_t       kq;
+    __fp16 *              qt_tiles;
+    __fp16 *              st_tiles;
     hmx_fa_o_update_job_t ou;
     hmx_fa_o_norm_job_t   on;
 } fa_mh_head_t;
@@ -2328,6 +2775,9 @@ typedef struct {
     worker_callback_t  softmax_fn;
     worker_callback_t  store_fn;
     uint32_t           n_h;
+    bool               k_rows;       // S^T = K Q^T: see fa_tile_transpose_*
+    size_t             n_col_tiles;  // of the block
+    size_t             n_rows_g;
 } fa_mh_args_t;
 
 static void fa_mh_q_thread(unsigned int n, unsigned int i, void * data) {
@@ -2349,6 +2799,9 @@ static void fa_mh_kv_thread(unsigned int n, unsigned int i, void * data) {
 static void fa_mh_softmax_thread(unsigned int n, unsigned int i, void * data) {
     const fa_mh_args_t * a = (const fa_mh_args_t *) data;
     for (uint32_t h = i; h < a->n_h; h += n) {
+        if (a->k_rows) {
+            fa_st_to_s_tiles(a->hd[h].f.vtcm_s_tiles[0], a->hd[h].st_tiles, a->n_col_tiles, a->n_rows_g);
+        }
         a->softmax_fn(1, i, &a->hd[h].s);
     }
 }
@@ -2363,7 +2816,11 @@ static void fa_mh_store_thread(unsigned int n, unsigned int i, void * data) {
 static void fa_mh_qk_worker(void * data) {
     const fa_mh_args_t * a = (const fa_mh_args_t *) data;
     for (uint32_t h = 0; h < a->n_h; h++) {
-        hmx_fa_qk_dot_worker(&a->hd[h].qk);
+        if (a->k_rows) {
+            hmx_fa_kq_dot_worker(&a->hd[h].kq);
+        } else {
+            hmx_fa_qk_dot_worker(&a->hd[h].qk);
+        }
     }
 }
 
@@ -2431,6 +2888,10 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     const size_t   kd       = htp_tensor_get_row_size(k->type, DK);
     const size_t   vd       = htp_tensor_get_row_size(v->type, DV);
 
+    // K as the activation when the queries fit one row tile (the head dimension is a multiple of 64
+    // in every model seen; the padded Q tiles of other sizes keep the K weight tiles)
+    const bool k_rows = n_rows_g <= HMX_FP16_TILE_N_ROWS && g_br == HMX_FP16_TILE_N_ROWS && DK % 64 == 0;
+
     // largest KV block (multiple of 64, at most 1024) whose buffers fit
     struct fa_mh_layout L;
     uint32_t Bc = 1024;
@@ -2439,7 +2900,7 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     }
     for (;; Bc /= 2) {
         fa_mh_layout_build(&L, g_br, DK, DV, Bc, n_h, n_rows_q, proto->is_q_fp32, proto->sinks != NULL, proto->n_heads, n_thr,
-                           sizeof(fa_mh_head_t), kd, vd);
+                           sizeof(fa_mh_head_t), kd, vd, k_rows);
         if (L.total <= ctx->vtcm_size) {
             break;
         }
@@ -2497,6 +2958,8 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
         f->o_tile_bytes       = L.o_tile_bytes;
         f->col_vec_bytes      = L.col_vec_bytes;
         f->d_tile_bytes       = L.d_tile_bytes;
+        hd[h].qt_tiles        = (__fp16 *) (s + L.qt_tiles);
+        hd[h].st_tiles        = (__fp16 *) (s + L.st_tiles);
     }
 
     hmx_init_column_scales(base + L.scales_id, Q6_V_vsplat_R(0x3c00));  // 1.0
@@ -2547,7 +3010,7 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     }
 
     fa_q_load_args_t qa[FA_MH_MAX_HEADS];
-    fa_mh_args_t     a = { hd, qa, NULL, NULL, n_h };
+    fa_mh_args_t     a = { hd, qa, NULL, NULL, n_h, k_rows, 0, n_rows_g };
 
     for (uint32_t h = 0; h < n_h; h++) {
         fa_q_load_args_t * x = &qa[h];
@@ -2563,6 +3026,9 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
         atomic_init(&x->barrier, n_thr);
     }
     work_queue_run(ctx->work_queue, fa_mh_q_thread, &a, n_thr);
+    for (uint32_t h = 0; h < n_h && k_rows; h++) {
+        fa_q_to_weight_tiles(hd[h].qt_tiles, hd[h].f.vtcm_q_tiles, DK, n_rows_g, NULL);
+    }
 
     const size_t n_row_tiles      = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS) / HMX_FP16_TILE_N_ROWS;
     const size_t n_row_tiles_g_br = g_br / HMX_FP16_TILE_N_ROWS;
@@ -2608,7 +3074,8 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
         }
         const uint32_t rows_per_t = hex_align_up(hmx_ceil_div(kv_rows, n_thr), 4);
         for (uint32_t h = 0; h < n_h; h++) {
-            hd[h].k = (fa_k_int_args_t) { &hd[h].f, kv_rows, k_src_stride, base + L.k[b] + h * kd, kv_start, rows_per_t, 0 };
+            hd[h].k = (fa_k_int_args_t) { &hd[h].f, kv_rows, k_src_stride, base + L.k[b] + h * kd, kv_start, rows_per_t, 0,
+                                        k_rows ? (uint32_t) n_tiles_per_bc : 0 };
             hd[h].v = (fa_v_int_args_t) { &hd[h].f, v_rows, v_src_stride, base + L.v[b] + h * vd, hd[h].f.vtcm_v_tiles[0],
                                         n_tiles_per_bc, kv_start, hex_align_up(hmx_ceil_div(v_rows, n_thr), 2) };
         }
@@ -2618,7 +3085,10 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
         for (uint32_t h = 0; h < n_h; h++) {
             hd[h].qk = (hmx_fa_qk_job_t) { hd[h].f.vtcm_q_tiles, hd[h].f.vtcm_k_tiles[0], hd[h].f.vtcm_s_tiles[0], n_row_tiles,
                                            n_col_tiles, DK / 32, n_tiles_per_bc, hd[h].f.vtcm_hmx_scales_qk };
+            hd[h].kq = (hmx_fa_kq_job_t) { hd[h].f.vtcm_k_tiles[0], hd[h].qt_tiles, hd[h].st_tiles, n_col_tiles, DK / 32,
+                                           n_tiles_per_bc, hd[h].f.vtcm_hmx_scales_qk };
         }
+        a.n_col_tiles = n_col_tiles;
         hmx_queue_push(hmx_q, hmx_queue_make_desc(fa_mh_qk_worker, &a));
         hmx_queue_pop(hmx_q);
 
@@ -2647,6 +3117,7 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
             s->mask_vtcm            = mask ? (const __fp16 *) (base + L.mask[b]) : NULL;
             s->mask_vtcm_row_stride = L.m_line_bytes / sizeof(__fp16);
             s->slopes               = hd[h].f.vtcm_slopes;
+            s->s_by_word            = k_rows;
         }
         work_queue_run(ctx->work_queue, fa_mh_softmax_thread, &a, MIN(n_thr, n_h));
 
@@ -3056,7 +3527,19 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 if (factx.pipeline) {
                     // Double-buffered job structs because HMX queue runs asynchronously
                     hmx_fa_qk_job_t qk_job[2];
+                    hmx_fa_kq_job_t kq_job[2];
                     hmx_fa_o_update_job_t ou_job[2];
+
+                    // Decode: K on the row side (see fa_tile_transpose_*). The Q tiles become the Q^T
+                    // weight in place (the S tiles are free until the first QK), S^T goes to the S
+                    // tiles and is transposed there before the softmax.
+                    // (decode ops only: prefill blocks of a few rows were slower, Gemma 4 E2B pp512 -2.9% on v73)
+                    const bool     k_rows   = n_q_blocks == 1 && n_rows_q <= FA_MH_MAX_ROWS && n_rows_g <= HMX_FP16_TILE_N_ROWS && DK == DK_pad &&
+                                              DK % 64 == 0 && Bc * HMX_FP16_TILE_N_ROWS * sizeof(__fp16) >= 32 * sizeof(HVX_Vector);
+                    const uint32_t act_rows = k_rows ? (uint32_t) n_tiles_per_bc : 0;
+                    if (k_rows) {
+                        fa_q_to_weight_tiles(factx.vtcm_q_tiles, factx.vtcm_q_tiles, DK, n_rows_g, (HVX_Vector *) factx.vtcm_s_tiles[0]);
+                    }
 
                     // Prefetch second active block early if there are multiple active blocks
                     if (n_active_blocks > 1) {
@@ -3066,8 +3549,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                     // Prep and start QK-dot(0)
                     void * curr_k0 = (void *) dma_queue_pop(dma_q).dst;
-                    fa_phase_k_interleave(&factx, b0_rows, k_src_stride, curr_k0, b0_start, 0);
+                    fa_phase_k_interleave(&factx, b0_rows, k_src_stride, curr_k0, b0_start, 0, act_rows);
 
+                    kq_job[0] = (hmx_fa_kq_job_t) { factx.vtcm_k_tiles[0], factx.vtcm_q_tiles, factx.vtcm_s_tiles[0], hmx_ceil_div(b0_rows, HMX_FP16_TILE_N_COLS),
+                                                    DK / 32, n_tiles_per_bc, factx.vtcm_hmx_scales_qk };
                     qk_job[0].q_tiles        = factx.vtcm_q_tiles;
                     qk_job[0].k_tiles        = factx.vtcm_k_tiles[0];
                     qk_job[0].s_tiles        = factx.vtcm_s_tiles[0];
@@ -3076,7 +3561,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     qk_job[0].n_dot_tiles    = DK_pad / 32;
                     qk_job[0].n_tiles_per_bc = n_tiles_per_bc;
                     qk_job[0].hmx_scales     = factx.vtcm_hmx_scales_qk;
-                    hmx_queue_push(hmx_q, hmx_queue_make_desc(hmx_fa_qk_dot_worker, &qk_job[0]));
+                    hmx_queue_push(hmx_q, k_rows ? hmx_queue_make_desc(hmx_fa_kq_dot_worker, &kq_job[0]) :
+                                                   hmx_queue_make_desc(hmx_fa_qk_dot_worker, &qk_job[0]));
 
                     for (uint32_t step = 0; step < n_active_blocks; ++step) {
                         const uint32_t kv_blk      = active_blocks[step];
@@ -3131,7 +3617,11 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             const size_t   next_buf   = 1 - buf_idx;
 
                             void * next_k = (void *) dma_queue_pop(dma_q).dst;
-                            fa_phase_k_interleave(&factx, next_rows, k_src_stride, next_k, next_start, next_buf);
+                            fa_phase_k_interleave(&factx, next_rows, k_src_stride, next_k, next_start, next_buf, act_rows);
+
+                            kq_job[next_buf] = (hmx_fa_kq_job_t) { factx.vtcm_k_tiles[next_buf], factx.vtcm_q_tiles, factx.vtcm_s_tiles[next_buf],
+                                                                   hmx_ceil_div(next_rows, HMX_FP16_TILE_N_COLS), DK / 32, n_tiles_per_bc,
+                                                                   factx.vtcm_hmx_scales_qk };
 
                             qk_job[next_buf].q_tiles        = factx.vtcm_q_tiles;
                             qk_job[next_buf].k_tiles        = factx.vtcm_k_tiles[next_buf];
@@ -3141,16 +3631,21 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             qk_job[next_buf].n_dot_tiles    = DK_pad / 32;
                             qk_job[next_buf].n_tiles_per_bc = n_tiles_per_bc;
                             qk_job[next_buf].hmx_scales     = factx.vtcm_hmx_scales_qk;
-                            hmx_queue_push(hmx_q, hmx_queue_make_desc(hmx_fa_qk_dot_worker, &qk_job[next_buf]));
+                            hmx_queue_push(hmx_q, k_rows ? hmx_queue_make_desc(hmx_fa_kq_dot_worker, &kq_job[next_buf]) :
+                                                           hmx_queue_make_desc(hmx_fa_qk_dot_worker, &qk_job[next_buf]));
                         }
 
                         // ---- 5. Wait for current block's QK-dot to finish ----
                         hmx_queue_pop(hmx_q);
 
                         // ---- 6. Phase 2: softmax + build_D ----
+                        if (k_rows) {
+                            fa_st_to_s_tiles(factx.vtcm_s_tiles[buf_idx], factx.vtcm_s_tiles[buf_idx], n_col_tiles, n_rows_g);
+                        }
                         fa_softmax_args_t sargs;
                         memset(&sargs, 0, sizeof(sargs));
                         sargs.factx                = &factx;
+                        sargs.s_by_word            = k_rows;
                         sargs.buf_idx              = buf_idx;
                         sargs.kv_rows              = kv_rows;
                         sargs.n_rows_g             = n_rows_g;
@@ -3244,7 +3739,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Wait for current K DMA and interleave
                         void * curr_k = (void *) dma_queue_pop(dma_q).dst;
-                        fa_phase_k_interleave(&factx, kv_rows, k_src_stride, curr_k, kv_start, 0);
+                        fa_phase_k_interleave(&factx, kv_rows, k_src_stride, curr_k, kv_start, 0, 0);
 
                         {
                             qk_job.q_tiles        = factx.vtcm_q_tiles;
