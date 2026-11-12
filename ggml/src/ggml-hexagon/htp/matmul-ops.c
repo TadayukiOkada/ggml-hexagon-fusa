@@ -2854,6 +2854,135 @@ static void NAME(unsigned int n, unsigned int i, void *data) {                  
 GLU_STORE_WORKER(transfer_output_chunk_geglu_worker_fn,  hvx_vec_geglu_f32)
 GLU_STORE_WORKER(transfer_output_chunk_swiglu_worker_fn, hvx_vec_swiglu_f32)
 
+// The gate of a fused GLU store is an F16 value of the HMX output, so its factor (gelu(x) or
+// x * sigmoid(x), about 80 instructions per vector in qf32) is one of 65536 values: a table by F16
+// code, computed with the same operations, gives the same bits with one gather per vector. The table
+// (256 KiB) is copied to the end of VTCM for the op when the op leaves that free; VTCM does not keep
+// it between ops, and not over a release.
+#define GLU_LUT_BYTES     (65536 * sizeof(float))
+#define GLU_LUT_TMP_BYTES (HTP_MAX_NTHREADS * 4 * VLEN)  // gather targets of the store workers
+
+static float * glu_lut_master(struct htp_context * ctx, uint32_t glu) {
+    const uint32_t k = glu == HTP_MM_GLU_GEGLU ? 0 : 1;
+    if (!ctx->glu_lut[k]) {
+        float * t = (float *) memalign(VLEN, GLU_LUT_BYTES);
+        if (!t) {
+            return NULL;
+        }
+        const HVX_Vector one = hvx_vec_splat_f16(1.0);
+        uint16_t codes[64] __attribute__((aligned(VLEN)));
+        for (uint32_t c = 0; c < 65536; c += 32) {
+            for (uint32_t i = 0; i < 32; i++) {  // the widening takes the even lanes
+                codes[2 * i] = (uint16_t) (c + i);
+                codes[2 * i + 1] = 0;
+            }
+            const HVX_VectorPair p = Q6_Wqf32_vmpy_VhfVhf(hvx_vmem(codes), one);
+            const HVX_Vector     x = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(p));
+            hvx_vmem(t + c) = k == 0 ? hvx_vec_geglu_gate_f32(x) : hvx_vec_swiglu_gate_f32(x);
+        }
+        ctx->glu_lut[k] = t;
+    }
+    return ctx->glu_lut[k];
+}
+
+// The table of the op's GLU in VTCM, or NULL when the op's buffers leave no room for it
+static const float * glu_lut_get(struct htp_context * ctx, uint32_t glu) {
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) ctx->octx.kernel_params;
+    const size_t top = hex_align_down(ctx->vtcm_size, VLEN);
+    if ((size_t) kparams->vtcm_size + GLU_LUT_BYTES + GLU_LUT_TMP_BYTES > top) {
+        return NULL;
+    }
+    float * const lut  = (float *) (ctx->vtcm_base + top - GLU_LUT_BYTES);
+    const uint32_t kind = glu == HTP_MM_GLU_GEGLU ? 1 : 2;
+    if (ctx->glu_lut_kind != kind || ctx->glu_lut_epoch != ctx->vtcm_epoch || ctx->glu_lut_batch != ctx->diag.batch_seq ||
+        ctx->glu_lut_op != ctx->diag.op_idx) {
+        const float * master = glu_lut_master(ctx, glu);
+        if (!master) {
+            return NULL;
+        }
+        hvx_copy_aa((uint8_t *) lut, (const uint8_t *) master, 65536, sizeof(float));
+        ctx->glu_lut_kind  = kind;
+        ctx->glu_lut_epoch = ctx->vtcm_epoch;
+        ctx->glu_lut_batch = ctx->diag.batch_seq;
+        ctx->glu_lut_op    = ctx->diag.op_idx;
+    }
+    return lut;
+}
+
+typedef struct {
+    output_transfer_glu_state_t st;
+    const float *               lut;
+    HVX_Vector *                tmp;  // 4 vectors per thread
+} output_transfer_glu_lut_state_t;
+
+// The store with the table: rows r and r + 1 of a tile vector are its even and odd F16 lanes
+static void transfer_output_chunk_glu_lut_worker_fn(unsigned int n, unsigned int i, void * data) {
+    (void) n;
+    const output_transfer_glu_lut_state_t * ls = (const output_transfer_glu_lut_state_t *) data;
+    const output_transfer_glu_state_t *     st = &ls->st;
+
+    const uint32_t n_pairs = (st->n_rows + 1) / 2;
+    const uint32_t p_first = fastdiv(n_pairs * i, &st->n_threads_div);
+    const uint32_t p_last  = fastdiv(n_pairs * (i + 1), &st->n_threads_div);
+    if (p_first >= p_last) {
+        return;
+    }
+
+    struct htp_thread_trace * tr = &st->traces[i];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, p_first);
+
+    const size_t     tile_row_stride = hmx_ceil_div(st->n_cols_total, HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS;
+    const size_t     limit_c         = hex_smin(st->n_cols, st->dst_cols);
+    const uint32_t   n_vec           = (uint32_t) ((limit_c + 31) / 32);
+    const size_t     up_off          = (size_t) st->up_tile_off * HTP_MM_HMX_TILE_N_ELMS;
+    const HVX_Vector one             = hvx_vec_splat_f16(1.0);
+    const HVX_Vector even            = Q6_V_vsplat_R(0x0000ffff);
+    const size_t     lut             = (size_t) ls->lut;
+    HVX_Vector *     tmp             = ls->tmp + 4 * i;
+    const uint32_t   vstep           = HTP_MM_HMX_TILE_N_ELMS / 64;
+
+    for (uint32_t p = p_first; p < p_last; p++) {
+        const size_t   r      = (size_t) p * 2;
+        const bool     has_r1 = r + 1 < st->n_rows;
+        const HVX_Vector * gp = (const HVX_Vector *) (st->vtcm_src + (r / HTP_MM_HMX_TILE_N_ROWS) * tile_row_stride)
+                                + (r % HTP_MM_HMX_TILE_N_ROWS) / 2;
+        const HVX_Vector * up = gp + up_off / 64;
+        float * out0 = st->dst + r * st->dst_stride;
+        float * out1 = out0 + st->dst_stride;
+
+        for (uint32_t b = 0; b < n_vec; b++) {
+            const HVX_Vector g  = gp[b * vstep];
+            const HVX_Vector o0 = Q6_Vw_vasl_VwR(Q6_V_vand_VV(g, even), 2);
+            const HVX_Vector o1 = Q6_Vw_vasl_VwR(Q6_Vuw_vlsr_VuwR(g, 16), 2);
+            Q6_vgather_ARMVw(&tmp[0], lut, GLU_LUT_BYTES - 1, o0);
+            Q6_vgather_ARMVw(&tmp[1], lut, GLU_LUT_BYTES - 1, o1);
+            const HVX_VectorPair pu = Q6_Wqf32_vmpy_VhfVhf(up[b * vstep], one);
+            const HVX_Vector     v0 = hvx_vec_mul_f32_f32(tmp[0], Q6_Vsf_equals_Vqf32(Q6_V_lo_W(pu)));
+            const HVX_Vector     v1 = hvx_vec_mul_f32_f32(tmp[1], Q6_Vsf_equals_Vqf32(Q6_V_hi_W(pu)));
+            const size_t         nb = hex_smin(limit_c - (size_t) b * 32, 32) * sizeof(float);
+            if (nb == VLEN) {
+                hvx_vmemu(out0 + b * 32) = v0;
+                if (has_r1) {
+                    hvx_vmemu(out1 + b * 32) = v1;
+                }
+            } else {
+                hvx_vec_store_u(out0 + b * 32, nb, v0);
+                if (has_r1) {
+                    hvx_vec_store_u(out1 + b * 32, nb, v1);
+                }
+            }
+        }
+        if (st->writeback) {
+            hex_l2clean(out0, limit_c * sizeof(float));
+            if (has_r1) {
+                hex_l2clean(out1, limit_c * sizeof(float));
+            }
+        }
+    }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, p_first);
+}
+
 static void transfer_output_chunk_glu_threaded(struct htp_context * ctx, float * dst, const __fp16 * vtcm_src, int n_rows,
                                                int n_cols, int n_cols_total, int up_tile_off, int dst_stride, int dst_cols,
                                                uint32_t glu, int n_threads) {
@@ -2874,6 +3003,17 @@ static void transfer_output_chunk_glu_threaded(struct htp_context * ctx, float *
     st.n_threads_div = (n_use == (int) ctx->n_threads) ? ctx->n_threads_div : init_fastdiv_values(n_use);
     st.traces        = ctx->trace;
     st.writeback     = ctx->mm_out_writeback;
+
+    const float * lut = glu_lut_get(ctx, glu);
+    if (lut) {
+        output_transfer_glu_lut_state_t ls = { st, lut, (HVX_Vector *) ((const uint8_t *) lut - GLU_LUT_TMP_BYTES) };
+        if (n_use <= 1) {
+            transfer_output_chunk_glu_lut_worker_fn(1, 0, &ls);
+        } else {
+            worker_pool_run_func(ctx->worker_pool, transfer_output_chunk_glu_lut_worker_fn, &ls, n_use);
+        }
+        return;
+    }
 
     const worker_callback_t fn = glu == HTP_MM_GLU_GEGLU ? transfer_output_chunk_geglu_worker_fn
                                                          : transfer_output_chunk_swiglu_worker_fn;

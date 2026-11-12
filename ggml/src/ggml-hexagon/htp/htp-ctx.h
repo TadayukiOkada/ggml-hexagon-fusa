@@ -142,6 +142,15 @@ struct htp_context {
     uint64_t               max_vmem;
     struct htp_dirty_range dirty_ranges[HTP_MAX_DIRTY_RANGES];
     uint32_t               n_dirty_ranges;  // the ranges in use are the first ones
+
+    // Gate factors of the fused GLU store by F16 code (matmul-ops.c): masters in DDR, and what the
+    // copy at the end of VTCM holds
+    float *                glu_lut[2];
+    uint32_t               vtcm_epoch;        // counts the acquisitions of VTCM
+    uint32_t               glu_lut_epoch;
+    uint32_t               glu_lut_batch;
+    uint32_t               glu_lut_op;
+    uint32_t               glu_lut_kind;      // 1 + table index, 0 = none
     bool                   mm_out_writeback;  // HMX matmul output stores write their lines back
 
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
