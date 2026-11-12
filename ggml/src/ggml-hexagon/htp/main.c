@@ -326,6 +326,7 @@ static void vtcm_acquire(struct htp_context * ctx) {
         }
 
         atomic_store(&ctx->vtcm_valid, true);
+        ctx->vtcm_epoch++;
         ctx->diag.acquire_us = 0;
         if (ctx->profiler) {
             ctx->resource_acquired_us = HAP_perf_get_time_us();
@@ -822,6 +823,10 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
     if (ctx->fa_mask_flags) {
         free(ctx->fa_mask_flags);
         ctx->fa_mask_flags = NULL;
+    }
+    for (int i = 0; i < 2; i++) {
+        free(ctx->glu_lut[i]);
+        ctx->glu_lut[i] = NULL;
     }
     if (ctx->ddr_spad_base) {
         free(ctx->ddr_spad_base);
