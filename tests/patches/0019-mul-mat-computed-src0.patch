@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 271b06a9a..837c33b37 100644
+index d14904b55..f856647cb 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10474,6 +10474,44 @@ static const ggml_type other_types[] = {
+@@ -10887,6 +10887,44 @@ static const ggml_type other_types[] = {
  #pragma optimize("", off)
  #endif
  
@@ -47,7 +47,7 @@ index 271b06a9a..837c33b37 100644
  // Single ops that may run for tens of ms at model shapes.
  // A backend that holds shared accelerator resources for a whole op can starve other clients.
  static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
-@@ -10510,6 +10548,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
+@@ -10923,6 +10961,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
          test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, kv, 512, 128, { 8, 1 }, { 2, 1 }));
          test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 512, kv, { 8, 1 }, { 2, 1 }));
      }
@@ -63,7 +63,7 @@ index 271b06a9a..837c33b37 100644
  
      // concat outside the DMA paths, element-wise copy
      for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
-@@ -13272,6 +13319,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13926,6 +13973,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  

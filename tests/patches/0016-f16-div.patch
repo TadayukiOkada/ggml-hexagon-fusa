@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 0cd5d58ff..07ebc3f69 100644
+index a992af8b8..a4bbd180b 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -3479,6 +3479,42 @@ struct test_cont : public test_case {
+@@ -3557,6 +3557,42 @@ struct test_cont : public test_case {
  // GGML_OP_SUB
  // GGML_OP_MUL
  // GGML_OP_DIV
@@ -45,7 +45,7 @@ index 0cd5d58ff..07ebc3f69 100644
  struct test_bin_bcast : public test_case {
      using op_t = ggml_tensor * (*) (ggml_context *, ggml_tensor *, ggml_tensor *);
      op_t op;
-@@ -13104,6 +13140,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13758,6 +13794,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              }
          }
      }
@@ -59,7 +59,7 @@ index 0cd5d58ff..07ebc3f69 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
-@@ -13423,6 +13466,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14086,6 +14129,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1,   1, 1, 1}));
      test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1, 512, 1, 1}));
  

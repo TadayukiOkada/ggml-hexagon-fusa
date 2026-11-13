@@ -181,7 +181,7 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
         return true;
     }
 
-    const uint32_t n_threads = htp_session_n_threads(sess) > 0 ? htp_session_n_threads(sess) : 4;
+    const uint32_t n_threads = htp_session_n_hvx(sess) > 0 ? htp_session_n_hvx(sess) : 4;
 
     switch (op->op) {
         case GGML_OP_ARGSORT:

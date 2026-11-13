@@ -37,7 +37,7 @@ YIELDING = ["CONT", "CPY", "FENCE_WAIT", "FLASH_ATTN_EXT", "IM2COL", "CONV_2D_DW
             "SOFT_MAX", "SET_ROWS", "ADD", "SUB", "MUL", "DIV", "ADD_ID", "ARGSORT:multi-row", "TOP_K:multi-row",
             "SCALE", "CLAMP", "LEAKY_RELU", "SQR", "SQRT", "NEG", "EXP", "SIGMOID", "SILU", "GELU",
             "GELU_QUICK", "GELU_ERF", "SOFTPLUS", "TANH", "ABS", "LOG", "RELU", "STEP",
-            "NORM", "RMS_NORM", "RMS_NORM_MUL", "L2_NORM", "TRI"]
+            "NORM", "RMS_NORM", "RMS_NORM_MUL", "RMS_NORM_MUL_ADD", "L2_NORM", "TRI"]
 
 
 def parse(stream, groups):

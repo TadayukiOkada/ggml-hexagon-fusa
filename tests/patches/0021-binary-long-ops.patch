@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 20fcce2b0..56696f57c 100644
+index 9a9f13a7d..8977f56af 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10552,6 +10552,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
+@@ -10965,6 +10965,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
      // 8 heads of 128), and rows broadcast over dim 2
      test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 1048576, 1, 1 }, { 1, 1 }, 524288, false));
      test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 65536, 4, 1 }, { 1, 1 }, 32768, false));

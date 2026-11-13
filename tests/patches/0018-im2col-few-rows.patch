@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index e448b6ad2..271b06a9a 100644
+index 00bb55612..d14904b55 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10929,6 +10929,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11353,6 +11353,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
