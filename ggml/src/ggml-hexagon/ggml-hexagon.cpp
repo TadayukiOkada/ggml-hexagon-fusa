@@ -3936,7 +3936,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         }
     }
     opt_vmem    = str_vmem    ? parse_size(str_vmem)   : opt_vmem;
-    opt_hostbuf = str_hostbuf ? atoi(str_hostbuf) != 0 : opt_hostbuf;
+    // Upstream enables host buffers everywhere. Up to v73 they stay off unless asked for: CPU-side
+    // tensors would move into FastRPC memory, and these targets are close to their mapping limits.
+    opt_hostbuf = str_hostbuf ? atoi(str_hostbuf) != 0 : (opt_arch > 73 ? opt_hostbuf : false);
 
     // Parse device configuration
     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");
