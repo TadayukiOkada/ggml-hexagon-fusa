@@ -203,6 +203,25 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
     0,    0, 0,    0, 0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0,    0, 0,    0, 0,    0,
 };
 
+#include "iq2xxs-tables.h"
+
+// VTCM copy of htp_iq2xxs_lut for the current op (set by hvx_mm_iq2xxs_lut_init)
+static const uint8_t * iq2xxs_vtcm_lut;
+
+static inline void iq2xxs_lut_copy(uint8_t * restrict lut) {
+    for (uint32_t i = 0; i < HTP_IQ2XXS_LUT_BYTES / VLEN; i++) {
+        hvx_vmem(lut + i * VLEN) = hvx_vmem(htp_iq2xxs_lut + i * VLEN);
+    }
+    iq2xxs_vtcm_lut = lut;
+}
+
+static inline void hvx_mm_iq2xxs_lut_init(uint8_t * restrict base, const struct htp_mm_hvx_vtcm_layout * restrict L) {
+    if (L->lut_bytes == 0) {
+        return;
+    }
+    iq2xxs_lut_copy(base + L->off_lut);
+}
+
 #define htp_matmul_tensors_preamble                                 \
     const struct htp_tensor * restrict src0 = octx->src[0];         \
     const struct htp_tensor * restrict src1 = octx->src[1];         \
@@ -1839,10 +1858,20 @@ static int hvx_mm_init_tiled_vec_dot(struct htp_mm_context * mmctx, enum htp_dat
             mmctx->vec_dot_32x1 = tiled_vec_dot_iq4nl_32x1;
             mmctx->vec_dot_32x2 = tiled_vec_dot_iq4nl_32x2;
             return 0;
+        case HTP_TYPE_IQ2_XXS:
+            mmctx->type         = "iq2xxs_tiled-f32";
+            mmctx->vec_dot_32x1 = tiled_vec_dot_iq2xxs_32x1;
+            mmctx->vec_dot_32x2 = tiled_vec_dot_iq2xxs_32x2;
+            return 0;
         case HTP_TYPE_MXFP4:
             mmctx->type         = "mxfp4_tiled-f32";
             mmctx->vec_dot_32x1 = tiled_vec_dot_mxfp4_32x1;
             mmctx->vec_dot_32x2 = tiled_vec_dot_mxfp4_32x2;
+            return 0;
+        case HTP_TYPE_NVFP4:
+            mmctx->type         = "nvfp4_tiled-f32";
+            mmctx->vec_dot_32x1 = tiled_vec_dot_nvfp4_32x1;
+            mmctx->vec_dot_32x2 = tiled_vec_dot_nvfp4_32x2;
             return 0;
         case HTP_TYPE_Q1_0:
             mmctx->type         = "q1_0_tiled-f32";
@@ -2032,6 +2061,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     mmctx->vtcm_bias     = VTCM_LAYOUT_PTR(uint8_t, base, L.off_bias);
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
+    hvx_mm_iq2xxs_lut_init(base, &L);
 
     // One token through the tiled matvec: the job quantizes the activation itself while its first
     // weight tiles load (hvx_mm_job_quant_barrier). The raw activation normally shares VTCM with the
@@ -2498,6 +2528,8 @@ static inline tiled_dequant_task_fn_t hmx_get_dequant_worker_fn(int weight_type,
         case HTP_TYPE_Q4_1:
         case HTP_TYPE_Q4_K:   return dequantize_tiled_weight_to_fp16_task_q4_1;
         case HTP_TYPE_MXFP4:  return dequantize_tiled_weight_to_fp16_task_mxfp4;
+        case HTP_TYPE_NVFP4:  return dequantize_tiled_weight_to_fp16_task_nvfp4;
+        case HTP_TYPE_IQ2_XXS: return dequantize_tiled_weight_to_fp16_task_iq2_xxs;
         case HTP_TYPE_Q8_0:   return dequantize_tiled_weight_to_fp16_task_q8_0;
         case HTP_TYPE_Q5_0:   return dequantize_tiled_weight_to_fp16_task_q5_0;
         case HTP_TYPE_Q5_1:
@@ -3156,10 +3188,14 @@ static void hmx_mm_zero_weight_row_tails(uint8_t * raw, size_t n_rows, size_t ro
 }
 
 // Per-op VTCM contents of hmx_mm_2d_f32 that outlive a pass over the weight chunks: the HMX
-// output scales and the bias. Run at op start and after VTCM was given away.
-static void hmx_mm_2d_vtcm_setup(dma_queue * weight_dma, __fp16 * vtcm_scales, float * vtcm_bias,
+// output scales, the bias and the IQ2_XXS decode tables (vtcm_lut, NULL for other weight types).
+// Run at op start and after VTCM was given away: another user may have written over them.
+static void hmx_mm_2d_vtcm_setup(dma_queue * weight_dma, __fp16 * vtcm_scales, float * vtcm_bias, uint8_t * vtcm_lut,
                                  dma_addr_t src2_addr, size_t src2_bytes, bool has_bias) {
     hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));  // scale: 1.0, bias: 0.0 in FP16
+    if (vtcm_lut) {
+        iq2xxs_lut_copy(vtcm_lut);
+    }
     if (has_bias) {
         dma_queue_push(weight_dma, dma_make_data(vtcm_bias, src2_addr), hex_align_up(src2_bytes, 128), 0, src2_bytes, 1);
         dma_queue_pop(weight_dma);
@@ -3253,7 +3289,8 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
 
     const bool has_bias      = (src2_bytes > 0 && src2_addr != 0 && !src2_stream);
     float   *vtcm_bias       = VTCM_LAYOUT_PTR_OPTIONAL(float, base, L.off_bias, src2_bytes > 0);
-    hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+    uint8_t *vtcm_lut        = VTCM_LAYOUT_PTR_OPTIONAL(uint8_t, base, L.off_lut, L.lut_bytes > 0);
+    hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, vtcm_lut, src2_addr, src2_bytes, has_bias);
     // A streamed src2 (a full matrix such as the residual) stays in DDR; the output store DMAs its rows
     // into the VTCM bias area, which holds HTP_MM_SRC2_STREAM_BYTES per thread.
     const float *bias_base   = has_bias ? vtcm_bias : (src2_stream ? (const float *) src2_addr : NULL);
@@ -3387,7 +3424,7 @@ pipelined_pass: __attribute__((unused));
                         dma_queue_pop(weight_dma);
                     }
                     htp_vtcm_yield(ctx);
-                    hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+                    hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, vtcm_lut, src2_addr, src2_bytes, has_bias);
                     i_start = i + 1;
                     goto pipelined_pass;
                 }
@@ -3408,7 +3445,7 @@ pipelined_pass: __attribute__((unused));
             // between row chunks: every output of this chunk is stored and no weight DMA is pending
             if (mr + m_chunk_n_rows < m && atomic_load(&ctx->vtcm_needs_release)) {
                 htp_vtcm_yield(ctx);
-                hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+                hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, vtcm_lut, src2_addr, src2_bytes, has_bias);
             }
 #endif
         }
@@ -3499,7 +3536,7 @@ sync_pass: __attribute__((unused));
                 if (nc_next < (size_t) n && atomic_load(&ctx->vtcm_needs_release)) {
                     dma_queue_pop(weight_dma);
                     htp_vtcm_yield(ctx);
-                    hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+                    hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, vtcm_lut, src2_addr, src2_bytes, has_bias);
                     i_start = i + 1;
                     goto sync_pass;
                 }
@@ -3509,7 +3546,7 @@ sync_pass: __attribute__((unused));
             // between row chunks: every output of this chunk is stored and no weight DMA is pending
             if (mr + m_chunk_n_rows < m && atomic_load(&ctx->vtcm_needs_release)) {
                 htp_vtcm_yield(ctx);
-                hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, src2_addr, src2_bytes, has_bias);
+                hmx_mm_2d_vtcm_setup(weight_dma, vtcm_scales, vtcm_bias, vtcm_lut, src2_addr, src2_bytes, has_bias);
             }
 #endif
         }
@@ -3609,22 +3646,25 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     __fp16  *vtcm_scales     = VTCM_LAYOUT_PTR(__fp16, base, L.off_scales);
 
     hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));  // scale: 1.0, bias: 0.0 in FP16
+    if (L.lut_bytes > 0) {
+        iq2xxs_lut_copy(base + L.off_lut);
+    }
 
     int m_start = 0;
     int m_rows  = m;
     if (octx->ctx->mdev.count > 1) {
-        bool can_split = htp_tensor_can_row_partition(act, act_elem_size);
-        if (can_split) {
-            const uint32_t n_dsts = kparams->glu ? 1 : n_weights;  // fused GLU: one output
-            for (uint32_t p = 0; p < n_dsts; ++p) {
-                const struct htp_tensor * restrict dst = octx->dsts[p];
-                if (!htp_tensor_can_row_partition(dst, sizeof(float))) {
-                    can_split = false;
-                    break;
-                }
+        uint32_t rows_per_chunk = 1;
+        const uint32_t n_dsts = kparams->glu ? 1 : n_weights;  // fused GLU: one output
+        for (uint32_t p = 0; p < n_dsts; ++p) {
+            const struct htp_tensor * restrict dst = octx->dsts[p];
+            uint32_t dst_rpc = 0;
+            if (!htp_tensor_mdev_rows_per_chunk(dst, sizeof(float), dst->ne[0] * sizeof(float), &dst_rpc)) {
+                rows_per_chunk = 0;
+                break;
             }
+            rows_per_chunk = MAX(rows_per_chunk, dst_rpc);
         }
-        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m, rows_per_chunk, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
         m_start = (int) range.start;
         m_rows  = (int) range.count;
     }
@@ -4309,7 +4349,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
     htp_mm_hmx_get_2d_chunk_costs(weight_type, k, /*pipeline=*/false, aligned_tile_size,
                                   &size_per_n, &size_per_m, &size_per_mn);
 
-    const size_t overhead = htp_mm_hmx_get_2d_overhead(/*pipeline=*/false, /*is_matmul_id=*/true);
+    const size_t overhead = htp_mm_hmx_get_2d_overhead(weight_type, /*pipeline=*/false, /*is_matmul_id=*/true);
     size_t m_chunk_n_rows = 0, n_chunk_n_cols = 0;
     if (htp_mm_hmx_compute_chunks(vtcm_budget, overhead, size_per_n, size_per_m, size_per_mn,
                            m_core_padded, n,
@@ -4331,6 +4371,8 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
     __fp16  *vtcm_output   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
     void    *vtcm_scratch0 = vtcm_seq_alloc(&vtcm_ptr, scratch0_size);
     __fp16  *vtcm_scales   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
+    const size_t lut_size  = htp_mm_hmx_lut_bytes(weight_type);
+    uint8_t *vtcm_lut      = lut_size ? (uint8_t *) vtcm_seq_alloc(&vtcm_ptr, lut_size) : NULL;
 
     vtcm_used = vtcm_ptr - (uint8_t *) ctx->vtcm_base;
     if (vtcm_used > vtcm_budget) {
@@ -4339,6 +4381,9 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
     }
 
     hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));
+    if (lut_size) {
+        iq2xxs_lut_copy(vtcm_lut);
+    }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
@@ -4417,12 +4462,12 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     int m_start = 0;
     int m_rows  = m_total;
     if (octx->ctx->mdev.count > 1) {
-        bool can_split = htp_tensor_can_row_partition(dst, sizeof(float)) &&
-                         htp_tensor_can_row_partition(act, act_elem_size);
-        if (src2 && src2->ne[1] > 1 && !htp_tensor_can_row_partition(src2, sizeof(float))) {
-            can_split = false;
+        uint32_t rows_per_chunk = 0;
+        if ((dst->ne[2] <= 1 || (dst->nb[2] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0) &&
+            (dst->ne[3] <= 1 || (dst->nb[3] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0)) {
+            htp_tensor_mdev_rows_per_chunk(dst, sizeof(float), dst->ne[0] * sizeof(float), &rows_per_chunk);
         }
-        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_total, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_total, rows_per_chunk, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
         m_start = (int) range.start;
         m_rows  = (int) range.count;
     }
@@ -4438,8 +4483,9 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     size_t src2_nb3 = 0;
     if (src2) {
         src2_stride = (src2->ne[1] == 1) ? 0 : (uint32_t) (src2->nb[1] / sizeof(float));
-        src2_addr = src2->data + m_start * src2_stride * sizeof(float);
-        src2_bytes = (size_t) kparams->vtcm_bias_size;
+        src2_addr = src2->data + (size_t) m_start * src2_stride * sizeof(float);
+        const size_t slice_bytes = (src2->ne[1] == 1) ? src2->nb[1] : (size_t) m_rows * src2->nb[1];
+        src2_bytes = MIN((size_t) kparams->vtcm_bias_size, slice_bytes);
         src2_nb2 = (src2->ne[2] == 1) ? 0 : src2->nb[2];
         src2_nb3 = (src2->ne[3] == 1) ? 0 : src2->nb[3];
     }
@@ -4680,6 +4726,7 @@ static int hvx_mm_matmul_id(
     mmctx->vtcm_bias     = NULL;
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
+    hvx_mm_iq2xxs_lut_init(base, &L);
 
     mmctx->vtcm_src0_stride    = src0_row_size_padded;
     mmctx->vtcm_act_stride     = act_row_size;
@@ -4838,6 +4885,7 @@ static int hvx_mm_matmul_id_nx(
     mmctx->vtcm_act      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act);
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
+    hvx_mm_iq2xxs_lut_init(base, &L);
 
     mmctx->vtcm_src0_stride    = 0;
     mmctx->vtcm_act_stride     = act_row_size;
@@ -5346,6 +5394,7 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     if (fuse_quant) {
         mmctx->vtcm_act_raw = base + hex_align_up(vtcm_size, 128);
     }
+    hvx_mm_iq2xxs_lut_init(base, &L);
 
     mmctx->vtcm_src0_stride    = 0;
     mmctx->vtcm_act_stride     = act_row_size;
