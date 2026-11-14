@@ -295,6 +295,19 @@ static bool htp_flash_attn_is_hmx_eligible(
         return false;
     }
 
+    // The HMX kernel reads the heads of a KV group (or, for a transposed Q, the rows of a head) as one
+    // run of DK-wide rows, so they have to be adjacent: a Q that is a view with wider rows (padding
+    // after each head) goes to the HVX kernel, which takes every row at its own stride.
+    {
+        const bool   q_transposed = q->nb[1] < q->nb[2];
+        const size_t q_row_bytes  = (size_t) q->ne[0] * ggml_type_size(q->type);
+        const size_t q_inner      = q_transposed ? q->nb[1] : q->nb[2];
+        const bool   q_run        = q_transposed ? q->ne[1] > 1 : q->ne[2] > 1;
+        if (q_run && q_inner != q_row_bytes) {
+            return false;
+        }
+    }
+
     const uint32_t DK = q->ne[0];
     const uint32_t DV = v->ne[0];
 
