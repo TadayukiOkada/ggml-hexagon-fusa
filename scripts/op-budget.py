@@ -55,7 +55,8 @@ def tag(op, fields, dims):
     """Kernel path of matmuls and flash attention, else whether the first source has several rows."""
     last = fields[-1] if len(fields) > 4 else ""
     if (op.startswith("MUL_MAT") or op == "FLASH_ATTN_EXT") and " vtcm " in last:
-        return last.split(" vtcm ")[0]
+        # "hmx-tiled vtcm N", or "hmx-tiled nhvx 4 vtcm N" since llama.cpp v1.0.0
+        return last.split(" vtcm ")[0].split(" nhvx ")[0]
     ne = [int(x) for x in re.findall(r"\d+", dims.split(" ")[0])]
     return "multi-row" if len(ne) > 1 and math.prod(ne[1:]) > 1 else "single-row"
 
