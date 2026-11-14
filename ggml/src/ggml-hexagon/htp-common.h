@@ -4,14 +4,6 @@
 #include "htp-opnode.h"
 #include "htp-repack.h"
 
-struct htp_tensor_extra {
-    std::vector<uint8_t>                   shadow_buf;
-    std::vector<std::pair<size_t, size_t>> shadow_ranges;              // parts of a tiled weight uploaded so far
-    bool                                   repack_initialized { false }; // the tiled weight holds all rows
-    uint32_t                               flags { 0 };
-    uint32_t                               n_mm_uses { 0 };  // RMS_NORM+MUL output used only as the activation of this many matmuls
-};
-
 extern int    opt_arch;
 extern size_t opt_ndev;
 extern size_t opt_nhvx;
@@ -50,42 +42,57 @@ extern int    opt_rt_repack;
     if (opt_verbose) GGML_LOG_DEBUG(__VA_ARGS__)
 #endif
 
-// A view on a buffer that the graph allocator does not reset shares the extra of the tensor it
-// views (ggml_backend_hexagon_buffer_init_tensor). The extra then describes the storage, not the node.
-static inline bool htp_tensor_extra_is_shared(const struct ggml_tensor * t) {
-    return t->view_src && t->extra && t->extra == t->view_src->extra;
+static inline uint32_t ggml_hexagon_tensor_get_flags(const struct ggml_tensor * t) {
+    return (uint32_t) (uintptr_t) t->extra;
 }
 
-static inline bool htp_tensor_is_fuseable(const struct ggml_tensor * t) {
-    if (!t || !t->extra) return false;
-    const auto * extra = (const struct htp_tensor_extra *) t->extra;
-    return (extra->flags & HTP_TENSOR_FUSEABLE) != 0;
+static inline void ggml_hexagon_tensor_set_flags(struct ggml_tensor * t, uint32_t flags) {
+    t->extra = (void *) (uintptr_t) (ggml_hexagon_tensor_get_flags(t) | flags);
 }
 
-static inline bool htp_can_rt_repack(const struct ggml_tensor * t) {
-    if (opt_rt_repack == 0 || !htp_is_tiled_weight_tensor(t)) {
+static inline void ggml_hexagon_tensor_clear_flags(struct ggml_tensor * t, uint32_t flags) {
+    t->extra = (void *) (uintptr_t) (ggml_hexagon_tensor_get_flags(t) & ~flags);
+}
+
+// Host-only bits next to HTP_TENSOR_FUSEABLE (never sent to the DSP): the number of matmuls that take
+// an RMS_NORM+MUL output as their activation, when those are all its uses (htp_fusion_tag_graph)
+#define HTP_TENSOR_MM_USES_SHIFT 8
+#define HTP_TENSOR_MM_USES_MASK  (0xFFu << HTP_TENSOR_MM_USES_SHIFT)
+
+static inline uint32_t ggml_hexagon_tensor_get_mm_uses(const struct ggml_tensor * t) {
+    return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_MM_USES_MASK) >> HTP_TENSOR_MM_USES_SHIFT;
+}
+
+static inline void ggml_hexagon_tensor_set_mm_uses(struct ggml_tensor * t, uint32_t n) {
+    ggml_hexagon_tensor_clear_flags(t, HTP_TENSOR_MM_USES_MASK);
+    if (n > 0 && n <= 0xFF) {
+        ggml_hexagon_tensor_set_flags(t, n << HTP_TENSOR_MM_USES_SHIFT);
+    }
+}
+
+static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
+    return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_FUSEABLE) != 0;
+}
+
+static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
+    return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_TILED) != 0;
+}
+
+static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {
+    if (opt_rt_repack == 0) {
         return false;
     }
-    if (t->buffer && ggml_backend_buft_is_host(t->buffer->buft)) {
-        return false;
+    if (t->buffer) {
+        if (ggml_backend_buft_is_host(t->buffer->buft) ||
+            ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            return false;
+        }
     }
-    return opt_rt_repack > 1 || ggml_is_quantized(t->type);
+    return htp_is_tiled_weight_tensor(t);
 }
 
-static inline bool htp_tensor_is_tiled(const struct ggml_tensor * t) {
-    const auto * extra = (const struct htp_tensor_extra *) t->extra;
-    if (extra && (extra->flags & HTP_TENSOR_TILED)) {
-        return true;
-    }
-    return htp_can_rt_repack(t);
-}
-
-static inline bool htp_needs_repack(const struct ggml_tensor * t) {
-    const auto * extra = (const struct htp_tensor_extra *) t->extra;
-    if (extra && (extra->flags & HTP_TENSOR_TILED)) {
-        return false;
-    }
-    return htp_can_rt_repack(t);
+static inline bool ggml_hexagon_tensor_will_tile(const struct ggml_tensor * t) {
+    return ggml_hexagon_tensor_is_tiled(t) || ggml_hexagon_tensor_can_tile(t);
 }
 
 static inline bool htp_tensors_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
@@ -108,7 +115,7 @@ struct ggml_hexagon_session;
 
 const char * htp_session_name(const struct ggml_hexagon_session * sess);
 size_t       htp_session_vtcm_size(const struct ggml_hexagon_session * sess);
-uint32_t     htp_session_n_threads(const struct ggml_hexagon_session * sess);
+uint32_t     htp_session_n_hvx(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_n_hmx(const struct ggml_hexagon_session * sess);
 uint32_t     htp_session_mdev_count(const struct ggml_hexagon_session * sess);
 

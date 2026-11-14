@@ -69,6 +69,8 @@ logs it (`ggml-hex: HTP0 build ...`).
 - `test-hexagon-metadata` (`--leak`, seconds) allocates graphs again and again with
   views of a weight, of a KV-cache-like tensor and scratch views, checks the
   results, and fails if the backend's tensor metadata of a buffer grows.
+  Since llama.cpp v1.0.0 the backend keeps no per-tensor metadata, so the count is
+  always 0; the test still checks the results of the repeated graphs.
 - `scripts/compare-packages.sh <new> <old|-> <kit> <out> <step>...` compares two
   packages on the target, step by step (LLM text and speed, `llama-bench`, a
   12.7k-token prefill, NeMo and SenseVoice outputs, both servers on one HTP), on
@@ -150,11 +152,12 @@ Hexagon registry:
 | Name | Type | Returns |
 |---|---|---|
 | `ggml_backend_hexagon_support_reason` | `const char * (*)(ggml_backend_dev_t, const ggml_tensor *)` | why `supports_op` rejects the op, from the same checks (below) |
-| `ggml_backend_buffer_metadata_epoch` | `uint64_t (*)(ggml_backend_buffer_t)` | a value that changes on every buffer reset, 0 for a non-Hexagon buffer. A tensor bound outside the graph allocator must be initialized again when it changes |
-| `ggml_backend_buffer_metadata_count` | `size_t (*)(ggml_backend_buffer_t)` | tensor metadata entries held by the buffer (bounded across resets), `SIZE_MAX` for a non-Hexagon buffer |
+| `ggml_backend_buffer_metadata_epoch` | `uint64_t (*)(ggml_backend_buffer_t)` | 1 for a Hexagon buffer, 0 otherwise. Constant since llama.cpp v1.0.0: tensor state is flag bits in the tensor, and nothing has to be initialized again after a buffer reset |
+| `ggml_backend_buffer_metadata_count` | `size_t (*)(ggml_backend_buffer_t)` | 0 for a Hexagon buffer (no per-tensor metadata since llama.cpp v1.0.0), `SIZE_MAX` otherwise |
 
 Support reasons: `supported`, `explicit_opfilter` (`GGML_HEXAGON_OPFILTER`),
-`unsupported_op` (no kernel for the op), `op_budget` (estimated time over the
+`unsupported_op` (no kernel for the op), `max_vmem` (a tensor of the op does not
+fit into the address space of a session), `op_budget` (estimated time over the
 per-op budget, left to the CPU; MUL_MAT from the FLOP rate and src0 bytes, with
 the measured rate of the kernel when src0 is not a weight, such as attention
 keys; SOFT_MAX by element count, in builds without

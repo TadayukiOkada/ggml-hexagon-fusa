@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a9d65a597..1c79358ac 100644
+index 2808757c2..34fb51502 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -5195,6 +5195,36 @@ struct test_gated_delta_net : public test_case {
+@@ -5273,6 +5273,36 @@ struct test_gated_delta_net : public test_case {
      }
  };
  
@@ -39,7 +39,7 @@ index a9d65a597..1c79358ac 100644
  // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
  struct test_gated_delta_net_cache_fusion : public test_case {
      const ggml_type type;
-@@ -13025,6 +13055,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13679,6 +13709,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
      test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
  

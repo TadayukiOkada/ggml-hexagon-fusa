@@ -1,6 +1,8 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index d47f9311c..abe8241b4 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10610,9 +10610,60 @@
+@@ -11023,9 +11023,60 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
  }
  
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
@@ -61,7 +63,7 @@
  
      // unary ops
      // TODO: add GGML_UNARY_OP_SOFTPLUS test that is sensitive to using `log1p(exp(x))` vs `log(exp(x) + 1)`
-@@ -13409,6 +13460,21 @@
+@@ -14063,6 +14114,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  

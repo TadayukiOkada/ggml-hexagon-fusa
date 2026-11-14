@@ -159,6 +159,16 @@ static double htp_estimate_conv_2d_ms(const struct ggml_tensor * op) {
     return (std::max)(flops / 0.6e9, htp_estimate_bytes_ms(op, 20.0e6));
 }
 
+// CONV_3D (llama.cpp v1.0.0): kernel [KW, KH, KD, IC * OC], dst [OW, OH, OD, OC * N], IC in the op
+// params. It runs on the CONV_2D kernel (KD and KH folded into one kernel row), so the same rate;
+// not timed on v73 yet.
+static double htp_estimate_conv_3d_ms(const struct ggml_tensor * op) {
+    const struct ggml_tensor * w = op->src[0];
+    const double ic    = (double) (std::max)(1, ggml_get_op_params_i32(op, 9));
+    const double flops = 2.0 * w->ne[0] * w->ne[1] * w->ne[2] * ic * (double) ggml_nelements(op);
+    return (std::max)(flops / 0.6e9, htp_estimate_bytes_ms(op, 20.0e6));
+}
+
 // LIGHTNING_INDEXER: q [D, H, n_batch, ne3], k [D, 1, n_kv, ne3]: a score per head, key and row
 static double htp_estimate_lightning_indexer_ms(const struct ggml_tensor * op) {
     const struct ggml_tensor * q = op->src[0];
@@ -181,7 +191,7 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
         return true;
     }
 
-    const uint32_t n_threads = htp_session_n_threads(sess) > 0 ? htp_session_n_threads(sess) : 4;
+    const uint32_t n_threads = htp_session_n_hvx(sess) > 0 ? htp_session_n_hvx(sess) : 4;
 
     switch (op->op) {
         case GGML_OP_ARGSORT:
@@ -194,6 +204,8 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
             return htp_budget_check(sess, op, htp_estimate_gdn_ms(op));
         case GGML_OP_CONV_2D:
             return htp_budget_check(sess, op, htp_estimate_conv_2d_ms(op));
+        case GGML_OP_CONV_3D:
+            return htp_budget_check(sess, op, htp_estimate_conv_3d_ms(op));
         case GGML_OP_LIGHTNING_INDEXER:
             return htp_budget_check(sess, op, htp_estimate_lightning_indexer_ms(op));
         case GGML_OP_UPSCALE:

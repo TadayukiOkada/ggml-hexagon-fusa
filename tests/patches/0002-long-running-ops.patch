@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a3de712a9..d945a580d 100644
+index 4b9a91cf2..4b8cd9665 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -1525,15 +1525,15 @@ struct test_case {
+@@ -1566,15 +1566,15 @@ struct test_case {
              const char * bn1 = ggml_backend_name(ud->backend1);
              const char * bn2 = ggml_backend_name(ud->backend2);
  
@@ -21,7 +21,7 @@ index a3de712a9..d945a580d 100644
                      ud->ok = false;
                      return true;
                  }
-@@ -10126,6 +10126,69 @@ static const ggml_type other_types[] = {
+@@ -10539,6 +10539,69 @@ static const ggml_type other_types[] = {
  #pragma optimize("", off)
  #endif
  
@@ -91,7 +91,7 @@ index a3de712a9..d945a580d 100644
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
-@@ -12771,6 +12834,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13425,6 +13488,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -106,7 +106,7 @@ index a3de712a9..d945a580d 100644
      return test_cases;
  }
  #ifdef _MSC_VER
-@@ -13341,6 +13412,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14031,6 +14102,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
      }
  

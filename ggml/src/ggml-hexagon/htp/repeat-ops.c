@@ -15,7 +15,7 @@
 #include "ggml-common.h"
 #include "htp-ctx.h"
 #include "hex-common.h"
-#include "hex-profile.h"
+#include "htp-trace.h"
 #include "htp-ops.h"
 #include "htp-tensor.h"
 #include "repeat-ops.h"
@@ -28,12 +28,12 @@ struct htp_repeat_context {
     uint32_t nr2;
     uint32_t nr3;
 
-    uint32_t nrows_per_thread;
+    uint32_t nrows_per_hvx;
     uint32_t total_dst_rows;  // ne1 * ne2 * ne3
     uint32_t row_start;
 
     size_t   type_size;
-    uint32_t size_per_thread;
+    uint32_t size_per_hvx;
     bool     copy_direct;
 };
 
@@ -82,7 +82,7 @@ static void repeat_row(uint8_t * dst, uint8_t * src, uint32_t row_bytes, uint32_
     }
 }
 
-static void repeat_copy_job_per_thread(unsigned int nth, unsigned int ith, void * data) {
+static void repeat_copy_job_per_hvx(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     const struct htp_repeat_context * rctx = (const struct htp_repeat_context *) data;
     struct htp_ops_context * octx = rctx->octx;
     const struct htp_tensor * src = octx->src[0];
@@ -115,10 +115,10 @@ static void repeat_copy_job_per_thread(unsigned int nth, unsigned int ith, void 
 
     const size_t row_bytes = ne00 * rctx->type_size;
 
-    const uint32_t row_start = rctx->row_start + MIN((uint64_t) rctx->nrows_per_thread * ith, rctx->total_dst_rows);
-    const uint32_t row_end   = row_start + MIN(rctx->nrows_per_thread, rctx->row_start + rctx->total_dst_rows - row_start);
+    const uint32_t row_start = rctx->row_start + MIN((uint64_t) rctx->nrows_per_hvx * ith, rctx->total_dst_rows);
+    const uint32_t row_end   = row_start + MIN(rctx->nrows_per_hvx, rctx->row_start + rctx->total_dst_rows - row_start);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     for (uint32_t dst_row = row_start; dst_row < row_end; dst_row++) {
@@ -150,7 +150,7 @@ static void repeat_copy_job_per_thread(unsigned int nth, unsigned int ith, void 
          row_start, row_end);
 }
 
-static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * data) {
+static void repeat_job_per_hvx(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     const struct htp_repeat_context * rctx = (const struct htp_repeat_context *) data;
     struct htp_ops_context * octx = rctx->octx;
     const struct htp_tensor * src = octx->src[0];
@@ -183,17 +183,17 @@ static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * dat
 
     const size_t row_bytes = ne00 * rctx->type_size;
 
-    const uint32_t row_start = rctx->row_start + MIN((uint64_t) rctx->nrows_per_thread * ith, rctx->total_dst_rows);
-    const uint32_t row_end   = row_start + MIN(rctx->nrows_per_thread, rctx->row_start + rctx->total_dst_rows - row_start);
+    const uint32_t row_start = rctx->row_start + MIN((uint64_t) rctx->nrows_per_hvx * ith, rctx->total_dst_rows);
+    const uint32_t row_end   = row_start + MIN(rctx->nrows_per_hvx, rctx->row_start + rctx->total_dst_rows - row_start);
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
-    uint8_t * spad = octx->ctx->vtcm_base + ith * rctx->size_per_thread;
+    dma_queue * dma_q = th->dma_q;
+    uint8_t * spad = octx->ctx->vtcm_base + ith * rctx->size_per_hvx;
     const uint32_t dst_bytes = ne0 * rctx->type_size;
-    const uint32_t pitch = row_bytes > rctx->size_per_thread ? 0 :
+    const uint32_t pitch = row_bytes > rctx->size_per_hvx ? 0 :
         (row_bytes == rctx->type_size ? row_bytes : hex_align_up(row_bytes, 128));
-    const uint32_t staged_rows = pitch == 0 ? 0 : rctx->size_per_thread / pitch;
+    const uint32_t staged_rows = pitch == 0 ? 0 : rctx->size_per_hvx / pitch;
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     for (uint32_t dst_row = row_start; dst_row < row_end;) {
@@ -221,7 +221,7 @@ static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * dat
             dst_row += nrows;
         } else {
             for (uint32_t offset = 0; offset < row_bytes;) {
-                const uint32_t bytes = MIN(row_bytes - offset, rctx->size_per_thread);
+                const uint32_t bytes = MIN(row_bytes - offset, rctx->size_per_hvx);
                 dma_cpy_sametype_reshape_contig(dma_q, (dma_addr_t) (uintptr_t) spad, src_row + offset, bytes);
                 dma_queue_flush(dma_q);
                 for (uint32_t i0 = 0; i0 < nr0; i0++) {
@@ -323,8 +323,8 @@ int op_repeat(struct htp_ops_context * octx) {
     }
 
     const struct htp_repeat_kernel_params * kparams = (const struct htp_repeat_kernel_params *) octx->kernel_params;
-    const uint32_t n_threads = MIN(kparams->n_threads, octx->ctx->vtcm_size / 128);
-    if (!htp_ops_context_set_n_threads(octx, n_threads)) {
+    const uint32_t n_hvx = MIN(kparams->n_hvx, octx->ctx->vtcm_size / 128);
+    if (!htp_ops_context_set_n_hvx(octx, n_hvx)) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
@@ -334,11 +334,11 @@ int op_repeat(struct htp_ops_context * octx) {
         .nr1              = nr[1],
         .nr2              = nr[2],
         .nr3              = nr[3],
-        .nrows_per_thread = fastdiv(nrows - 1, &octx->n_threads_div) + 1,
+        .nrows_per_hvx = fastdiv(nrows - 1, &octx->n_hvx_div) + 1,
         .total_dst_rows   = nrows,
         .row_start        = row_start,
         .type_size        = type_size,
-        .size_per_thread  = MIN(16 * 1024, (octx->ctx->vtcm_size / n_threads) & ~(size_t) 127),
+        .size_per_hvx  = MIN(16 * 1024, (octx->ctx->vtcm_size / n_hvx) & ~(size_t) 127),
         .copy_direct      = repeat_copy_direct(dst_size, src_row_size, dst_row_size) && !htp_tensor_is_extended(src0) && src_size - 1 <= UINT32_MAX - src0->data,
     };
 
@@ -347,7 +347,7 @@ int op_repeat(struct htp_ops_context * octx) {
          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
          rctx.nr0, rctx.nr1, rctx.nr2, rctx.nr3);
 
-    work_queue_run(octx->ctx->work_queue, rctx.copy_direct ? repeat_copy_job_per_thread : repeat_job_per_thread, &rctx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, rctx.copy_direct ? repeat_copy_job_per_hvx : repeat_job_per_hvx, &rctx, n_hvx);
 
     return HTP_STATUS_OK;
 }

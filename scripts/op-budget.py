@@ -37,7 +37,7 @@ YIELDING = ["CONT", "CPY", "FENCE_WAIT", "FLASH_ATTN_EXT", "IM2COL", "CONV_2D_DW
             "SOFT_MAX", "SET_ROWS", "ADD", "SUB", "MUL", "DIV", "ADD_ID", "ARGSORT:multi-row", "TOP_K:multi-row",
             "SCALE", "CLAMP", "LEAKY_RELU", "SQR", "SQRT", "NEG", "EXP", "SIGMOID", "SILU", "GELU",
             "GELU_QUICK", "GELU_ERF", "SOFTPLUS", "TANH", "ABS", "LOG", "RELU", "STEP",
-            "NORM", "RMS_NORM", "RMS_NORM_MUL", "L2_NORM", "TRI"]
+            "NORM", "RMS_NORM", "RMS_NORM_MUL", "RMS_NORM_MUL_ADD", "L2_NORM", "TRI"]
 
 
 def parse(stream, groups):
@@ -55,7 +55,8 @@ def tag(op, fields, dims):
     """Kernel path of matmuls and flash attention, else whether the first source has several rows."""
     last = fields[-1] if len(fields) > 4 else ""
     if (op.startswith("MUL_MAT") or op == "FLASH_ATTN_EXT") and " vtcm " in last:
-        return last.split(" vtcm ")[0]
+        # "hmx-tiled vtcm N", or "hmx-tiled nhvx 4 vtcm N" since llama.cpp v1.0.0
+        return last.split(" vtcm ")[0].split(" nhvx ")[0]
     ne = [int(x) for x in re.findall(r"\d+", dims.split(" ")[0])]
     return "multi-row" if len(ne) > 1 and math.prod(ne[1:]) > 1 else "single-row"
 

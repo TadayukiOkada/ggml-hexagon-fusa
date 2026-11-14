@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index e8c4ac8f2..c4182acf7 100644
+index 31c2bc017..4424ad9cd 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -3118,9 +3118,11 @@ struct test_repeat : public test_case {
+@@ -3196,9 +3196,11 @@ struct test_repeat : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne;
      const std::array<int, 4> nr;
@@ -15,7 +15,7 @@ index e8c4ac8f2..c4182acf7 100644
      }
  
      size_t op_size(ggml_tensor * t) override {
-@@ -3129,16 +3131,29 @@ struct test_repeat : public test_case {
+@@ -3207,16 +3209,29 @@ struct test_repeat : public test_case {
  
      test_repeat(ggml_type type = GGML_TYPE_F32,
              std::array<int64_t, 4> ne = {10, 5, 4, 3},
@@ -48,7 +48,7 @@ index e8c4ac8f2..c4182acf7 100644
  
          ggml_tensor * out = ggml_repeat(ctx, src, target);
          ggml_set_name(out, "out");
-@@ -10849,6 +10864,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11282,6 +11297,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_repeat(GGML_TYPE_BF16, {10, 5, 4, ne3}, {2, 1, 1, 1}));
      }
  
