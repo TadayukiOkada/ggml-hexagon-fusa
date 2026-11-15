@@ -55,7 +55,10 @@ echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$summary"
 
 if [ $ops -eq 1 ]; then
     run 300 "$out/support.log" test-backend-ops-hex support -b HTP0
-    grep -aoE '^  [A-Z_0-9]+\(' "$out/support.log" | tr -d ' (' | sort -u > "$out/ops.txt"
+    # the fused-graph tests of tests/patches have names of their own, which the support run does not list
+    fused="F16_DIV_PRECISION FA_SINK_NORMALIZATION GDN_DECAY MUL_MAT_ADD_RESIDUAL MUL_MAT_GLU MUL_MAT_SOFTCAP
+        NORM_MUL_MAT RMS_NORM_ADD_SCALE RMS_NORM_ROPE"
+    { grep -aoE '^  [A-Z_0-9]+\(' "$out/support.log" | tr -d ' ('; printf '%s\n' $fused; } | sort -u > "$out/ops.txt"
     echo "ops: $(wc -l < "$out/ops.txt")" | tee -a "$summary"
     for op in $(cat "$out/ops.txt"); do
         GGML_HEXAGON_PROFILE=1 run 3600 "$out/test_$op.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$op"

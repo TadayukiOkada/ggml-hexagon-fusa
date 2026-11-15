@@ -436,6 +436,8 @@ static bool fuse_mul_mat_nx_glu(const ggml_hexagon_session * sess, htp_opnode & 
     if (kp->n_weights != 2) return false;
     if (kp->n_hmx) {
         if (!kp->pipeline || ((kp->n_chunk / 2) & ~31) == 0) return false;
+        // tiled F16 weights go to HMX as they are: the fused GLU store needs the dequantization pass
+        if (kp->tile_size > 0 && prev.inputs[0]->type == GGML_TYPE_F16) return false;
     } else {
         // the HVX kernel (a few rows) keeps the gate outputs in VTCM and writes act(gate) * up with each up tile
         const ggml_tensor * x0 = prev.inputs[2];
