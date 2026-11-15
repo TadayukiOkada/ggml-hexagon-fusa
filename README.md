@@ -124,9 +124,16 @@ batch completes: the phase and how long it has been in it, the batch and op,
 VTCM acquire in progress, release requests and in-op yields so far, and the
 state of the worker and HMX queues, and the queue errors the DSP main thread
 has seen. It is a separate FastRPC call, so it answers while the main thread
-is stuck. With the I/O trace on, the session also records the state once at
-release (`dsp_diag_release`). The words are listed at `htp_iface_diag()` in
-`htp/main.c`.
+is stuck. With the I/O trace on, the same state is recorded each time a
+backend is freed (`dsp_diag_free`, e.g. when a llama context is freed) and when
+the session is released (`dsp_diag_release`; a process normally exits without
+releasing its sessions, so use `dsp_diag_free` for the totals of a run). The
+words are listed at `htp_iface_diag()` in `htp/main.c`.
+
+With the profiler on, each `profile-op` line ends with `yields N`: how often
+that op gave VTCM/HMX away because another client asked. `scripts/op-budget.py`
+sums them per op group, and `--min-yields OP=N` checks that a run really
+released inside the named ops.
 
 The DSP main thread's timed queue wait sometimes returns QuRT's own timeout
 code (`QURT_ETIMEDOUT`, 47) instead of `AEE_EEXPIRED`; the thread took it for a

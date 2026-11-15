@@ -208,6 +208,12 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
             return htp_budget_check(sess, op, htp_estimate_conv_3d_ms(op));
         case GGML_OP_LIGHTNING_INDEXER:
             return htp_budget_check(sess, op, htp_estimate_lightning_indexer_ms(op));
+        case GGML_OP_SSM_SCAN:
+            // New on the HTP after llama.cpp v1.0.0: not timed on v73 and no point where VTCM is
+            // released, so there is no estimate to compare with the budget.
+            HEX_VERBOSE("ggml-hex: %s %s %s has no time estimate, left to the CPU\n", htp_session_name(sess),
+                        ggml_op_desc(op), op->name);
+            return false;
         case GGML_OP_UPSCALE:
         case GGML_OP_TOP_K_MASK:
             return htp_budget_check(sess, op, htp_estimate_bytes_ms(op, 20.0e6));

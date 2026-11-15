@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 83c064046..b491e9d8b 100644
+index 8d0c13da4..a543068b9 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6138,6 +6138,71 @@ struct test_mul_mat_glu : public test_case {
+@@ -6170,6 +6170,71 @@ struct test_mul_mat_glu : public test_case {
      }
  };
  
@@ -74,14 +74,14 @@ index 83c064046..b491e9d8b 100644
  // GGML_OP_OUT_PROD
  struct test_out_prod : public test_case {
      const ggml_type type_a;
-@@ -13578,6 +13643,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13639,6 +13704,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
 +    // matmul + residual (fusable into the HMX store) and matvec + logit softcap (fusable into the
 +    // repacked matvec)
 +    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_Q6_K}) {
-+        for (int64_t n : {70, 512}) {
++        for (int64_t n : {1, 5, 70, 512}) {
 +            test_cases.emplace_back(new test_mul_mat_add_residual(type, 512, 1056, n, false));
 +        }
 +        test_cases.emplace_back(new test_mul_mat_add_residual(type, 1024, 2048, 256, true));

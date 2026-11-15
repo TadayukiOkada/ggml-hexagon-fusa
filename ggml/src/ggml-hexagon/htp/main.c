@@ -1210,6 +1210,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_SSM_CONV:
             return op_ssm_conv(octx);
 
+        case HTP_OP_SSM_SCAN:
+            return op_ssm_scan(octx);
+
         case HTP_OP_CUMSUM:
             return op_cumsum(octx);
 
@@ -1280,7 +1283,12 @@ static int execute_op(struct htp_ops_context * octx) {
 }
 
 static inline bool reuse_buf(struct htp_context *ctx, uint32_t *m_reuse, struct htp_buf_desc *b) {
-    b->base = NULL;
+    if (b->fd == ctx->shm.fd) {
+        b->base = ctx->shm.base;
+        return true;
+    }
+
+    b->base = 0;
 
     for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) {
         struct htp_mmap *m = ctx->mmap + i;
@@ -1394,7 +1402,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
 
         for (uint32_t i=0; i < n_bufs; i++) {
             struct htp_buf_desc *b = bufs + i;
-            if (!(b->flags & HTP_BUF_EXTENDED)) {
+            if (!(b->flags & HTP_BUF_EXTENDED) && b->fd != ctx->shm.fd) {
                 b->base = 0;
             }
             if (!mmap_buf(ctx, b)) {
@@ -1569,6 +1577,9 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             n_bufs, n_tens, n_ops, req->n_traces, dbuf->size, b_size, t_size, o_size);
 
     // Setup descriptor pointers
+    ctx->shm.fd   = dbuf->fd;
+    ctx->shm.base = (uintptr_t) dbuf->ptr - dbuf->offset;
+
     uint8_t * m_ptr = dbuf->ptr;
     struct htp_buf_desc* bufs = (struct htp_buf_desc*)  m_ptr; m_ptr += b_size;
     struct htp_tensor*   tens = (struct htp_tensor*)    m_ptr; m_ptr += t_size;
@@ -1621,6 +1632,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     octx->status  = HTP_STATUS_OK;
     for (uint32_t i = 0; i < n_ops; i++) {
         struct profile_data prof;
+        const uint32_t yields_before = ctx->diag.n_yields;
 
         profile_start(ctx->profiler, &prof);
 
@@ -1639,6 +1651,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             pds[i].usecs  = prof.usecs;
             pds[i].cycles_start = prof.cycles_start;
             pds[i].cycles_stop = prof.cycles_stop;
+            pds[i].yields   = ctx->diag.n_yields - yields_before;  // inside the op, not the one after it
+            pds[i].reserved = 0;
             for (int j = 0; j < HEX_NUM_PMU_COUNTERS; j++) {
                 pds[i].pmu[j] = prof.pmu_counters[j];
             }

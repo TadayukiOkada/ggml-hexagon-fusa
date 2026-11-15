@@ -6,12 +6,16 @@ HMX. A single op that holds them longer than the budget can make the self-test
 miss its deadline (yield points are only between ops and inside some copies).
 This groups the profile-op lines by op, shapes and types, and reports count,
 mean, p95 and max time, flagging groups whose max exceeds the budget with !!.
+The yields column is how often the ops of a group gave VTCM/HMX away inside
+the op because another client asked ("-" for logs from builds that do not
+report it): it shows that a release inside an op really happened in that run.
+--min-yields OP=N (with --fail) requires at least N of them in the ops named OP.
 Ops that release VTCM/HMX inside the op when built with
 GGML_HEXAGON_HTP_YIELD_IN_CPY / _IN_OPS / _BETWEEN_OPS (--yielding, see YIELDING) are marked
 ~~ instead: their op time is not the time the resources are held, at least on
 the paths that yield. For builds without those options pass --yielding "".
 
-usage: scripts/op-budget.py [--budget-ms 25] [--top 30] [--fail] LOG...
+usage: scripts/op-budget.py [--budget-ms 25] [--top 30] [--fail] [--min-yields OP=N] LOG...
        (reads stdin when no LOG is given)
 """
 
@@ -25,6 +29,7 @@ from collections import defaultdict
 LINE = re.compile(
     r"(?P<dev>HTP\d+(?::\d+)?) profile-op (?P<op>[A-Z_0-9+]+)\|(?P<fields>.*)\|usec (?P<usec>\d+) cycles (?P<cycles>\d+)"
 )
+YIELDS = re.compile(r" yields (\d+)\s*$")
 
 
 # Ops that release VTCM/HMX on request inside the op in builds with GGML_HEXAGON_HTP_YIELD_IN_CPY
@@ -40,7 +45,7 @@ YIELDING = ["CONT", "CPY", "FENCE_WAIT", "FLASH_ATTN_EXT", "IM2COL", "CONV_2D_DW
             "NORM", "RMS_NORM", "RMS_NORM_MUL", "RMS_NORM_MUL_ADD", "L2_NORM", "TRI"]
 
 
-def parse(stream, groups):
+def parse(stream, groups, yields):
     for line in stream:
         m = LINE.search(line)
         if not m or m["op"] == "OPBATCH":
@@ -48,7 +53,11 @@ def parse(stream, groups):
         fields = m["fields"].split("|")
         dims = fields[1] if len(fields) > 1 else ""
         types = fields[2] if len(fields) > 2 else ""
-        groups[(m["dev"], m["op"], dims, types, tag(m["op"], fields, dims))].append(int(m["usec"]))
+        key = (m["dev"], m["op"], dims, types, tag(m["op"], fields, dims))
+        groups[key].append(int(m["usec"]))
+        y = YIELDS.search(line)
+        if y:
+            yields[key] += int(y[1])
 
 
 def tag(op, fields, dims):
@@ -79,16 +88,27 @@ def main():
     ap.add_argument("--yielding", default=",".join(YIELDING),
                     help="ops that yield inside the op, marked ~~ and not counted for --fail "
                          "(default: those that do with GGML_HEXAGON_HTP_YIELD_IN_CPY, _IN_OPS and _BETWEEN_OPS)")
-    ap.add_argument("--fail", action="store_true", help="exit with 1 when any other op exceeds the budget")
+    ap.add_argument("--fail", action="store_true",
+                    help="exit with 1 when any other op exceeds the budget or a --min-yields is not met")
+    ap.add_argument("--min-yields", action="append", default=[], metavar="OP=N",
+                    help="expect at least N yields inside the ops named OP, or OP:tag (repeatable)")
     args = ap.parse_args()
 
+    need = []
+    for spec in args.min_yields:
+        name, _, count = spec.partition("=")
+        if not name or not count.isdigit():
+            ap.error(f"--min-yields {spec}: expected OP=N")
+        need.append((name, int(count)))
+
     groups = defaultdict(list)
+    yields = defaultdict(int)  # only groups whose lines report yields
     if args.logs:
         for path in args.logs:
             with open(path, errors="replace") as f:
-                parse(f, groups)
+                parse(f, groups, yields)
     else:
-        parse(sys.stdin, groups)
+        parse(sys.stdin, groups, yields)
 
     if not groups:
         print("op-budget: no profile-op lines (run with GGML_HEXAGON_PROFILE=1)", file=sys.stderr)
@@ -100,14 +120,26 @@ def main():
     over = [r for r in rows if max(r[1]) > budget_us and not is_yielding(r[0][1], r[0][4], yielding)]
     over_y = [r for r in rows if max(r[1]) > budget_us and is_yielding(r[0][1], r[0][4], yielding)]
 
-    print(f"{'':2}{'max ms':>9} {'p95 ms':>9} {'mean ms':>9} {'count':>7}  op  dims  types  tag")
+    print(f"{'':2}{'max ms':>9} {'p95 ms':>9} {'mean ms':>9} {'count':>7} {'yields':>7}  op  dims  types  tag")
     for (dev, op, dims, types, tg), us in rows[: args.top or None]:
         flag = ("~~" if is_yielding(op, tg, yielding) else "!!") if max(us) > budget_us else ""
-        print(f"{flag:2}{max(us) / 1000:9.2f} {p95(us) / 1000:9.2f} {sum(us) / len(us) / 1000:9.2f} {len(us):7d}  "
+        key = (dev, op, dims, types, tg)
+        ys = str(yields[key]) if key in yields else "-"
+        print(f"{flag:2}{max(us) / 1000:9.2f} {p95(us) / 1000:9.2f} {sum(us) / len(us) / 1000:9.2f} {len(us):7d} {ys:>7}  "
               f"{dev} {op}  {dims}  {types}  {tg}")
     print(f"\n{len(over)} of {len(rows)} op groups exceed {args.budget_ms:g} ms"
           f" (plus {len(over_y)} of the yielding ops {','.join(sorted(yielding))})")
-    return 1 if args.fail and over else 0
+    short = False
+    if yields:
+        print(f"{sum(yields.values())} yields inside ops")
+    else:
+        print("yields inside ops: not reported by this build")
+    for name, count in need:
+        got = sum(n for (_, op, _, _, tg), n in yields.items() if name in (op, f"{op}:{tg}"))
+        ok = got >= count
+        short = short or not ok
+        print(f"{'ok' if ok else 'MISSING'}: {got} yields inside {name} (at least {count} expected)")
+    return 1 if args.fail and (over or short) else 0
 
 
 if __name__ == "__main__":
