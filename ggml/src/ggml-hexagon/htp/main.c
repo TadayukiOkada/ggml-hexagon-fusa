@@ -1632,6 +1632,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     octx->status  = HTP_STATUS_OK;
     for (uint32_t i = 0; i < n_ops; i++) {
         struct profile_data prof;
+        const uint32_t yields_before = ctx->diag.n_yields;
 
         profile_start(ctx->profiler, &prof);
 
@@ -1650,6 +1651,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             pds[i].usecs  = prof.usecs;
             pds[i].cycles_start = prof.cycles_start;
             pds[i].cycles_stop = prof.cycles_stop;
+            pds[i].yields   = ctx->diag.n_yields - yields_before;  // inside the op, not the one after it
+            pds[i].reserved = 0;
             for (int j = 0; j < HEX_NUM_PMU_COUNTERS; j++) {
                 pds[i].pmu[j] = prof.pmu_counters[j];
             }

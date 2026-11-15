@@ -240,8 +240,10 @@ static void ggml_hexagon_dump_op_prof(const char * sess_name, const htp_opnode &
     }
 
     float mhz = op_usec > 0 ? (float) op_cycles / op_usec : 0.0f;
-    GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|usec %u cycles %u start %u mhz %.1f%s\n",
-                   sess_name, htp_format_op(node, HTP_OPFMT_PROF).c_str(), op_usec, op_cycles, pd.cycles_start, mhz, pmu_str);
+    // yields: times the op gave VTCM/HMX away on request. Last, so parsers of the fields before it still match.
+    GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|usec %u cycles %u start %u mhz %.1f%s yields %u\n",
+                   sess_name, htp_format_op(node, HTP_OPFMT_PROF).c_str(), op_usec, op_cycles, pd.cycles_start, mhz, pmu_str,
+                   pd.yields);
 }
 
 static void ggml_hexagon_dump_batch_prof(const char * sess_name, const htp_opbatch_rsp & rsp) {
@@ -404,7 +406,8 @@ struct ggml_hexagon_session {
         uint32_t n_batches = 0;      // batches completed since the session opened
         uint32_t errors    = 0;      // queue errors the main thread recovered from
     };
-    dsp_state report_dsp_state(uint64_t waited_ms, bool at_release = false);
+    dsp_state report_dsp_state(uint64_t waited_ms, const char * at_end = nullptr);
+    void      report_dsp_state_at_end(const char * event);
 
     void mmap_buffers();
     void clone_buffer(const ggml_hexagon_shared_buffer*);
@@ -1923,9 +1926,11 @@ void ggml_hexagon_session::requeue() {
 }
 
 // Ask the DSP where its main thread is (htp_iface_diag) while a batch does not complete, and
-// once at release with the I/O trace on. The words are the layout of htp_iface_diag() in htp/main.c.
-ggml_hexagon_session::dsp_state ggml_hexagon_session::report_dsp_state(uint64_t waited_ms, bool at_release) {
-    const char * event = at_release ? "dsp_diag_release" : "dsp_diag";
+// with the I/O trace on when work ends (at_end names the record). The words are the layout of
+// htp_iface_diag() in htp/main.c.
+ggml_hexagon_session::dsp_state ggml_hexagon_session::report_dsp_state(uint64_t waited_ms, const char * at_end) {
+    const bool   at_release = at_end != nullptr;
+    const char * event      = at_release ? at_end : "dsp_diag";
     dsp_state st;
     uint32_t w[40] = {};
     int err = htp_iface_diag(this->handle, w, 40);
@@ -1947,7 +1952,7 @@ ggml_hexagon_session::dsp_state ggml_hexagon_session::report_dsp_state(uint64_t 
                       "opcode %u, batches %u yields %u release-requests %u, acquire %u ms tries %u err 0x%x, vtcm valid %u "
                       "needs-release %u, wq active %u seqn %u r %u w %u pending %u busy 0x%x, hmx w %u r %u pop %u locked %u, "
                       "main-thread prio %d, peek errors %u (0x%x), read errors %u (0x%x), main-thread exits %u\n",
-                      this->c_name(), at_release ? "at release, last" : "no response to", (uint64_t) this->batch_rsp_seq + !at_release,
+                      this->c_name(), at_release ? "at the end, last" : "no response to", (uint64_t) this->batch_rsp_seq + !at_release,
                       waited_ms, w[2], phase_ms, w[4], w[6], w[5], w[7], w[8], w[9], w[10], acquire_ms, w[12], w[13], w[14],
                       w[15], w[17], w[18], w[19], w[20], w[21], w[22], w[23], w[24], w[25], w[26], (int) w[28], w[29], w[30],
                       w[31], w[32], w[33]);
@@ -1983,6 +1988,15 @@ static const char * dsp_lost_reason(const ggml_hexagon_session::dsp_state & prev
         return "the DSP keeps failing to read its queue";
     }
     return nullptr;
+}
+
+// The session counters (batches, in-op yields, release requests, queue errors) at a point where
+// work ends. A session lives as long as the registry, which a process normally never frees, so
+// the record at session release alone would not appear in a trace.
+void ggml_hexagon_session::report_dsp_state_at_end(const char * event) {
+    if (this->valid_iface && hex_io_trace.enabled() && opt_diag_wait > 0) {
+        report_dsp_state(0, event);
+    }
 }
 
 void ggml_hexagon_session::flush_pending(bool all) {
@@ -2711,9 +2725,7 @@ void ggml_hexagon_session::release() noexcept(true) {
     int err;
 
     if (this->valid_iface) {
-        if (hex_io_trace.enabled() && opt_diag_wait > 0) {
-            report_dsp_state(0, true);
-        }
+        report_dsp_state_at_end("dsp_diag_release");
 
         // Stop dspqueue/opbatch processing
         err = htp_iface_stop(this->handle);
@@ -2810,6 +2822,10 @@ static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
 static void ggml_backend_hexagon_free(ggml_backend_t backend) {
     // we just need to delete the backend here
     // the sessions are allocated & freed as part of the registry
+    auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    if (sess) {
+        sess->report_dsp_state_at_end("dsp_diag_free");
+    }
     delete backend;
 }
 

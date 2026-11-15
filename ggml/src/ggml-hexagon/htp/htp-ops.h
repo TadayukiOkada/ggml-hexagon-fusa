@@ -284,6 +284,8 @@ struct htp_prof_desc {
     uint32_t cycles_start;           // Start cycle counter
     uint32_t cycles_stop;            // Stop cycle counter
     uint32_t pmu[HTP_PROF_PMU_NCNT]; // PMU counters
+    uint32_t yields;                 // Times the op gave VTCM/HMX away on request (htp_vtcm_yield)
+    uint32_t reserved;               // Keeps the size a multiple of 8
 };
 
 struct htp_opbatch_req {
