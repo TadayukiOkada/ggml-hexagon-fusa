@@ -4484,8 +4484,11 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     if (src2) {
         src2_stride = (src2->ne[1] == 1) ? 0 : (uint32_t) (src2->nb[1] / sizeof(float));
         src2_addr = src2->data + (size_t) m_start * src2_stride * sizeof(float);
+        // A streamed src2 keeps the whole staging area (HTP_MM_SRC2_STREAM_BYTES per thread) whatever
+        // the number of rows; only a src2 that is copied to VTCM shrinks to the rows of this device.
         const size_t slice_bytes = (src2->ne[1] == 1) ? src2->nb[1] : (size_t) m_rows * src2->nb[1];
-        src2_bytes = MIN((size_t) kparams->vtcm_bias_size, slice_bytes);
+        src2_bytes = kparams->src2_stream ? (size_t) kparams->vtcm_bias_size
+                                          : MIN((size_t) kparams->vtcm_bias_size, slice_bytes);
         src2_nb2 = (src2->ne[2] == 1) ? 0 : src2->nb[2];
         src2_nb3 = (src2->ne[3] == 1) ? 0 : src2->nb[3];
     }

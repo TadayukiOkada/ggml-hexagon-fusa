@@ -81,7 +81,7 @@ index 8d0c13da4..a543068b9 100644
 +    // matmul + residual (fusable into the HMX store) and matvec + logit softcap (fusable into the
 +    // repacked matvec)
 +    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_Q6_K}) {
-+        for (int64_t n : {70, 512}) {
++        for (int64_t n : {1, 5, 70, 512}) {
 +            test_cases.emplace_back(new test_mul_mat_add_residual(type, 512, 1056, n, false));
 +        }
 +        test_cases.emplace_back(new test_mul_mat_add_residual(type, 1024, 2048, 256, true));
