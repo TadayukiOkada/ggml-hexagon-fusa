@@ -4,6 +4,8 @@
 # 16 kHz mono PCM16 WAV for all audio.
 models/Qwen3-0.6B-Q4_0.gguf  382156480  33bcc57074ec7b6eada5a90651ee546ec0c2b271002c22baf9f1b2dd1e8f75cb  llm, bench, prefill
 models/Qwen3.5-0.8B-Q4_0.gguf  563036064  57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf  llm, bench (GATED_DELTA_NET)
+models/Qwen3.5-0.8B-Q4_K_M-AR-tool.gguf  529297472  e6a63cee6540f0f10489870603db553c4b4077f29dbc73d1d796755fb02f866e  llm, bench (accuracy candidate)
+models/Qwen3.5-0.8B-Q4_0-AR-tool.gguf  501452864  75ffce9e5e3332f585401ec9205ac847d79bba81b63e91fd2168100a59cb26f0  llm, bench (speed candidate)
 models/Llama-3.2-1B-Instruct-Q4_0.gguf  773025920  fa0390e7c043f89ae1847bd6682d748041a99d4ef3de0e0b27d33b6af97a8be8  device-tests.sh --bench
 models/gemma-4-E2B_q4_0-it.gguf  3349516256  fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634  device-tests.sh --bench (262144-token vocabulary)
 models/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf  742090464  3fc991d3badad7277c11030a7519832cddaf2057aafed6d4b25147e953a070b1  asr, servers (NeMo-Speech.cpp)
