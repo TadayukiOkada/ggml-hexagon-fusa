@@ -82,11 +82,17 @@ class VerdictTest(unittest.TestCase):
 
     # --ops
 
-    def ops_dir(self, rows, ops=("ADD", "SUB"), logs=None):
+    OP_PROFILE = "ggml-hex: HTP0 profile-op {op}|a -> b|1:1 -> 1:1|f32 -> f32|x|usec {usec} cycles 1\n"
+
+    def ops_dir(self, rows, ops=("ADD", "SUB"), logs=None, profile=True):
         d = os.path.join(self.d, "ops")
         write(os.path.join(d, "ops.txt"), "".join(o + "\n" for o in ops))
         write(os.path.join(d, "summary.txt"), "package: x\n" + "".join(r + "\n" for r in rows))
-        for name, text in (logs or {}).items():
+        logs = dict(logs or {})
+        for op in ops:  # device-tests.sh --ops profiles every op
+            body = textwrap.dedent(logs.get(op, "")).lstrip("\n")
+            logs[op] = (self.OP_PROFILE.format(op=op, usec=100) if profile else "") + body
+        for name, text in logs.items():
             write(os.path.join(d, f"test_{name}.log"), text)
         return d
 
@@ -139,6 +145,32 @@ class VerdictTest(unittest.TestCase):
         d = self.ops_dir(["test ADD rc=0 10/10 tests passed", "test SUB rc=0 4/4 tests passed", "metadata rc=1 grew"])
         self.assertEqual(self.run_verdict("--ops", d), FAIL, self.output)
 
+    def test_ops_over_budget(self):
+        rows = ["test ADD rc=0 10/10 tests passed", "test SUB rc=0 4/4 tests passed"]
+        d = self.ops_dir(rows, logs={"ADD": self.OP_PROFILE.format(op="CONV_2D", usec=86000)})
+        self.assertEqual(self.run_verdict("--ops", d, "--known-budget", os.devnull), FAIL, self.output)
+        self.assertIn("over the op budget", self.output)
+
+    def test_ops_yielding_over_budget(self):
+        # an op that releases VTCM/HMX inside is left to the probe
+        rows = ["test ADD rc=0 10/10 tests passed", "test SUB rc=0 4/4 tests passed"]
+        d = self.ops_dir(rows, logs={"ADD": self.OP_PROFILE.format(op="SOFT_MAX", usec=86000)})
+        self.assertEqual(self.run_verdict("--ops", d, "--known-budget", os.devnull), PASS, self.output)
+
+    def test_ops_over_budget_known(self):
+        rows = ["test ADD rc=0 10/10 tests passed", "test SUB rc=0 4/4 tests passed"]
+        d = self.ops_dir(rows, logs={"ADD": self.OP_PROFILE.format(op="CONV_2D", usec=86000)})
+        known = os.path.join(self.d, "budget.txt")
+        write(known, "# comment\nCONV_2D ^1:1\s->\s1:1\s a reason\n")
+        self.assertEqual(self.run_verdict("--ops", d, "--known-budget", known), PASS, self.output)
+        write(known, "CONV_2D ^2:2 another shape\n")
+        self.assertEqual(self.run_verdict("--ops", d, "--known-budget", known), FAIL, self.output)
+
+    def test_ops_without_profile(self):
+        d = self.ops_dir(["test ADD rc=0 10/10 tests passed", "test SUB rc=0 4/4 tests passed"], profile=False)
+        self.assertEqual(self.run_verdict("--ops", d), FAIL, self.output)
+        self.assertIn("no profile-op lines", self.output)
+
     # --long
 
     def long_dir(self, rows, logs):
@@ -177,6 +209,30 @@ class VerdictTest(unittest.TestCase):
 
     def test_compare_pass(self):
         self.assertEqual(self.compare(compare_summary()), PASS, self.output)
+
+    def vlm_summary(self, logs):
+        text = compare_summary() + "## vlm 2026-11-20T00:00:00Z\nvlm new HTP1 rc=0 md5=eeee\nvlm new HTP0 rc=0 md5=eeee\n"
+        for name, body in logs.items():
+            write(os.path.join(self.d, f"vlm_new_{name}.err"), body)
+        return text
+
+    def test_compare_vlm(self):
+        logs = {d: self.OP_PROFILE.format(op="UPSCALE", usec=8000) for d in ("HTP0", "HTP1")}
+        self.assertEqual(self.compare(self.vlm_summary(logs)), PASS, self.output)
+
+    def test_compare_vlm_over_budget(self):
+        logs = {"HTP0": self.OP_PROFILE.format(op="UPSCALE", usec=8000),
+                "HTP1": self.OP_PROFILE.format(op="CONV_2D", usec=86000)}
+        self.assertEqual(self.compare(self.vlm_summary(logs)), FAIL, self.output)
+        self.assertIn("compare: vlm: over the op budget", self.output)
+
+    def test_compare_vlm_without_logs(self):
+        self.assertEqual(self.compare(self.vlm_summary({})), FAIL, self.output)
+
+    def test_compare_vlm_interrupted(self):
+        text = self.vlm_summary({"HTP1": self.OP_PROFILE.format(op="UPSCALE", usec=8000)})
+        text = text.replace("vlm new HTP0 rc=0 md5=eeee\n", "")
+        self.assertEqual(self.compare(text), FAIL, self.output)
 
     def test_compare_new_only(self):
         self.assertEqual(self.compare(compare_summary(two=False)), PASS, self.output)

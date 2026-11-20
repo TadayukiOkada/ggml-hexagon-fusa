@@ -10,12 +10,15 @@ The yields column is how often the ops of a group gave VTCM/HMX away inside
 the op because another client asked ("-" for logs from builds that do not
 report it): it shows that a release inside an op really happened in that run.
 --min-yields OP=N (with --fail) requires at least N of them in the ops named OP.
+--exempt OP=REGEX (repeatable) marks the groups of OP (or OP:tag) whose "dims  types" match REGEX
+with xx and leaves them out of --fail: known over-budget groups that do not occur in real graphs
+(tests/known-over-budget.txt, read by scripts/verdict.py --ops).
 Ops that release VTCM/HMX inside the op when built with
 GGML_HEXAGON_HTP_YIELD_IN_CPY / _IN_OPS / _BETWEEN_OPS (--yielding, see YIELDING) are marked
 ~~ instead: their op time is not the time the resources are held, at least on
 the paths that yield. For builds without those options pass --yielding "".
 
-usage: scripts/op-budget.py [--budget-ms 25] [--top 30] [--fail] [--min-yields OP=N] LOG...
+usage: scripts/op-budget.py [--budget-ms 25] [--top 30] [--fail] [--min-yields OP=N] [--exempt OP=REGEX] LOG...
        (reads stdin when no LOG is given)
 """
 
@@ -93,7 +96,26 @@ def main():
                     help="exit with 1 when any other op exceeds the budget or a --min-yields is not met")
     ap.add_argument("--min-yields", action="append", default=[], metavar="OP=N",
                     help="expect at least N yields inside the ops named OP, or OP:tag (repeatable)")
+    ap.add_argument("--exempt", action="append", default=[], metavar="OP=REGEX",
+                    help="leave groups of OP (or OP:tag) whose 'dims  types' match REGEX out of --fail (repeatable)")
     args = ap.parse_args()
+
+    exempt = []
+    for spec in args.exempt:
+        name, _, rx = spec.partition("=")
+        if not name or not rx:
+            ap.error(f"--exempt {spec}: expected OP=REGEX")
+        try:
+            exempt.append([name, re.compile(rx), 0])
+        except re.error as e:
+            ap.error(f"--exempt {spec}: {e}")
+
+    def exempted(op, dims, types, tg):
+        hit = None
+        for e in exempt:
+            if e[0] in (op, f"{op}:{tg}") and e[1].search(f"{dims}  {types}"):
+                hit = e
+        return hit
 
     need = []
     for spec in args.min_yields:
@@ -118,18 +140,29 @@ def main():
     budget_us = args.budget_ms * 1000.0
     rows = sorted(groups.items(), key=lambda kv: max(kv[1]), reverse=True)
     yielding = {o.strip() for o in args.yielding.split(",") if o.strip()}
-    over = [r for r in rows if max(r[1]) > budget_us and not is_yielding(r[0][1], r[0][4], yielding)]
+    over_all = [r for r in rows if max(r[1]) > budget_us and not is_yielding(r[0][1], r[0][4], yielding)]
     over_y = [r for r in rows if max(r[1]) > budget_us and is_yielding(r[0][1], r[0][4], yielding)]
+    over = []
+    for r in over_all:
+        e = exempted(r[0][1], r[0][2], r[0][3], r[0][4])
+        if e:
+            e[2] += 1
+        else:
+            over.append(r)
 
     print(f"{'':2}{'max ms':>9} {'p95 ms':>9} {'mean ms':>9} {'count':>7} {'yields':>7}  op  dims  types  tag")
     for (dev, op, dims, types, tg), us in rows[: args.top or None]:
-        flag = ("~~" if is_yielding(op, tg, yielding) else "!!") if max(us) > budget_us else ""
+        flag = ""
+        if max(us) > budget_us:
+            flag = "~~" if is_yielding(op, tg, yielding) else "xx" if exempted(op, dims, types, tg) else "!!"
         key = (dev, op, dims, types, tg)
         ys = str(yields[key]) if key in yields else "-"
         print(f"{flag:2}{max(us) / 1000:9.2f} {p95(us) / 1000:9.2f} {sum(us) / len(us) / 1000:9.2f} {len(us):7d} {ys:>7}  "
               f"{dev} {op}  {dims}  {types}  {tg}")
     print(f"\n{len(over)} of {len(rows)} op groups exceed {args.budget_ms:g} ms"
           f" (plus {len(over_y)} of the yielding ops {','.join(sorted(yielding))})")
+    for name, rx, hits in exempt:
+        print(f"exempt {name} {rx.pattern}: {hits} group(s) over the budget")
     short = False
     if yields:
         print(f"{sum(yields.values())} yields inside ops")

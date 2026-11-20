@@ -8,8 +8,8 @@
 # groups (default: all of the mode's, in this order)
 #   ops      device-tests.sh --ops (every supported op against the CPU)          --evk only
 #   long     device-tests.sh --long --leak (single ops of tens of ms), probed    --evk only
-#   compare  compare-packages.sh leak llm bench prefill asr sv servers, one step at a time;
-#            prefill, asr and servers probed on --evk
+#   compare  compare-packages.sh leak llm bench prefill asr sv servers vlm, one step at a time;
+#            prefill, asr, servers and vlm probed on --evk (vlm on both cDSPs)
 #   extra    300 s NeMo CLI input and a Gemma prefill of about 2k tokens (new package), probed
 #            on --evk; on --fusa only the 300 s input, unprobed
 #
@@ -44,12 +44,19 @@ if [ $mode = --evk ] && [ -n "${PROBE:-}" ] && [ ! -x "$PROBE/vtcmlat" ]; then
     echo "target-suite: PROBE=$PROBE has no vtcmlat" >&2; exit 2
 fi
 
-probe_loop() { # name pid: probe in 60 s chunks while pid runs (a probe holds VTCM/HMX only briefly)
+probe_loop() { # name pid: probe in 60 s chunks while pid runs (a probe holds VTCM/HMX only briefly),
+    # on each cDSP of $doms at the same time
     i=0
     while kill -0 "$2" 2> /dev/null; do
-        LD_LIBRARY_PATH="$PROBE:${LD_LIBRARY_PATH:-}" ADSP_LIBRARY_PATH="$PROBE;${ADSP_LIBRARY_PATH:-}" \
-            "$PROBE/vtcmlat" -d cdsp -p 50000 -H 800 -n 1200 -P -20 -t 2000000 -o "$out/probe/$1_$i.csv" \
-            > "$out/probe/$1_$i.csv.log" 2>&1
+        pids=""
+        for dom in ${doms:-cdsp}; do
+            sfx=$([ "$dom" = cdsp ] && echo "" || echo "_$dom")
+            LD_LIBRARY_PATH="$PROBE:${LD_LIBRARY_PATH:-}" ADSP_LIBRARY_PATH="$PROBE;${ADSP_LIBRARY_PATH:-}" \
+                "$PROBE/vtcmlat" -d "$dom" -p 50000 -H 800 -n 1200 -P -20 -t 2000000 -o "$out/probe/$1${sfx}_$i.csv" \
+                > "$out/probe/$1${sfx}_$i.csv.log" 2>&1 &
+            pids="$pids $!"
+        done
+        for p in $pids; do wait "$p"; done # only the probes: the step's status is collected by run()
         i=$((i + 1))
     done
 }
@@ -79,21 +86,21 @@ for g in $groups; do
     ops)
         probe=0 run ops ops sh "$here/device-tests.sh" "$new" "$out/ops" --ops ;;
     long)
-        probe=1 run long long sh "$here/device-tests.sh" "$new" "$out/long" --long --leak ;;
+        doms=cdsp probe=1 run long long sh "$here/device-tests.sh" "$new" "$out/long" --long --leak ;;
     compare)
-        for s in ${STEPS:-leak llm bench prefill asr sv servers}; do
-            case $s in prefill|asr|servers) p=1 ;; *) p=0 ;; esac
-            probe=$p run compare "$s" sh "$here/compare-packages.sh" "$new" "$old" "$kit" "$out/compare" "$s"
+        for s in ${STEPS:-leak llm bench prefill asr sv servers vlm}; do
+            case $s in prefill|asr|servers) p=1 d=cdsp ;; vlm) p=1 d="cdsp cdsp1" ;; *) p=0 d=cdsp ;; esac
+            doms=$d probe=$p run compare "$s" sh "$here/compare-packages.sh" "$new" "$old" "$kit" "$out/compare" "$s"
             if grep -Eq 'rc=-?[1-9]|alive=(nemo|sv)' "$out/compare/summary.txt"; then
                 echo "STOP compare $s: failure in the summary $(now)" >> "$steps"; exit 1
             fi
         done ;;
     extra)
-        probe=1 run extra asr300 env ASR_DEVICE=HTP0 timeout 1200 "$new/run-asr.sh" \
+        doms=cdsp probe=1 run extra asr300 env ASR_DEVICE=HTP0 timeout 1200 "$new/run-asr.sh" \
             "$kit/models/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf" "$kit/audio/l300.wav" --language ja-JP --json
         if [ $mode = --evk ] && [ -f "$kit/models/gemma-4-E2B_q4_0-it.gguf" ]; then
             head -c 9000 "$kit/prompts/long_prompt.txt" > "$out/prompt2k.txt"
-            probe=1 run extra gemma2k timeout 600 "$new/run.sh" llama-completion -m "$kit/models/gemma-4-E2B_q4_0-it.gguf" \
+            doms=cdsp probe=1 run extra gemma2k timeout 600 "$new/run.sh" llama-completion -m "$kit/models/gemma-4-E2B_q4_0-it.gguf" \
                 -ngl 99 -dev HTP0 -no-cnv --temp 0 -n 4 -c 4096 -f "$out/prompt2k.txt"
         fi ;;
     esac

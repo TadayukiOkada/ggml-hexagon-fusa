@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests of the yield count in scripts/op-budget.py, on synthetic profile-op lines.
+"""Offline tests of the yield count and exemptions in scripts/op-budget.py, on synthetic profile-op lines.
 
   python3 -m unittest discover -s tests/release -v
 """
@@ -53,6 +53,19 @@ class OpBudgetYieldsTest(unittest.TestCase):
         self.assertEqual([line for line in r.stdout.splitlines() if " MUL_MAT " in line][0].split()[4], "-")
         # an expectation cannot be met by a log that does not report yields
         self.assertEqual(run(text, "--fail", "--min-yields", "MUL_MAT=1").returncode, 1)
+
+    def test_exempt(self):
+        text = MM.format(usec=90000, tail=" yields 0")
+        self.assertEqual(run(text, "--fail", "--yielding", "").returncode, 1)
+        r = run(text, "--fail", "--yielding", "", "--exempt", r"MUL_MAT:hmx-tiled=^1024:3584\sx\s1024:512\s")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("1 group(s) over the budget", r.stdout)
+        self.assertTrue([l for l in r.stdout.splitlines() if l.startswith("xx")], r.stdout)
+        # another tag or shape does not match
+        self.assertEqual(run(text, "--fail", "--yielding", "", "--exempt", "MUL_MAT:hvx-tiled=.").returncode, 1)
+        self.assertEqual(run(text, "--fail", "--yielding", "", "--exempt", "MUL_MAT=^2048:").returncode, 1)
+        self.assertEqual(run(text, "--exempt", "MUL_MAT").returncode, 2)
+        self.assertEqual(run(text, "--exempt", "MUL_MAT=(").returncode, 2)
 
     def test_bad_spec(self):
         self.assertEqual(run(MM.format(usec=1, tail=""), "--min-yields", "MUL_MAT").returncode, 2)

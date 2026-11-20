@@ -1,6 +1,6 @@
 # Test kit for scripts/compare-packages.sh and device-tests.sh --bench: file, size, SHA-256, use.
 # The files are not in this repository (model weights and recorded speech have their own terms);
-# any copy with the same SHA-256 works. Keep the layout: <kit>/models, <kit>/audio, <kit>/prompts.
+# any copy with the same SHA-256 works. Keep the layout: <kit>/models, <kit>/audio, <kit>/prompts, <kit>/images.
 # 16 kHz mono PCM16 WAV for all audio.
 models/Qwen3-0.6B-Q4_0.gguf  382156480  33bcc57074ec7b6eada5a90651ee546ec0c2b271002c22baf9f1b2dd1e8f75cb  llm, bench, prefill
 models/Qwen3.5-0.8B-Q4_0.gguf  563036064  57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf  llm, bench (GATED_DELTA_NET)
@@ -11,6 +11,9 @@ models/gemma-4-E2B_q4_0-it.gguf  3349516256  fa401b55b07ee70a54c6dae3903c783a6e6
 models/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf  742090464  3fc991d3badad7277c11030a7519832cddaf2057aafed6d4b25147e953a070b1  asr, servers (NeMo-Speech.cpp)
 models/sensevoice-small-q8.gguf  254208320  4ae45c94422de949b387e2e0fb10d7e14e4c42c69db30c3444ecc7d4b844b7c5  sv, servers (SenseVoice)
 models/fsmn-vad.gguf  1720512  1270f2559c495f4e7b6e739541151027d360761a3fda43fc147034f5719f5479  run-sensevoice.sh --vad
+models/LFM2.5-VL-450M-Q4_0.gguf  219311264  6d2757dd0f0b98aea7dc90477bb5b3a0df1089be85ef92943f8cecb05121ccbf  vlm (LiquidAI/LFM2.5-VL-450M-GGUF)
+models/mmproj-LFM2.5-VL-450m-Q8_0.gguf  102815168  ebfc428baa37efad8bae93864f914b2634a09009f91ad59f974fe1a1565d8561  vlm (its SigLIP2 vision encoder)
+images/coco_000000002261.jpg  197814  1a0ad595a5675bdc7a5e95c04def56109c00d61168fd826158322fd538d70279  vlm: COCO 2017 image 2261, 640x427 (resized position embeddings, 16x16 -> 38x26)
 prompts/prompt12k.txt  49623  a8962ff2d6f0778d43d336c10b02680a571d2323ad50f24bc4fe98e12245242f  prefill (tests/data/long_prompt.txt x 7, 12676 tokens for Qwen3-0.6B)
 prompts/prompt512.txt  2600  d52f04dd44e7a89a8b3fe58ff55df37a034665421fd050459ffecf7b55d0b3ab  first 2600 bytes of tests/data/long_prompt.txt (664 tokens)
 audio/ja_second.wav  244558  2392edc31fe111c7873e4bb020f1ed53428fe3cc5c8f0642f6ed9fd07e979cc1  asr: Japanese speech, about 7.6 s
