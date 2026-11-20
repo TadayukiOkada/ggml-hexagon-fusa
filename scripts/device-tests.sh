@@ -56,12 +56,15 @@ echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$summary"
 if [ $ops -eq 1 ]; then
     run 300 "$out/support.log" test-backend-ops-hex support -b HTP0
     # the fused-graph tests of tests/patches have names of their own, which the support run does not list
-    fused="F16_DIV_PRECISION FA_SINK_NORMALIZATION GDN_DECAY LORA_FUSION MUL_MAT_ADD_RESIDUAL MUL_MAT_GLU MUL_MAT_SOFTCAP
-        NORM_MUL_MAT RMS_NORM_ADD_SCALE RMS_NORM_ROPE"
+    # LORA_FUSION_UNFUSED: the LORA_FUSION cases with the chains left unfused (GGML_HEXAGON_LORA_UNFUSED),
+    # the adapter weights flat on the flat-weight matmuls, as when a fused op does not fit
+    fused="F16_DIV_PRECISION FA_SINK_NORMALIZATION GDN_DECAY LORA_FUSION LORA_FUSION_UNFUSED MUL_MAT_ADD_RESIDUAL
+        MUL_MAT_GLU MUL_MAT_SOFTCAP NORM_MUL_MAT RMS_NORM_ADD_SCALE RMS_NORM_ROPE"
     { grep -aoE '^  [A-Z_0-9]+\(' "$out/support.log" | tr -d ' ('; printf '%s\n' $fused; } | sort -u > "$out/ops.txt"
     echo "ops: $(wc -l < "$out/ops.txt")" | tee -a "$summary"
     for op in $(cat "$out/ops.txt"); do
-        GGML_HEXAGON_PROFILE=1 run 3600 "$out/test_$op.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$op"
+        o=${op%_UNFUSED}; unfused=0; [ "$o" != "$op" ] && unfused=1
+        GGML_HEXAGON_LORA_UNFUSED=$unfused GGML_HEXAGON_PROFILE=1 run 3600 "$out/test_$op.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$o"
         rc=$?
         echo "test $op rc=$rc $(grep -aE '[0-9]+/[0-9]+ tests passed' "$out/test_$op.log" | tail -1 | tr -s ' ')" | tee -a "$summary"
         [ $rc -ne 0 ] && sleep "$pause"

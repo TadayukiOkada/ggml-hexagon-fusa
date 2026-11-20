@@ -37,6 +37,7 @@ extern int    opt_optrace;
 extern int    opt_oppoll;
 extern int    opt_opfusion;
 extern int    opt_rt_repack;
+extern int    opt_lora_unfused; // test hook: LoRA weights stay flat, the chains are not fused
 
 #ifndef HEX_VERBOSE
 #define HEX_VERBOSE(...) \
@@ -80,7 +81,7 @@ static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
 }
 
 static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {
-    if (opt_rt_repack == 0) {
+    if (opt_rt_repack == 0 || (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_FLAT)) {
         return false;
     }
     if (t->buffer) {

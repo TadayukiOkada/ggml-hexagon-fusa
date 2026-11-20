@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 6ddc3bf..2c01211 100644
+index 6ddc3bf..15a5da3 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -6429,6 +6429,129 @@ struct test_rms_norm_rope : public test_case {
@@ -132,7 +132,7 @@ index 6ddc3bf..2c01211 100644
  // GGML_OP_OUT_PROD
  struct test_out_prod : public test_case {
      const ggml_type type_a;
-@@ -14136,6 +14259,67 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -14136,6 +14259,98 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -195,6 +195,37 @@ index 6ddc3bf..2c01211 100644
 +    for (int64_t n : {1, 2, 64}) {
 +        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_0, GGML_TYPE_F16, 256, 256, n, 16, 1, 1.5f, false, 0, false, 0, true));
 +        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_F16, GGML_TYPE_F16, 48, 256, n, 8, 1, 1.5f, false, 0, false, 0, false));
++    }
++
++    // Model-sized shapes (Gemma 4 E2B: hidden 1536, FFN 6144): several K and N chunks, HMX row chunks
++    for (int64_t n : {1, 4, 128, 512}) {
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_0, GGML_TYPE_F16, 1536, 1536, n, 16, 1, 2.0f));
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_F16,  GGML_TYPE_F16, 1536, 1536, n, 16, 1, 2.0f));
++    }
++    for (int64_t n : {1, 128}) {
++        test_cases.emplace_back(new test_lora_fusion(1, GGML_TYPE_Q4_0, GGML_TYPE_F16, 1536, 1536, n, 16, 1, 1.5f, true, 0, false, 7));
++        test_cases.emplace_back(new test_lora_fusion(2, GGML_TYPE_Q4_0, GGML_TYPE_F16, 1536, 6144, n, 16, 1, 1.5f, true, 1, false));
++    }
++
++    // Ranks up to the limit the fusion takes (256)
++    for (int64_t r : {128, 256}) {
++        for (int64_t n : {1, 128}) {
++            test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_0, GGML_TYPE_F16, 1536, 1536, n, r, 1, 1.5f));
++        }
++    }
++
++    // 3 and 4 stacked adapters on one matmul (4 is the limit)
++    for (int n_lora : {3, 4}) {
++        for (int64_t n : {1, 128}) {
++            test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_0, GGML_TYPE_F16, 256, 256, n, 16, n_lora, 1.5f));
++        }
++    }
++
++    // Other repacked base weight types
++    for (ggml_type type_w : {GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL, GGML_TYPE_BF16}) {
++        for (int64_t n : {1, 128}) {
++            test_cases.emplace_back(new test_lora_fusion(0, type_w, GGML_TYPE_F16, 256, 256, n, 16, 1, 1.5f));
++        }
 +    }
 +
      // matmul + residual (fusable into the HMX store) and matvec + logit softcap (fusable into the
