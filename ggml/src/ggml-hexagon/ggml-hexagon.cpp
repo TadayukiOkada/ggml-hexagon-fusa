@@ -158,6 +158,7 @@ int    opt_oppoll    = 0;    // batch completions: 0 = blocking, 1 = spin, 2 = s
 int    opt_opfusion  = 1;    // enable/disable op fusion
 static int opt_qrecover = 1; // re-create a dspqueue whose blocking reads busy-wait (0 = off, 2 = after every sync, for testing)
 static int opt_diag_wait = 10; // seconds without a batch response before asking the DSP where it is (0 = never)
+int    opt_lora_unfused = 0;
 int    opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = all tileable weights (default)
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
@@ -2844,11 +2845,18 @@ static void ggml_hexagon_tensor_repack(ggml_tensor * tensor, ggml_hexagon_sessio
     ggml_hexagon_tensor_set_flags(tensor, HTP_TENSOR_TILED);
 }
 
-static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_session * sess,
-                                      std::unordered_set<const struct ggml_tensor *> * skipped_out = nullptr) {
-    std::unordered_set<const struct ggml_tensor *> lora_weights;
+// LoRA A/B weights stay in the standard layout for good (HTP_TENSOR_FLAT): the fused LoRA ops read
+// them as rows, and a graph that leaves a chain unfused runs those matmuls on the flat-weight
+// kernels. Tiling them once would rule out fusion for every later graph.
+static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_session * sess) {
     if (htp_fusion_enabled(HTP_FUSE_LORA) && htp_session_mdev_count(sess) <= 1) {
+        std::unordered_set<const struct ggml_tensor *> lora_weights;
         htp_fusion_collect_lora_weights(graph, lora_weights);
+        for (const ggml_tensor * w : lora_weights) {
+            if (!ggml_hexagon_tensor_is_tiled(w)) {
+                ggml_hexagon_tensor_set_flags(const_cast<ggml_tensor *>(w), HTP_TENSOR_FLAT);
+            }
+        }
     }
 
     for (int i = 0; i < graph->n_nodes; ++i) {
@@ -2857,12 +2865,6 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
             continue;
         }
         if (n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) {
-            if (!lora_weights.empty() && lora_weights.count(n->src[0]) != 0) {
-                if (skipped_out) {
-                    skipped_out->insert(n->src[0]);
-                }
-                continue;
-            }
             ggml_hexagon_tensor_repack(n->src[0], sess);
         }
     }
@@ -2884,8 +2886,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     if (cache_hit) {
         nodes_ptr = &sess->cached_nodes;
     } else {
-        std::unordered_set<const struct ggml_tensor *> skipped_lora_weights;
-        ggml_hexagon_graph_repack(graph, sess, &skipped_lora_weights);
+        ggml_hexagon_graph_repack(graph, sess);
 
         htp_fusion_tag_graph(graph);
 
@@ -2910,15 +2911,6 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
         htp_fusion_elide_gdn_state_rows(sess, graph, computed_nodes);
         htp_fusion_lora(sess, graph, computed_nodes);
-
-        if (!skipped_lora_weights.empty()) {
-            for (const auto & node : computed_nodes) {
-                if ((node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) && !node.inputs.empty() &&
-                    skipped_lora_weights.count(node.inputs[0]) != 0) {
-                    ggml_hexagon_tensor_repack(const_cast<struct ggml_tensor *>(node.inputs[0]), sess);
-                }
-            }
-        }
 
         if (graph->uid != 0) {
             sess->cached_uid   = graph->uid;
@@ -3943,6 +3935,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_qrecover = getenv("GGML_HEXAGON_QRECOVER");
     const char * str_diag_wait = getenv("GGML_HEXAGON_DIAG_WAIT");
     const char * str_rt_repack = getenv("GGML_HEXAGON_RT_REPACK");
+    const char * str_lora_unfused = getenv("GGML_HEXAGON_LORA_UNFUSED");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4013,6 +4006,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_qrecover  = str_qrecover ? atoi(str_qrecover)                     : opt_qrecover;
     opt_diag_wait = str_diag_wait ? atoi(str_diag_wait)                   : opt_diag_wait;
     opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
+    opt_lora_unfused = str_lora_unfused ? atoi(str_lora_unfused)          : opt_lora_unfused;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     if (str_power_mode) {

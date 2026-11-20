@@ -1,6 +1,7 @@
 #define _USE_MATH_DEFINES
 
 #include "htp-kparams.h"
+#include "htp-budget.h"
 #include "htp-opnode.h"
 #include "ggml-impl.h"
 
@@ -1291,6 +1292,33 @@ static bool htp_lora_check_weight_tensor(const struct ggml_tensor * t) {
     return true;
 }
 
+// The fused op holds VTCM for all its weights and adapters at once, while the op budget
+// (htp-budget.cpp) judged each matmul of the chain on its own. Same estimate as for a weight there:
+// 5 TFLOP/s or 45 GB/s of weight bytes, whichever bounds it. Only for kernels without a yield point.
+static bool htp_lora_fused_within_budget(const struct ggml_tensor * const * weights, int32_t n_weights,
+                                         const struct htp_lora_adapter_desc * loras, int32_t n_loras,
+                                         uint32_t m) {
+    if (opt_op_budget_ms <= 0) {
+        return true;
+    }
+    double flops = 0.0;
+    double bytes = 0.0;
+    for (int32_t p = 0; p < n_weights; ++p) {
+        flops += 2.0 * (double) weights[p]->ne[0] * (double) weights[p]->ne[1] * m;
+        bytes += (double) ggml_nbytes(weights[p]);
+    }
+    for (int32_t l = 0; l < n_loras; ++l) {
+        flops += 2.0 * ((double) ggml_nelements(loras[l].a) + (double) ggml_nelements(loras[l].b)) * m;
+        bytes += (double) ggml_nbytes(loras[l].a) + (double) ggml_nbytes(loras[l].b);
+    }
+    const double est = (std::max)(flops / 5.0e9, bytes / 45.0e6);
+    if (est > opt_op_budget_ms) {
+        HEX_VERBOSE("ggml-hex: skip LoRA fusion: estimated %.1f ms > budget %.1f ms\n", est, opt_op_budget_ms);
+        return false;
+    }
+    return true;
+}
+
 bool htp_kparams_solve_matmul_lora(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * const * weights,
@@ -1435,6 +1463,11 @@ bool htp_kparams_solve_matmul_lora(
                               hmx_scales_ok && (act->type == GGML_TYPE_F32 || act->type == GGML_TYPE_F16) &&
                               (!glu || !(is_tiled && wtype == GGML_TYPE_F16));
     if (hmx_eligible) {
+#ifndef GGML_HEXAGON_HTP_YIELD_IN_OPS
+        if (!htp_lora_fused_within_budget(weights, n_weights, loras, n_loras, act_nrows)) {
+            return false;
+        }
+#endif
         const uint32_t k_padded          = (uint32_t) hex_round_up((int) k, 32);
         const uint32_t m_padded          = (uint32_t) hex_round_up((int) act_nrows, 32);
         const uint32_t max_n_padded      = (uint32_t) hex_round_up((int) max_n, 32);
@@ -1493,6 +1526,9 @@ bool htp_kparams_solve_matmul_lora(
         return false;
     }
     if ((k % htp_tensor_get_tile_k(wtype)) != 0) {
+        return false;
+    }
+    if (!htp_lora_fused_within_budget(weights, n_weights, loras, n_loras, act_nrows)) {
         return false;
     }
 

@@ -1249,7 +1249,7 @@ static bool htp_lora_rows_collapsible(const ggml_tensor * t) {
 void htp_fusion_lora(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph,
                      std::vector<struct htp_opnode> & nodes) {
     GGML_UNUSED(graph);
-    if (!opt_opfusion || !htp_fusion_enabled(HTP_FUSE_LORA) || htp_session_mdev_count(sess) > 1) {
+    if (!opt_opfusion || !htp_fusion_enabled(HTP_FUSE_LORA) || htp_session_mdev_count(sess) > 1 || opt_lora_unfused) {
         return;
     }
 
