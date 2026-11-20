@@ -195,6 +195,20 @@ bool htp_kparams_solve_upscale(
     struct htp_upscale_kernel_params * kparams
 );
 
+// Upscale cost model, per element on one HVX thread of v73 (QCS9075, GGML_HEXAGON_PROFILE of the
+// UPSCALE cases of test-backend-ops), rounded up: an output of the vector kernels (2x nearest and
+// bilinear: 0.55-0.6 ns) or of a pass over a source row, an output of one gathered tap (bilinear 2
+// taps, antialiased 3 taps: 3.1-3.3 ns) and a source element staged by DMA from a strided source
+// (SigLIP2 position embeddings, 16x16 x 1152 permuted, to 38x26: about 31 ns). Rounds take about
+// HTP_UPSCALE_ROUND_MS.
+#define HTP_UPSCALE_NS_VECTOR  0.75
+#define HTP_UPSCALE_NS_GATHER  4.0
+#define HTP_UPSCALE_NS_STRIDED 40.0
+#define HTP_UPSCALE_ROUND_MS   2.0
+
+double htp_upscale_chunk_ms(const struct htp_upscale_kernel_params * kp, const struct ggml_tensor * src0,
+                            const struct ggml_tensor * dst);
+
 static inline bool htp_kparams_solve_upscale(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,

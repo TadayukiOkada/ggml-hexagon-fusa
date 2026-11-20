@@ -3161,10 +3161,13 @@ bool htp_kparams_solve_upscale(
     const float inv_sf2 = 1.0f / sf2;
     const float inv_sf3 = 1.0f / sf3;
 
-    const float filter_radius0 = antialias ? (std::max)(1.0f, inv_sf0) : 0.0f;
-    const float filter_radius1 = antialias ? (std::max)(1.0f, inv_sf1) : 0.0f;
-    const float invscale0      = antialias ? (1.0f / filter_radius0) : 0.0f;
-    const float invscale1      = antialias ? (1.0f / filter_radius1) : 0.0f;
+    // Support radius of the filter: the triangle of antialiased bilinear (at least 1 pixel), the
+    // cubic (2 pixels). The source rows a band of output rows needs are sized from it.
+    const bool  bicubic        = mode_raw == HTP_UPSCALE_MODE_BICUBIC;
+    const float filter_radius0 = antialias && !bicubic ? (std::max)(1.0f, inv_sf0) : bicubic ? 2.0f : 0.0f;
+    const float filter_radius1 = antialias && !bicubic ? (std::max)(1.0f, inv_sf1) : bicubic ? 2.0f : 0.0f;
+    const float invscale0      = antialias && !bicubic ? (1.0f / filter_radius0) : 0.0f;
+    const float invscale1      = antialias && !bicubic ? (1.0f / filter_radius1) : 0.0f;
 
     const uint32_t total_slices = dst_z * dst_w;
     uint32_t       n_hvx        = htp_session_n_hvx(sess);
@@ -3182,23 +3185,19 @@ bool htp_kparams_solve_upscale(
         return false;
     }
 
-    size_t lut_x_size = 0;
-    size_t elem_y_sz  = sizeof(uint32_t);
-    if (mode_raw == HTP_UPSCALE_MODE_BICUBIC) {
-        lut_x_size = hex_round_up(dst_x * sizeof(struct upscale_bicubic_x), 128);
-        elem_y_sz  = sizeof(struct upscale_bicubic_y);
+    uint32_t taps0 = 0, taps1 = 0;
+    if (bicubic) {
+        taps0 = taps1 = HTP_UPSCALE_BICUBIC_TAPS;
     } else if (antialias) {
-        lut_x_size = hex_round_up(dst_x * sizeof(struct upscale_antialias_x), 128);
-        elem_y_sz  = sizeof(struct upscale_antialias_y);
-    } else if (mode_raw == HTP_UPSCALE_MODE_BILINEAR) {
-        const uint32_t n_chunks = (dst_x + 31) / 32;
-        lut_x_size = hex_round_up(n_chunks * sizeof(struct upscale_bilinear_x_chunk), 128);
-        elem_y_sz  = sizeof(struct upscale_bilinear_y);
-    } else {
-        lut_x_size = hex_round_up(dst_x * sizeof(uint32_t), 128);
+        taps0 = htp_upscale_antialias_taps(filter_radius0);
+        taps1 = htp_upscale_antialias_taps(filter_radius1);
     }
-    const size_t total_lut_size = lut_x_size + hex_round_up(dst_y * elem_y_sz, 128);
-    if (total_lut_size > HTP_DDR_SPAD_SIZE) {
+    if (taps0 > UINT16_MAX || taps1 > UINT16_MAX) {
+        return false;
+    }
+    size_t lut_x_size, lut_y_size, lut_wy_size;
+    htp_upscale_lut_sizes(mode_raw, antialias, dst_x, dst_y, taps0, taps1, &lut_x_size, &lut_y_size, &lut_wy_size);
+    if (lut_x_size + lut_y_size + lut_wy_size > HTP_DDR_SPAD_SIZE) {
         return false;
     }
 
@@ -3272,7 +3271,56 @@ bool htp_kparams_solve_upscale(
     kparams->div_chunks_per_slice = init_fastdiv_values(chunks_per_slice > 0 ? chunks_per_slice : 1);
     kparams->div_dst_z            = init_fastdiv_values(dst_z > 0 ? dst_z : 1);
 
+    kparams->taps0                = (uint16_t) taps0;
+    kparams->taps1                = (uint16_t) taps1;
+
+    // Rounds of about HTP_UPSCALE_ROUND_MS per HVX thread (one chunk per thread at least)
+    const double   chunk_ms        = htp_upscale_chunk_ms(kparams, src0, dst);
+    const uint32_t chunks_per_hvx  = (uint32_t) (std::max)(1.0, std::floor(HTP_UPSCALE_ROUND_MS / chunk_ms));
+    kparams->chunks_per_round     = (uint32_t) (std::min)((uint64_t) total_chunks, (uint64_t) chunks_per_hvx * n_hvx);
+
     return true;
+}
+
+// Time of one chunk on one HVX thread (ms), for the rounds and the op budget. Each output row of a
+// chunk costs its outputs in whole vectors of 32 (a gather per tap, or a vector store) plus, for
+// the kernels that first combine source rows into a row buffer, a vector pass over the source row
+// per row combined. A source with strided elements (a permuted tensor) is staged by DMA one element
+// at a time.
+double htp_upscale_chunk_ms(const struct htp_upscale_kernel_params * kp, const struct ggml_tensor * src0,
+                            const struct ggml_tensor * dst) {
+    const double src_x  = (double) src0->ne[0];
+    const double dst_xv = (double) ((dst->ne[0] + 31) / 32 * 32);
+    double out_ns = 0.0, row_ns = 0.0;
+    switch (kp->kernel_type) {
+        case HTP_UPSCALE_KERNEL_NEAREST_2X:
+        case HTP_UPSCALE_KERNEL_NEAREST_4X:
+        case HTP_UPSCALE_KERNEL_BILINEAR_2X:
+            out_ns = HTP_UPSCALE_NS_VECTOR;
+            break;
+        case HTP_UPSCALE_KERNEL_NEAREST:
+            out_ns = HTP_UPSCALE_NS_GATHER;
+            row_ns = HTP_UPSCALE_NS_VECTOR;
+            break;
+        case HTP_UPSCALE_KERNEL_BILINEAR:
+            out_ns = 2 * HTP_UPSCALE_NS_GATHER;
+            row_ns = 2 * HTP_UPSCALE_NS_VECTOR;
+            break;
+        case HTP_UPSCALE_KERNEL_BILINEAR_AA:
+        case HTP_UPSCALE_KERNEL_BICUBIC:
+        default:
+            out_ns = kp->taps0 * HTP_UPSCALE_NS_GATHER;
+            row_ns = kp->taps1 * HTP_UPSCALE_NS_VECTOR;
+            break;
+    }
+    double ns = kp->dst_nrows_per_chunk * (dst_xv * out_ns + src_x * row_ns);
+    if (src0->nb[0] != sizeof(float)) {
+        const double src_rows = kp->dst_nrows_per_chunk >= dst->ne[1]
+            ? (double) src0->ne[1]
+            : (std::min)((double) src0->ne[1], std::ceil((double) kp->dst_nrows_per_chunk * kp->inv_sf1) + kp->filter_radius1 * 2 + 2);
+        ns += src_x * src_rows * HTP_UPSCALE_NS_STRIDED;
+    }
+    return 1e-6 * ns;
 }
 
 static bool htp_kparams_solve_concat(

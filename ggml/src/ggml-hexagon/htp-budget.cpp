@@ -152,6 +152,25 @@ static double htp_estimate_bytes_ms(const struct ggml_tensor * op, double bytes_
     return bytes / bytes_per_ms;
 }
 
+// UPSCALE runs in chunks of output rows of one plane, one HVX thread per chunk, from the kernel's
+// time per chunk (htp_upscale_chunk_ms). With yield inside ops VTCM/HMX can be released between
+// rounds of chunks, so the longest hold is one round; otherwise it is the whole op. The estimate
+// used to be the bytes at 20 GB/s, which let the old scalar antialiased kernel
+// hold VTCM for 86 ms (SigLIP2 position embeddings 16x16 -> 38x26 x 1152 channels).
+static double htp_estimate_upscale_ms(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    struct htp_upscale_kernel_params kp;
+    if (!htp_kparams_solve_upscale(sess, op, &kp) || kp.n_hvx == 0) {
+        return 0.0; // not supported: supports_op refuses it anyway
+    }
+    const double chunk_ms = htp_upscale_chunk_ms(&kp, op->src[0], op);
+#ifdef GGML_HEXAGON_HTP_YIELD_IN_OPS
+    const uint32_t chunks = kp.chunks_per_round ? kp.chunks_per_round : kp.total_chunks;
+#else
+    const uint32_t chunks = kp.total_chunks;
+#endif
+    return chunk_ms * (double) ((chunks + kp.n_hvx - 1) / kp.n_hvx);
+}
+
 // CONV_2D: kernel [KW, KH, IC, OC], dst [OW, OH, OC, N]
 static double htp_estimate_conv_2d_ms(const struct ggml_tensor * op) {
     const struct ggml_tensor * w = op->src[0];
@@ -215,6 +234,7 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
                         ggml_op_desc(op), op->name);
             return false;
         case GGML_OP_UPSCALE:
+            return htp_budget_check(sess, op, htp_estimate_upscale_ms(sess, op));
         case GGML_OP_TOP_K_MASK:
             return htp_budget_check(sess, op, htp_estimate_bytes_ms(op, 20.0e6));
         case GGML_OP_DSV4_HC_PRE:
