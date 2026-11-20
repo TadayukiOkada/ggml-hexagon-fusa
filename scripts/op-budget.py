@@ -39,6 +39,7 @@ YIELDS = re.compile(r" yields (\d+)\s*$")
 # path for matmuls and flash attention (e.g. hmx-tiled, hmx-flat for the HMX 2D matmul),
 # otherwise multi-row or single-row.
 YIELDING = ["CONT", "CPY", "FENCE_WAIT", "FLASH_ATTN_EXT", "IM2COL", "CONV_2D_DW", "GET_ROWS", "PAD", "MUL_MAT:hmx-tiled", "MUL_MAT:hmx-flat",
+            "MUL_MAT_LORA:hmx-tiled", "MUL_MAT_LORA:hmx-flat", "LORA_ADD:hmx",
             "SOFT_MAX", "SET_ROWS", "ADD", "SUB", "MUL", "DIV", "ADD_ID", "ARGSORT:multi-row", "TOP_K:multi-row",
             "SCALE", "CLAMP", "LEAKY_RELU", "SQR", "SQRT", "NEG", "EXP", "SIGMOID", "SILU", "GELU",
             "GELU_QUICK", "GELU_ERF", "SOFTPLUS", "TANH", "ABS", "LOG", "RELU", "STEP",
@@ -63,7 +64,7 @@ def parse(stream, groups, yields):
 def tag(op, fields, dims):
     """Kernel path of matmuls and flash attention, else whether the first source has several rows."""
     last = fields[-1] if len(fields) > 4 else ""
-    if (op.startswith("MUL_MAT") or op == "FLASH_ATTN_EXT") and " vtcm " in last:
+    if (op.startswith("MUL_MAT") or op == "FLASH_ATTN_EXT" or op == "LORA_ADD") and " vtcm " in last:
         # "hmx-tiled vtcm N", or "hmx-tiled nhvx 4 vtcm N" since llama.cpp v1.0.0
         return last.split(" vtcm ")[0].split(" nhvx ")[0]
     ne = [int(x) for x in re.findall(r"\d+", dims.split(" ")[0])]

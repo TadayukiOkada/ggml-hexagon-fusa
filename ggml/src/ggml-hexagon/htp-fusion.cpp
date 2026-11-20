@@ -757,9 +757,132 @@ bool htp_fusion_can_stack(const struct ggml_tensor * a, const struct ggml_tensor
     return w0->type == w1->type && w0->ne[0] == w1->ne[0] && w0->ne[2] == w1->ne[2];
 }
 
+static bool htp_lora_is_float_weight_ok(const ggml_tensor * t) {
+    if (!t || (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_BF16)) {
+        return false;
+    }
+    if (ggml_hexagon_tensor_is_tiled(t) || ggml_is_permuted(t) || !ggml_is_contiguous_rows(t)) {
+        return false;
+    }
+    if (t->ne[2] != 1 || t->ne[3] != 1 || t->nb[0] != ggml_type_size(t->type)) {
+        return false;
+    }
+    return true;
+}
+
+static int htp_lora_match_chain_graph(
+    const struct ggml_cgraph * graph,
+    int                        idx,
+    const ggml_tensor *        expected_x,
+    const ggml_tensor *        expected_prev,
+    const ggml_tensor **       prev_out,
+    const ggml_tensor **       add_out,
+    int *                      mm_a_idx_out,
+    int *                      mm_b_idx_out
+) {
+    const int n = graph->n_nodes;
+    if (idx + 2 >= n) {
+        return 0;
+    }
+    const ggml_tensor * mm_a = graph->nodes[idx];
+    const ggml_tensor * mm_b = graph->nodes[idx + 1];
+    if (!mm_a || !mm_b || mm_a->op != GGML_OP_MUL_MAT || mm_b->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    if (htp_is_hadamard(mm_a) || htp_is_hadamard(mm_b) || mm_b->src[1] != mm_a) {
+        return 0;
+    }
+    const ggml_tensor * a = mm_a->src[0];
+    const ggml_tensor * x = mm_a->src[1];
+    const ggml_tensor * b = mm_b->src[0];
+    if (!a || !b || !x || (expected_x && x != expected_x)) {
+        return 0;
+    }
+    if (!htp_lora_is_float_weight_ok(a) || !htp_lora_is_float_weight_ok(b)) {
+        return 0;
+    }
+    if (a->ne[0] != x->ne[0] || a->ne[1] < 1 || a->ne[1] > 256 || b->ne[0] != a->ne[1]) {
+        return 0;
+    }
+    if (mm_a->view_src || mm_b->view_src || (mm_a->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        (mm_b->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(graph, idx) != 1 ||
+        ggml_node_get_use_count(graph, idx + 1) != 1) {
+        return 0;
+    }
+
+    int                 chain_len = 0;
+    const ggml_tensor * ba_scaled = mm_b;
+    int                 add_idx   = idx + 2;
+
+    if (graph->nodes[idx + 2]->op == GGML_OP_SCALE) {
+        if (idx + 3 >= n) {
+            return 0;
+        }
+        const ggml_tensor * sc = graph->nodes[idx + 2];
+        if (sc->src[0] != mm_b || sc->view_src || (sc->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_node_get_use_count(graph, idx + 2) != 1) {
+            return 0;
+        }
+        float bias = 0.0f;
+        memcpy(&bias, (const float *) sc->op_params + 1, sizeof(float));
+        if (bias != 0.0f) {
+            return 0;
+        }
+        ba_scaled = sc;
+        add_idx   = idx + 3;
+        chain_len = 4;
+    } else {
+        chain_len = 3;
+    }
+
+    const ggml_tensor * add = graph->nodes[add_idx];
+    if (!add || add->op != GGML_OP_ADD || add->view_src) {
+        return 0;
+    }
+    const ggml_tensor * other = nullptr;
+    if (add->src[0] == ba_scaled) {
+        other = add->src[1];
+    } else if (add->src[1] == ba_scaled) {
+        other = add->src[0];
+    } else {
+        return 0;
+    }
+    if (!other || (expected_prev && other != expected_prev) || b->ne[1] != other->ne[0]) {
+        return 0;
+    }
+    if (prev_out)     *prev_out     = other;
+    if (add_out)      *add_out      = add;
+    if (mm_a_idx_out) *mm_a_idx_out = idx;
+    if (mm_b_idx_out) *mm_b_idx_out = idx + 1;
+    return chain_len;
+}
+
 int htp_fusion_max(const struct ggml_cgraph * graph, int idx) {
     const int n = graph->n_nodes;
     const ggml_op op0 = graph->nodes[idx]->op;
+    if (htp_fusion_enabled(HTP_FUSE_LORA) && op0 == GGML_OP_MUL_MAT && htp_fusion_can_stack(graph->nodes[idx])) {
+        const ggml_tensor * base_mm  = graph->nodes[idx];
+        const ggml_tensor * cur_prev = base_mm;
+        const ggml_tensor * x        = base_mm->src[1];
+        int                 f        = 1;
+        int                 pos      = idx + 1;
+        int                 prev_idx = idx;
+        while (pos < n && !(cur_prev->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+               ggml_node_get_use_count(graph, prev_idx) == 1) {
+            const ggml_tensor * add_out = nullptr;
+            const int cl = htp_lora_match_chain_graph(graph, pos, x, cur_prev, nullptr, &add_out, nullptr, nullptr);
+            if (cl == 0 || f + cl > HTP_OP_MAX_FUSED) {
+                break;
+            }
+            cur_prev = add_out;
+            prev_idx = pos + cl - 1;
+            pos += cl;
+            f += cl;
+        }
+        if (f > 1) {
+            return f;
+        }
+    }
     if (op0 != GGML_OP_ADD && op0 != GGML_OP_NORM && op0 != GGML_OP_RMS_NORM) {
         return 1;
     }
@@ -990,6 +1113,684 @@ void htp_fusion_elide_gdn_state_rows(const struct ggml_hexagon_session * sess, c
         HEX_VERBOSE("ggml-hex: %s state rows of %s from %s\n", htp_session_name(sess), gdn.name().c_str(), cache->name);
         nodes.erase(nodes.begin() + (std::ptrdiff_t) i);
         j--;
+    }
+}
+
+void htp_fusion_collect_lora_weights(const struct ggml_cgraph * graph,
+                                     std::unordered_set<const struct ggml_tensor *> & lora_weights) {
+    lora_weights.clear();
+    if (!graph || !opt_opfusion || !htp_fusion_enabled(HTP_FUSE_LORA)) {
+        return;
+    }
+
+    std::vector<uint8_t> matched_mm_nodes((size_t) graph->n_nodes, 0);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        int mm_a_idx = -1, mm_b_idx = -1;
+        const int cl = htp_lora_match_chain_graph(graph, i, nullptr, nullptr, nullptr, nullptr, &mm_a_idx, &mm_b_idx);
+        if (cl > 0) {
+            lora_weights.insert(graph->nodes[mm_a_idx]->src[0]);
+            lora_weights.insert(graph->nodes[mm_b_idx]->src[0]);
+            matched_mm_nodes[mm_a_idx] = 1;
+            matched_mm_nodes[mm_b_idx] = 1;
+            i += cl - 1;
+        }
+    }
+    if (lora_weights.empty()) {
+        return;
+    }
+
+    // Never skip repacking any weight also consumed by a non-LoRA MUL_MAT / MUL_MAT_ID
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * n = graph->nodes[i];
+        if (!n || (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID)) {
+            continue;
+        }
+        if (!matched_mm_nodes[i] && n->src[0]) {
+            lora_weights.erase(n->src[0]);
+        }
+    }
+}
+
+static inline void htp_lora_push_fused_safe(htp_opnode & dst, const ggml_tensor * t) {
+    if (t && dst.fused.size() < HTP_OP_MAX_FUSED) {
+        dst.fused.push_back(t);
+    }
+}
+
+static int htp_lora_match_chain_nodes(
+    const std::vector<struct htp_opnode> & nodes,
+    size_t                                 idx,
+    const ggml_tensor *                    expected_x,
+    const ggml_tensor *                    expected_base,
+    struct htp_lora_adapter_desc *         ad_out,
+    const ggml_tensor **                   base_out,
+    const ggml_tensor **                   add_out
+) {
+    if (idx + 2 >= nodes.size()) {
+        return 0;
+    }
+    const htp_opnode & n_a = nodes[idx];
+    const htp_opnode & n_b = nodes[idx + 1];
+    if (n_a.opcode != HTP_OP_MUL_MAT || n_b.opcode != HTP_OP_MUL_MAT || !n_a.node || !n_b.node) {
+        return 0;
+    }
+    if (!n_a.fused.empty() || !n_b.fused.empty() || htp_is_hadamard(n_a.node) || htp_is_hadamard(n_b.node)) {
+        return 0;
+    }
+    const ggml_tensor * a = n_a.node->src[0];
+    const ggml_tensor * x = n_a.node->src[1];
+    const ggml_tensor * b = n_b.node->src[0];
+    if (!a || !b || !x || n_b.node->src[1] != n_a.node || (expected_x && x != expected_x)) {
+        return 0;
+    }
+    if (!htp_lora_is_float_weight_ok(a) || !htp_lora_is_float_weight_ok(b) ||
+        !ggml_hexagon_tensor_is_fuseable(n_a.node) || (n_a.node->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        n_a.node->view_src || !ggml_hexagon_tensor_is_fuseable(n_b.node) ||
+        (n_b.node->flags & GGML_TENSOR_FLAG_OUTPUT) || n_b.node->view_src) {
+        return 0;
+    }
+
+    int                 cl        = 3;
+    float               scale     = 1.0f;
+    const ggml_tensor * ba_scaled = n_b.node;
+    size_t              add_idx   = idx + 2;
+
+    if (nodes[idx + 2].opcode == HTP_OP_SCALE) {
+        if (idx + 3 >= nodes.size()) {
+            return 0;
+        }
+        const htp_opnode & n_s = nodes[idx + 2];
+        if (!n_s.node || !n_s.fused.empty() || n_s.node->src[0] != n_b.node || n_s.node->view_src ||
+            !ggml_hexagon_tensor_is_fuseable(n_s.node) || (n_s.node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        float bias = 0.0f;
+        memcpy(&scale, (const float *) n_s.params + 0, sizeof(float));
+        memcpy(&bias,  (const float *) n_s.params + 1, sizeof(float));
+        if (bias != 0.0f) {
+            return 0;
+        }
+        ba_scaled = n_s.node;
+        add_idx   = idx + 3;
+        cl        = 4;
+    }
+
+    const htp_opnode & n_add = nodes[add_idx];
+    if (n_add.opcode != HTP_OP_ADD || !n_add.node || !n_add.fused.empty() || n_add.node->view_src) {
+        return 0;
+    }
+    const ggml_tensor * other = nullptr;
+    if (n_add.node->src[0] == ba_scaled) {
+        other = n_add.node->src[1];
+    } else if (n_add.node->src[1] == ba_scaled) {
+        other = n_add.node->src[0];
+    } else {
+        return 0;
+    }
+    if (!other || (expected_base && other != expected_base)) {
+        return 0;
+    }
+    if (ad_out) {
+        ad_out->a      = a;
+        ad_out->b      = b;
+        ad_out->scale  = scale;
+        ad_out->target = 0;
+    }
+    if (base_out) *base_out = other;
+    if (add_out)  *add_out  = n_add.node;
+    return cl;
+}
+
+static bool htp_lora_rows_collapsible(const ggml_tensor * t) {
+    size_t s = 0;
+    return t && htp_rows_stride(t->ne, t->nb, &s);
+}
+
+void htp_fusion_lora(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph,
+                     std::vector<struct htp_opnode> & nodes) {
+    GGML_UNUSED(graph);
+    if (!opt_opfusion || !htp_fusion_enabled(HTP_FUSE_LORA) || htp_session_mdev_count(sess) > 1) {
+        return;
+    }
+
+    // Pass 1: Collapse LoRA chains into HTP_OP_MUL_MAT_LORA (with base MM) or HTP_OP_LORA_ADD (fallback)
+    size_t n_matmul_lora = 0;
+    {
+        size_t out_n = 0;
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            struct htp_lora_adapter_desc adapters[HTP_LORA_MAX_ADAPTERS] = {};
+            const ggml_tensor *          base_t                          = nullptr;
+            const ggml_tensor *          cur_out                         = nullptr;
+            const int cl0 = htp_lora_match_chain_nodes(nodes, i, nullptr, nullptr, &adapters[0], &base_t, &cur_out);
+            if (cl0 == 0) {
+                if (out_n != i) {
+                    nodes[out_n] = std::move(nodes[i]);
+                }
+                ++out_n;
+                continue;
+            }
+
+            const ggml_tensor * x_orig  = nodes[i].node->src[1];
+            int                 n_loras = 1;
+            size_t              cursor  = i + (size_t) cl0;
+
+            while (n_loras < HTP_LORA_MAX_ADAPTERS && cursor < nodes.size()) {
+                if (!ggml_hexagon_tensor_is_fuseable(cur_out) || (cur_out->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                    cur_out->view_src) {
+                    break;
+                }
+                const ggml_tensor * next_out = nullptr;
+                const int cl = htp_lora_match_chain_nodes(nodes, cursor, x_orig, cur_out, &adapters[n_loras], nullptr,
+                                                          &next_out);
+                if (cl == 0) {
+                    break;
+                }
+                cur_out = next_out;
+                cursor += (size_t) cl;
+                n_loras++;
+            }
+
+            const size_t        last_idx  = cursor - 1;
+            const ggml_tensor * final_out = cur_out;
+
+            // Try folding directly into immediately preceding base MUL_MAT
+            bool folded_into_base = false;
+            if (out_n > 0 && nodes[out_n - 1].opcode == HTP_OP_MUL_MAT && nodes[out_n - 1].fused.empty() &&
+                nodes[out_n - 1].node == base_t && !base_t->view_src &&
+                ggml_hexagon_tensor_is_fuseable(base_t) && !(base_t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                const ggml_tensor * base_w = base_t->src[0];
+                if (base_t->src[1] == x_orig && base_w &&
+                    !htp_tensors_overlap(final_out, base_w) && !htp_tensors_overlap(final_out, x_orig)) {
+                    bool overlap = false;
+                    for (int l = 0; l < n_loras; ++l) {
+                        if (htp_tensors_overlap(final_out, adapters[l].a) ||
+                            htp_tensors_overlap(final_out, adapters[l].b)) {
+                            overlap = true;
+                            break;
+                        }
+                    }
+                    const bool do_collapse = (x_orig->ne[2] > 1 || x_orig->ne[3] > 1);
+                    if (!overlap && (!do_collapse || htp_matmul_can_collapse(base_w, x_orig, final_out))) {
+                        htp_opnode merged(HTP_OP_MUL_MAT_LORA, base_t);
+                        const ggml_tensor * x_eff =
+                            do_collapse ? merged.add_dummy(htp_tensor_collapse_rows(x_orig)) : x_orig;
+                        const ggml_tensor * o_eff =
+                            do_collapse ? merged.add_dummy(htp_tensor_collapse_rows(final_out)) : final_out;
+                        struct htp_lora_kernel_params kp;
+                        if (htp_kparams_solve_matmul_lora(sess, &base_w, 1, x_eff, nullptr, false, 0.0f, 0.0f, 0,
+                                                          adapters, n_loras, &kp, nullptr)) {
+                            merged.inputs = { base_w, x_eff };
+                            for (int l = 0; l < n_loras; ++l) {
+                                merged.inputs.push_back(adapters[l].a);
+                                merged.inputs.push_back(adapters[l].b);
+                            }
+                            merged.outputs = { o_eff };
+                            merged.set_kparams(kp);
+                            for (size_t k = i; k <= last_idx; ++k) {
+                                htp_lora_push_fused_safe(merged, nodes[k].node);
+                            }
+                            nodes[out_n - 1] = std::move(merged);
+                            ++n_matmul_lora;
+                            i                = last_idx;
+                            folded_into_base = true;
+                        }
+                    }
+                }
+            }
+            if (folded_into_base) {
+                continue;
+            }
+
+            // Fallback: collapse into standalone HTP_OP_LORA_ADD
+            bool collapsed_add = false;
+            const bool do_collapse = (x_orig->ne[2] > 1 || x_orig->ne[3] > 1 ||
+                                      base_t->ne[2] > 1 || base_t->ne[3] > 1);
+            const bool can_col     = !do_collapse ||
+                                     (htp_lora_rows_collapsible(x_orig) && htp_lora_rows_collapsible(base_t) &&
+                                      htp_lora_rows_collapsible(final_out) &&
+                                      x_orig->ne[1] == final_out->ne[1] && x_orig->ne[2] == final_out->ne[2] &&
+                                      x_orig->ne[3] == final_out->ne[3] && ggml_are_same_shape(base_t, final_out));
+            if (can_col) {
+                htp_opnode merged(HTP_OP_LORA_ADD, nodes[last_idx].node);
+                const ggml_tensor * b_eff = do_collapse ? merged.add_dummy(htp_tensor_collapse_rows(base_t))    : base_t;
+                const ggml_tensor * x_eff = do_collapse ? merged.add_dummy(htp_tensor_collapse_rows(x_orig))    : x_orig;
+                const ggml_tensor * o_eff = do_collapse ? merged.add_dummy(htp_tensor_collapse_rows(final_out)) : final_out;
+                struct htp_lora_kernel_params kp;
+                if (htp_kparams_solve_lora_add(sess, b_eff, o_eff, x_eff, adapters, n_loras, &kp)) {
+                    merged.inputs = { b_eff, x_eff };
+                    for (int l = 0; l < n_loras; ++l) {
+                        merged.inputs.push_back(adapters[l].a);
+                        merged.inputs.push_back(adapters[l].b);
+                    }
+                    merged.outputs = { o_eff };
+                    merged.set_kparams(kp);
+                    for (size_t k = i; k < last_idx; ++k) {
+                        htp_lora_push_fused_safe(merged, nodes[k].node);
+                    }
+                    nodes[out_n++] = std::move(merged);
+                    i              = last_idx;
+                    collapsed_add  = true;
+                }
+            }
+            if (!collapsed_add) {
+                if (out_n != i) {
+                    nodes[out_n] = std::move(nodes[i]);
+                }
+                ++out_n;
+            }
+        }
+        nodes.resize(out_n);
+    }
+
+    if (n_matmul_lora == 0) {
+        return;
+    }
+
+    // Pass 2: Stack adjacent HTP_OP_MUL_MAT_LORA / HTP_OP_MUL_MAT on same x into multi-weight MUL_MAT_LORA
+    if (htp_fusion_enabled(HTP_FUSE_MUL_MAT_NX)) {
+        auto collect_node = [](const htp_opnode & n, const ggml_tensor ** ws, uint32_t & nw,
+                               htp_lora_adapter_desc * ads, uint32_t & nl, const ggml_tensor ** x_orig_out,
+                               const ggml_tensor ** x_node_out, bool & has_lora) -> bool {
+            if (n.opcode == HTP_OP_MUL_MAT_LORA) {
+                const auto * kp = n.kparams<htp_lora_kernel_params>();
+                if (kp->norm || kp->glu || !n.node) {
+                    return false;
+                }
+                nw = kp->n_weights;
+                nl = kp->n_loras;
+                if (nw == 0 || nw > HTP_LORA_MAX_WEIGHTS || nl > HTP_LORA_MAX_ADAPTERS ||
+                    n.inputs.size() != nw + 1 + 2 * nl || n.outputs.size() != nw) {
+                    return false;
+                }
+                for (uint32_t p = 0; p < nw; ++p) {
+                    ws[p] = n.inputs[p];
+                }
+                for (uint32_t l = 0; l < nl; ++l) {
+                    ads[l] = { n.inputs[kp->lora_a_slot[l]], n.inputs[kp->lora_b_slot[l]],
+                               kp->lora_scale[l], kp->lora_target[l] };
+                }
+                *x_orig_out = n.node->src[1];
+                *x_node_out = n.inputs[nw];
+                has_lora    = true;
+                return true;
+            }
+            if (n.opcode == HTP_OP_MUL_MAT && n.fused.empty() && n.node && !htp_is_hadamard(n.node)) {
+                nw          = 1;
+                nl          = 0;
+                ws[0]       = n.inputs[0];
+                *x_orig_out = n.node->src[1];
+                *x_node_out = n.inputs[1];
+                return true;
+            }
+            return false;
+        };
+
+        size_t out_n = 0;
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            if (nodes[i].opcode != HTP_OP_MUL_MAT_LORA &&
+                (nodes[i].opcode != HTP_OP_MUL_MAT || !nodes[i].fused.empty() || !nodes[i].node ||
+                 htp_is_hadamard(nodes[i].node))) {
+                if (out_n != i) {
+                    nodes[out_n] = std::move(nodes[i]);
+                }
+                ++out_n;
+                continue;
+            }
+
+            const ggml_tensor *   w_acc[HTP_LORA_MAX_WEIGHTS]   = {};
+            htp_lora_adapter_desc ad_acc[HTP_LORA_MAX_ADAPTERS] = {};
+            const ggml_tensor *   out_acc[HTP_LORA_MAX_WEIGHTS] = {};
+            uint32_t              nw_acc = 0, nl_acc = 0;
+            const ggml_tensor *   x_orig0 = nullptr, * x_eff0 = nullptr;
+            bool                  any_lora = false;
+            if (!collect_node(nodes[i], w_acc, nw_acc, ad_acc, nl_acc, &x_orig0, &x_eff0, any_lora)) {
+                if (out_n != i) {
+                    nodes[out_n] = std::move(nodes[i]);
+                }
+                ++out_n;
+                continue;
+            }
+            for (uint32_t p = 0; p < nw_acc; ++p) {
+                out_acc[p] = nodes[i].outputs[p];
+            }
+
+            size_t consume_end = i + 1;
+            struct htp_lora_kernel_params best_kp = {};
+            bool   merged_any = false;
+
+            while (consume_end < nodes.size()) {
+                const ggml_tensor *   w_j[HTP_LORA_MAX_WEIGHTS]   = {};
+                htp_lora_adapter_desc ad_j[HTP_LORA_MAX_ADAPTERS] = {};
+                uint32_t              nw_j = 0, nl_j = 0;
+                const ggml_tensor *   x_orig_j = nullptr, * x_eff_j = nullptr;
+                bool                  j_lora   = false;
+                if (!collect_node(nodes[consume_end], w_j, nw_j, ad_j, nl_j, &x_orig_j, &x_eff_j, j_lora)) {
+                    break;
+                }
+                const bool comb_lora = any_lora || j_lora;
+                if (!comb_lora || x_orig_j != x_orig0 || nw_acc + nw_j > HTP_LORA_MAX_WEIGHTS ||
+                    nl_acc + nl_j == 0 || nl_acc + nl_j > HTP_LORA_MAX_ADAPTERS ||
+                    nw_acc + nw_j + 1 + 2 * (nl_acc + nl_j) > HTP_OP_MAX_INPUTS) {
+                    break;
+                }
+                if (w_j[0]->type != w_acc[0]->type || w_j[0]->ne[0] != w_acc[0]->ne[0] ||
+                    ggml_hexagon_tensor_will_tile(w_j[0]) != ggml_hexagon_tensor_will_tile(w_acc[0])) {
+                    break;
+                }
+                if (!ggml_are_same_shape(x_eff0, x_eff_j)) {
+                    break;
+                }
+
+                bool overlap = false;
+                for (uint32_t p = 0; p < nw_j && !overlap; ++p) {
+                    const ggml_tensor * oj = nodes[consume_end].outputs[p];
+                    if (htp_tensors_overlap(oj, x_eff0) || htp_tensors_overlap(oj, w_j[p])) {
+                        overlap = true;
+                    }
+                    for (uint32_t q = 0; q < nw_acc; ++q) {
+                        if (htp_tensors_overlap(out_acc[q], oj) || htp_tensors_overlap(out_acc[q], w_j[p]) ||
+                            htp_tensors_overlap(oj, w_acc[q])) {
+                            overlap = true;
+                        }
+                    }
+                    for (uint32_t l = 0; l < nl_acc; ++l) {
+                        if (htp_tensors_overlap(oj, ad_acc[l].a) || htp_tensors_overlap(oj, ad_acc[l].b)) {
+                            overlap = true;
+                        }
+                    }
+                }
+                for (uint32_t l = 0; l < nl_j && !overlap; ++l) {
+                    for (uint32_t q = 0; q < nw_acc; ++q) {
+                        if (htp_tensors_overlap(out_acc[q], ad_j[l].a) || htp_tensors_overlap(out_acc[q], ad_j[l].b)) {
+                            overlap = true;
+                        }
+                    }
+                }
+                if (overlap) {
+                    break;
+                }
+
+                const ggml_tensor *   w_try[HTP_LORA_MAX_WEIGHTS];
+                htp_lora_adapter_desc ad_try[HTP_LORA_MAX_ADAPTERS];
+                for (uint32_t p = 0; p < nw_acc; ++p) w_try[p] = w_acc[p];
+                for (uint32_t p = 0; p < nw_j;   ++p) w_try[nw_acc + p] = w_j[p];
+                for (uint32_t l = 0; l < nl_acc; ++l) ad_try[l] = ad_acc[l];
+                for (uint32_t l = 0; l < nl_j; ++l) {
+                    ad_try[nl_acc + l]        = ad_j[l];
+                    ad_try[nl_acc + l].target += (uint8_t) nw_acc;
+                }
+
+                struct htp_lora_kernel_params try_kp;
+                if (!htp_kparams_solve_matmul_lora(sess, w_try, (int32_t) (nw_acc + nw_j), x_eff0, nullptr, false,
+                                                   0.0f, 0.0f, 0, ad_try, (int32_t) (nl_acc + nl_j), &try_kp,
+                                                   nullptr)) {
+                    break;
+                }
+
+                for (uint32_t p = 0; p < nw_j; ++p) {
+                    w_acc[nw_acc + p]   = w_j[p];
+                    out_acc[nw_acc + p] = nodes[consume_end].outputs[p];
+                }
+                for (uint32_t l = 0; l < nl_j; ++l) {
+                    ad_acc[nl_acc + l] = ad_try[nl_acc + l];
+                }
+                nw_acc    += nw_j;
+                nl_acc    += nl_j;
+                any_lora   = true;
+                best_kp    = try_kp;
+                merged_any = true;
+                consume_end++;
+            }
+
+            if (merged_any) {
+                htp_opnode merged(HTP_OP_MUL_MAT_LORA, nodes[i].node);
+                const ggml_tensor * x_final = (x_orig0->ne[2] > 1 || x_orig0->ne[3] > 1)
+                    ? merged.add_dummy(*x_eff0) : x_eff0;
+                merged.inputs.clear();
+                for (uint32_t p = 0; p < nw_acc; ++p) {
+                    merged.inputs.push_back(w_acc[p]);
+                }
+                merged.inputs.push_back(x_final);
+                for (uint32_t l = 0; l < nl_acc; ++l) {
+                    merged.inputs.push_back(ad_acc[l].a);
+                    merged.inputs.push_back(ad_acc[l].b);
+                }
+                merged.outputs.clear();
+                for (uint32_t p = 0; p < nw_acc; ++p) {
+                    const ggml_tensor * o = out_acc[p];
+                    merged.outputs.push_back((o->ne[2] != nodes[i].node->ne[2] || x_orig0->ne[2] > 1 || x_orig0->ne[3] > 1)
+                        ? merged.add_dummy(*o) : o);
+                }
+                for (size_t k = i; k < consume_end; ++k) {
+                    if (k > i) {
+                        htp_lora_push_fused_safe(merged, nodes[k].node);
+                    }
+                    for (const ggml_tensor * f : nodes[k].fused) {
+                        htp_lora_push_fused_safe(merged, f);
+                    }
+                }
+                merged.set_kparams(best_kp);
+                nodes[out_n++] = std::move(merged);
+                i              = consume_end - 1;
+            } else {
+                if (out_n != i) {
+                    nodes[out_n] = std::move(nodes[i]);
+                }
+                ++out_n;
+            }
+        }
+        nodes.resize(out_n);
+    }
+
+    // Pass 3: Absorb preceding RMS_NORM + MUL into HTP_OP_MUL_MAT_LORA
+    if (htp_fusion_enabled(HTP_FUSE_NORM_MUL_MAT_NX)) {
+        size_t out_n = 0;
+        for (size_t idx = 0; idx < nodes.size(); ++idx) {
+            bool absorbed = false;
+            do {
+                if (out_n < 2) break;
+                htp_opnode & cur = nodes[idx];
+                if (cur.opcode != HTP_OP_MUL_MAT_LORA || !cur.node) break;
+                const auto * kp = cur.kparams<htp_lora_kernel_params>();
+                const uint32_t nw = kp->n_weights;
+                const uint32_t nl = kp->n_loras;
+                if (kp->norm || kp->glu || cur.inputs.size() != nw + 1 + 2 * nl) break;
+                const htp_opnode & norm = nodes[out_n - 2];
+                const htp_opnode & mul  = nodes[out_n - 1];
+                if (norm.opcode != HTP_OP_RMS_NORM || mul.opcode != HTP_OP_MUL || !mul.fused.empty() ||
+                    norm.inputs.size() != 1 || norm.outputs.size() != 1 || !norm.node || !mul.node) break;
+                const ggml_tensor * norm_out = norm.node;
+                if (!ggml_hexagon_tensor_is_fuseable(norm_out) || (norm_out->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                    norm_out->view_src) break;
+                const ggml_tensor * norm_w = nullptr;
+                if (mul.node->src[0] == norm_out) {
+                    norm_w = mul.node->src[1];
+                } else if (mul.node->src[1] == norm_out) {
+                    norm_w = mul.node->src[0];
+                } else {
+                    break;
+                }
+                const ggml_tensor * norm_src = norm.node->src[0];
+                const ggml_tensor * x_orig   = cur.node->src[1];
+                if (!norm_src || !norm_w || mul.node != x_orig) break;
+                if (ggml_hexagon_tensor_get_mm_uses(x_orig) != nw + nl) break;
+                if (nw + 2 + 2 * nl > HTP_OP_MAX_INPUTS) break;
+                if (norm_src->type != GGML_TYPE_F32 || x_orig->type != GGML_TYPE_F32 || norm_w->type != GGML_TYPE_F32) break;
+                if (ggml_nrows(norm_w) != 1 || norm_w->ne[0] != x_orig->ne[0] || !ggml_are_same_shape(norm_src, x_orig)) break;
+                if (!ggml_is_contiguous(norm_src) || !ggml_is_contiguous(x_orig) || !ggml_is_contiguous(norm_w)) break;
+                bool overlap = false;
+                for (const auto * o : cur.outputs) {
+                    if (htp_tensors_overlap(o, norm_src) || htp_tensors_overlap(o, norm_w)) {
+                        overlap = true;
+                        break;
+                    }
+                }
+                if (overlap) break;
+
+                float eps = 0.0f, scale = 0.0f;
+                memcpy(&eps,   &norm.params[0], sizeof(float));
+                memcpy(&scale, &norm.params[1], sizeof(float));
+
+                const ggml_tensor * weights[HTP_LORA_MAX_WEIGHTS]    = {};
+                htp_lora_adapter_desc ads[HTP_LORA_MAX_ADAPTERS]     = {};
+                for (uint32_t p = 0; p < nw; ++p) weights[p] = cur.inputs[p];
+                for (uint32_t l = 0; l < nl; ++l) {
+                    ads[l] = { cur.inputs[kp->lora_a_slot[l]], cur.inputs[kp->lora_b_slot[l]],
+                               kp->lora_scale[l], kp->lora_target[l] };
+                }
+                const bool do_collapse = (norm_src->ne[2] > 1 || norm_src->ne[3] > 1);
+                const ggml_tensor * src_eff =
+                    do_collapse ? cur.add_dummy(htp_tensor_collapse_rows(norm_src)) : norm_src;
+
+                struct htp_lora_kernel_params new_kp;
+                uint8_t norm_slot = 0xff;
+                if (!htp_kparams_solve_matmul_lora(sess, weights, (int32_t) nw, src_eff, norm_w, true, eps, scale, 0,
+                                                   ads, (int32_t) nl, &new_kp, &norm_slot)) {
+                    break;
+                }
+
+                cur.inputs.clear();
+                for (uint32_t p = 0; p < nw; ++p) cur.inputs.push_back(weights[p]);
+                cur.inputs.push_back(src_eff);
+                cur.inputs.push_back(norm_w);
+                for (uint32_t l = 0; l < nl; ++l) {
+                    cur.inputs.push_back(ads[l].a);
+                    cur.inputs.push_back(ads[l].b);
+                }
+                htp_lora_push_fused_safe(cur, norm.node);
+                for (const ggml_tensor * f : norm.fused) htp_lora_push_fused_safe(cur, f);
+                htp_lora_push_fused_safe(cur, mul.node);
+                cur.set_kparams(new_kp);
+
+                nodes[out_n - 2] = std::move(cur);
+                out_n -= 1;
+                absorbed = true;
+            } while (0);
+
+            if (!absorbed) {
+                if (out_n != idx) {
+                    nodes[out_n] = std::move(nodes[idx]);
+                }
+                ++out_n;
+            }
+        }
+        nodes.resize(out_n);
+    }
+
+    // Pass 4: Absorb following GEGLU/SWIGLU or SILU/GELU+MUL into 2-weight HTP_OP_MUL_MAT_LORA
+    if (htp_fusion_enabled(HTP_FUSE_MUL_MAT_NX_GLU)) {
+        size_t out_n = 0;
+        for (size_t idx = 0; idx < nodes.size(); ++idx) {
+            size_t absorbed_consume = 0;
+            do {
+                if (idx + 1 >= nodes.size()) break;
+                htp_opnode & cur = nodes[idx];
+                if (cur.opcode != HTP_OP_MUL_MAT_LORA || cur.outputs.size() != 2) break;
+                const auto * kp = cur.kparams<htp_lora_kernel_params>();
+                if (kp->n_weights != 2 || kp->glu != 0) break;
+
+                uint8_t             glu_kind = 0;
+                size_t              consume  = 0;
+                const ggml_tensor * a        = nullptr;
+                const ggml_tensor * b        = nullptr;
+                const ggml_tensor * glu_dst  = nullptr;
+
+                const htp_opnode & n1 = nodes[idx + 1];
+                if ((n1.opcode == HTP_OP_GLU_GEGLU || n1.opcode == HTP_OP_GLU_SWIGLU) && n1.node && n1.node->src[1]) {
+                    glu_kind = (n1.opcode == HTP_OP_GLU_GEGLU) ? HTP_MM_GLU_GEGLU : HTP_MM_GLU_SWIGLU;
+                    a        = n1.node->src[0];
+                    b        = n1.node->src[1];
+                    glu_dst  = n1.node;
+                    consume  = 1;
+                } else if (idx + 2 < nodes.size() &&
+                           (n1.opcode == HTP_OP_UNARY_GELU || n1.opcode == HTP_OP_UNARY_SILU) &&
+                           n1.fused.empty() && n1.node && nodes[idx + 2].opcode == HTP_OP_MUL && nodes[idx + 2].node) {
+                    const ggml_tensor * u = n1.node;
+                    const ggml_tensor * m = nodes[idx + 2].node;
+                    if (!ggml_hexagon_tensor_is_fuseable(u) || (u->flags & GGML_TENSOR_FLAG_OUTPUT) || u->view_src) {
+                        break;
+                    }
+                    if (m->src[0] == u) {
+                        b = m->src[1];
+                    } else if (m->src[1] == u) {
+                        b = m->src[0];
+                    } else {
+                        break;
+                    }
+                    glu_kind = (n1.opcode == HTP_OP_UNARY_GELU) ? HTP_MM_GLU_GEGLU : HTP_MM_GLU_SWIGLU;
+                    a        = u->src[0];
+                    glu_dst  = m;
+                    consume  = 2;
+                } else {
+                    break;
+                }
+
+                if (!a || !b || !glu_dst) break;
+                const ggml_tensor * d0 = cur.outputs[0];
+                const ggml_tensor * d1 = cur.outputs[1];
+                int gate_idx = -1;
+                if (htp_same_tensor_data(a, d0) && htp_same_tensor_data(b, d1)) {
+                    gate_idx = 0;
+                } else if (htp_same_tensor_data(a, d1) && htp_same_tensor_data(b, d0)) {
+                    gate_idx = 1;
+                } else {
+                    break;
+                }
+
+                if (!ggml_hexagon_tensor_is_fuseable(a) || !ggml_hexagon_tensor_is_fuseable(b) ||
+                    ((a->flags | b->flags) & GGML_TENSOR_FLAG_OUTPUT) || a->view_src || b->view_src) break;
+                if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || glu_dst->type != GGML_TYPE_F32) break;
+                if (!ggml_are_same_shape(a, glu_dst) || !ggml_are_same_shape(b, glu_dst) ||
+                    !ggml_is_contiguous_rows(glu_dst) || glu_dst->nb[1] != a->nb[1]) break;
+                if (htp_inputs_overlap_unsafe(cur, glu_dst)) break;
+
+                const ggml_tensor *   w_reordered[2] = { cur.inputs[gate_idx], cur.inputs[1 - gate_idx] };
+                const ggml_tensor *   act_ptr        = cur.inputs[2];
+                const ggml_tensor *   norm_w_ptr     = kp->norm ? cur.inputs[kp->norm_w_slot] : nullptr;
+                htp_lora_adapter_desc ads[HTP_LORA_MAX_ADAPTERS] = {};
+                const uint32_t        nl             = kp->n_loras;
+                for (uint32_t l = 0; l < nl; ++l) {
+                    ads[l] = { cur.inputs[kp->lora_a_slot[l]], cur.inputs[kp->lora_b_slot[l]],
+                               kp->lora_scale[l], (uint8_t) (kp->lora_target[l] ^ (uint8_t) gate_idx) };
+                }
+
+                struct htp_lora_kernel_params new_kp;
+                uint8_t norm_slot = 0xff;
+                if (!htp_kparams_solve_matmul_lora(sess, w_reordered, 2, act_ptr, norm_w_ptr, kp->norm != 0,
+                                                   kp->norm_eps, kp->norm_scale, glu_kind, ads, (int32_t) nl, &new_kp,
+                                                   &norm_slot)) {
+                    break;
+                }
+
+                const bool collapsed = (d0 != a && d0 != b);
+                const ggml_tensor * out_eff = collapsed ? cur.add_dummy(htp_tensor_collapse_rows(glu_dst)) : glu_dst;
+
+                cur.inputs.clear();
+                cur.inputs.push_back(w_reordered[0]);
+                cur.inputs.push_back(w_reordered[1]);
+                cur.inputs.push_back(act_ptr);
+                if (norm_w_ptr) {
+                    cur.inputs.push_back(norm_w_ptr);
+                }
+                for (uint32_t l = 0; l < nl; ++l) {
+                    cur.inputs.push_back(ads[l].a);
+                    cur.inputs.push_back(ads[l].b);
+                }
+                cur.outputs = { out_eff };
+                for (size_t c = 1; c <= consume; ++c) {
+                    htp_lora_push_fused_safe(cur, nodes[idx + c].node);
+                }
+                cur.set_kparams(new_kp);
+                absorbed_consume = consume;
+            } while (0);
+
+            if (out_n != idx) {
+                nodes[out_n] = std::move(nodes[idx]);
+            }
+            ++out_n;
+            idx += absorbed_consume;
+        }
+        nodes.resize(out_n);
     }
 }
 

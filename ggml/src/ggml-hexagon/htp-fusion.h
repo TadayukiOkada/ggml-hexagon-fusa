@@ -3,6 +3,7 @@
 
 #include "htp-common.h"
 
+#include <unordered_set>
 #include <vector>
 
 enum htp_fusion_flags {
@@ -27,6 +28,7 @@ enum htp_fusion_flags {
     HTP_FUSE_RMS_NORM_MUL_ADD_MUL = (1 << 23), // 8388608
     HTP_FUSE_MUL_MAT_POST         = (1 << 24), // 16777216
     HTP_FUSE_GDN_STATE_ROWS       = (1 << 25), // 33554432
+    HTP_FUSE_LORA                 = (1 << 26), // 67108864
 };
 
 static inline bool htp_fusion_enabled(int flag) {
@@ -43,5 +45,9 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
 bool htp_fusion_try_absorb_norm(const struct htp_opnode & norm, struct htp_opnode & nx);
 void htp_fusion_elide_gdn_state_rows(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph,
                                      std::vector<struct htp_opnode> & nodes);
+void htp_fusion_collect_lora_weights(const struct ggml_cgraph * graph,
+                                     std::unordered_set<const struct ggml_tensor *> & lora_weights);
+void htp_fusion_lora(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph,
+                     std::vector<struct htp_opnode> & nodes);
 
 #endif // HTP_FUSION_H

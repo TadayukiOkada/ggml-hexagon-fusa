@@ -1269,6 +1269,418 @@ bool htp_kparams_solve_mmidnx(
     return ok;
 }
 
+static size_t htp_lora_elem_size_host(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:  return sizeof(float);
+        case GGML_TYPE_F16:  return sizeof(uint16_t);
+        case GGML_TYPE_BF16: return sizeof(uint16_t);
+        default:             return 0;
+    }
+}
+
+static bool htp_lora_check_weight_tensor(const struct ggml_tensor * t) {
+    if (!t || htp_lora_elem_size_host(t->type) == 0) {
+        return false;
+    }
+    if (ggml_hexagon_tensor_is_tiled(t) || ggml_is_permuted(t) || !ggml_is_contiguous_rows(t)) {
+        return false;
+    }
+    if (t->ne[2] != 1 || t->ne[3] != 1 || t->nb[0] != htp_lora_elem_size_host(t->type)) {
+        return false;
+    }
+    return true;
+}
+
+bool htp_kparams_solve_matmul_lora(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * const * weights,
+    int32_t n_weights,
+    const struct ggml_tensor * act,
+    const struct ggml_tensor * norm_w,
+    bool has_norm,
+    float norm_eps,
+    float norm_scale,
+    uint8_t glu,
+    const struct htp_lora_adapter_desc * loras,
+    int32_t n_loras,
+    struct htp_lora_kernel_params * kparams,
+    uint8_t * norm_w_slot_out
+) {
+    memset(kparams, 0, sizeof(*kparams));
+    kparams->norm_w_slot = 0xff;
+    if (norm_w_slot_out) {
+        *norm_w_slot_out = 0xff;
+    }
+
+    if (htp_session_mdev_count(sess) > 1 || n_weights <= 0 || n_weights > HTP_LORA_MAX_WEIGHTS ||
+        n_loras <= 0 || n_loras > HTP_LORA_MAX_ADAPTERS || !weights || !act || !loras) {
+        return false;
+    }
+
+    const int32_t total_inputs = n_weights + 1 + (has_norm ? 1 : 0) + 2 * n_loras;
+    if (total_inputs > HTP_OP_MAX_INPUTS) {
+        return false;
+    }
+
+    const struct ggml_tensor * w0 = weights[0];
+    if (!w0 || !htp_is_tiled_weight_type(w0->type)) {
+        return false;
+    }
+    const bool is_tiled = ggml_hexagon_tensor_will_tile(w0);
+    const int  wtype    = (is_tiled && (w0->type == GGML_TYPE_F32 || w0->type == GGML_TYPE_BF16))
+                            ? GGML_TYPE_F16 : w0->type;
+    const int64_t k     = w0->ne[0];
+    if (k <= 0 || (k % 32) != 0) {
+        return false;
+    }
+
+    int64_t max_n = 0;
+    for (int32_t p = 0; p < n_weights; ++p) {
+        const struct ggml_tensor * wp = weights[p];
+        if (!wp || wp->type != w0->type || wp->ne[0] != k || wp->ne[2] != 1 || wp->ne[3] != 1) {
+            return false;
+        }
+        if (ggml_hexagon_tensor_will_tile(wp) != is_tiled || ggml_is_permuted(wp) || !ggml_is_contiguous(wp)) {
+            return false;
+        }
+        if (glu != 0 && wp->ne[1] != w0->ne[1]) {
+            return false;
+        }
+        max_n = std::max(max_n, wp->ne[1]);
+    }
+    if (glu != 0 && n_weights != 2) {
+        return false;
+    }
+
+    if (act->ne[0] != k || (act->type != GGML_TYPE_F32 && act->type != GGML_TYPE_F16)) {
+        return false;
+    }
+    if (has_norm && act->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_is_permuted(act) || !ggml_is_contiguous(act) || act->nb[0] != htp_lora_elem_size_host(act->type)) {
+        return false;
+    }
+    if (has_norm) {
+        if (!norm_w || norm_w->type != GGML_TYPE_F32 || ggml_nrows(norm_w) != 1 ||
+            norm_w->ne[0] != k || !ggml_is_contiguous(norm_w)) {
+            return false;
+        }
+    }
+
+    uint32_t lora_r_tiles[HTP_LORA_MAX_ADAPTERS] = {};
+    uint32_t max_r                               = 1;
+    size_t   max_a_elem_bytes                    = 2;
+    size_t   max_b_row_bytes                     = 0;
+    uint32_t per_w_count[HTP_LORA_MAX_WEIGHTS]   = {};
+    uint32_t max_loras_per_w                     = 1;
+    uint8_t  lora_targets[HTP_LORA_MAX_ADAPTERS] = {};
+    bool     hmx_scales_ok                       = true;
+
+    for (int32_t l = 0; l < n_loras; ++l) {
+        const struct htp_lora_adapter_desc & ad = loras[l];
+        if (ad.target >= (uint8_t) n_weights) {
+            return false;
+        }
+        if (!htp_lora_check_weight_tensor(ad.a) || !htp_lora_check_weight_tensor(ad.b)) {
+            return false;
+        }
+        if (ad.a->ne[0] != k || ad.a->ne[1] < 1 || ad.a->ne[1] > 256 ||
+            ad.b->ne[0] != ad.a->ne[1] || ad.b->ne[1] != weights[ad.target]->ne[1]) {
+            return false;
+        }
+        const size_t ae = htp_lora_elem_size_host(ad.a->type);
+        const size_t be = htp_lora_elem_size_host(ad.b->type);
+        lora_targets[l]  = ad.target;
+        lora_r_tiles[l]  = ((uint32_t) ad.a->ne[1] + 31u) / 32u;
+        max_r            = std::max(max_r, (uint32_t) ad.a->ne[1]);
+        max_a_elem_bytes = std::max(max_a_elem_bytes, ae);
+        max_b_row_bytes  = std::max(max_b_row_bytes, (size_t) ad.b->ne[0] * be);
+        per_w_count[ad.target]++;
+        max_loras_per_w = std::max(max_loras_per_w, per_w_count[ad.target]);
+
+        const float asc = std::fabs(ad.scale);
+        if (asc > 0.0f && (asc < 3.7e-9f || asc > 4e9f)) {
+            hmx_scales_ok = false;
+        }
+    }
+
+    const uint32_t act_nrows   = (uint32_t) (act->ne[1] * act->ne[2] * act->ne[3]);
+    const uint32_t n_hvx       = htp_session_n_hvx(sess);
+    const uint32_t n_hmx       = htp_session_n_hmx(sess);
+    const size_t   vtcm_budget = htp_session_vtcm_size(sess);
+
+    const uint8_t norm_slot   = has_norm ? (uint8_t) (n_weights + 1) : 0xff;
+    const uint8_t first_lora  = (uint8_t) (n_weights + 1 + (has_norm ? 1 : 0));
+
+    kparams->n_weights   = (uint8_t) n_weights;
+    kparams->n_loras     = (uint8_t) n_loras;
+    kparams->glu         = glu;
+    kparams->norm        = has_norm ? 1 : 0;
+    kparams->norm_w_slot = norm_slot;
+    kparams->norm_eps    = has_norm ? norm_eps : 0.0f;
+    kparams->norm_scale  = has_norm ? norm_scale : 0.0f;
+    if (norm_w_slot_out) {
+        *norm_w_slot_out = norm_slot;
+    }
+    for (int32_t l = 0; l < n_loras; ++l) {
+        kparams->lora_target[l] = loras[l].target;
+        kparams->lora_a_slot[l] = (uint8_t) (first_lora + 2 * l + 0);
+        kparams->lora_b_slot[l] = (uint8_t) (first_lora + 2 * l + 1);
+        kparams->lora_scale[l]  = loras[l].scale;
+    }
+
+    // HMX prefill path (M > 4)
+    const bool hmx_eligible = (act_nrows > HTP_MM_HMX_MIN_NROWS) && (n_hmx > 0) && (opt_mm_select >= 2) &&
+                              hmx_scales_ok && (act->type == GGML_TYPE_F32 || act->type == GGML_TYPE_F16) &&
+                              (!glu || !(is_tiled && wtype == GGML_TYPE_F16));
+    if (hmx_eligible) {
+        const uint32_t k_padded          = (uint32_t) hex_round_up((int) k, 32);
+        const uint32_t m_padded          = (uint32_t) hex_round_up((int) act_nrows, 32);
+        const uint32_t max_n_padded      = (uint32_t) hex_round_up((int) max_n, 32);
+        const uint32_t aligned_tile_size = is_tiled ? htp_tensor_get_tile_padded_size(wtype) : 0;
+
+        for (int pipe_try = 1; pipe_try >= (glu ? 1 : 0); --pipe_try) {
+            const bool pipeline = (pipe_try != 0);
+            size_t     reserve  = htp_lora_hmx_group_a_bytes(
+                std::min<size_t>(m_padded, 128), std::min<size_t>(max_n_padded, 256), pipeline, glu, n_hvx,
+                (uint32_t) n_weights, (uint32_t) n_loras, lora_targets, lora_r_tiles, max_r);
+
+            for (int iter = 0; iter < 8; ++iter) {
+                size_t m_chunk = 0, n_chunk = 0, vtcm_size = 0;
+                int    act_hvx = 0;
+                if (!htp_mm_hmx_solve_2d_params(wtype, k_padded, 0, max_n_padded, m_padded, act_nrows, (int) n_hvx,
+                                                pipeline, false, aligned_tile_size, reserve, vtcm_budget,
+                                                &m_chunk, &n_chunk, &act_hvx, &vtcm_size)) {
+                    break;
+                }
+                const size_t exact_reserve = htp_lora_hmx_group_a_bytes(
+                    m_chunk, n_chunk, pipeline, glu, n_hvx, (uint32_t) n_weights, (uint32_t) n_loras,
+                    lora_targets, lora_r_tiles, max_r);
+                const size_t exact_vtcm = htp_mm_hmx_get_2d_vtcm_size(
+                    wtype, k_padded, m_chunk, n_chunk, pipeline, (uint32_t) act_hvx, aligned_tile_size, exact_reserve);
+
+                if (exact_reserve <= reserve && exact_vtcm <= vtcm_budget) {
+                    if (glu != 0 && (!pipeline || ((n_chunk / 2) & ~31) < 32)) {
+                        break;
+                    }
+                    kparams->kernel_type       = HTP_MM_KERNEL_HMX_2D;
+                    kparams->lora_mode         = HTP_LORA_MODE_HMX;
+                    kparams->pipeline          = pipeline ? 1 : 0;
+                    kparams->n_hmx             = 1;
+                    kparams->n_hvx             = (uint8_t) n_hvx;
+                    kparams->n_act_hvx         = (uint8_t) act_hvx;
+                    kparams->m_chunk           = (int32_t) m_chunk;
+                    kparams->n_chunk           = (int32_t) n_chunk;
+                    kparams->tile_size         = is_tiled ? (int32_t) htp_tensor_get_tile_size(wtype) : 0;
+                    kparams->aligned_tile_size = (int32_t) aligned_tile_size;
+                    kparams->act_row_size      = (int32_t) htp_mm_tiled_act_row_size(wtype, (uint32_t) k);
+                    kparams->vtcm_size         = (int32_t) exact_vtcm;
+                    kparams->div_n_act_hvx     = init_fastdiv_values((uint32_t) act_hvx);
+                    kparams->div_ne00_padded   = init_fastdiv_values(k_padded);
+                    return true;
+                }
+                if (exact_vtcm > vtcm_budget || exact_reserve > reserve) {
+                    reserve = std::max(exact_reserve, reserve + HTP_MM_HMX_TILE_SIZE);
+                }
+            }
+        }
+        return false;
+    }
+
+    // HVX decode path (M <= 4)
+    if (act_nrows > HTP_MM_HMX_MIN_NROWS || opt_mm_select < 1 || !is_tiled || act->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if ((k % htp_tensor_get_tile_k(wtype)) != 0) {
+        return false;
+    }
+
+    const int32_t  ktype        = (act_nrows < n_hvx) ? HTP_MM_KERNEL_HVX_QUANT_BLOCK : HTP_MM_KERNEL_HVX_QUANT_ROW;
+    const size_t   act_row_size = htp_mm_tiled_act_row_size(wtype, (uint32_t) k);
+    const uint32_t max_tiles_thr = (uint32_t) hmx_ceil_div((size_t) max_n, (size_t) 32 * n_hvx) + 1u;
+
+    for (uint32_t d = 16; d >= 2; d /= 2) {
+        struct htp_mm_hvx_vtcm_layout L_base;
+        htp_mm_hvx_vtcm_layout_build(&L_base, ktype, wtype, (uint32_t) k, act_nrows, n_hvx,
+                                     0, w0->nb[1], act_row_size, 0, d, false, true);
+        if (L_base.total_bytes >= vtcm_budget) {
+            continue;
+        }
+        const uint32_t cand_b[] = { max_tiles_thr, 128u, 64u, 32u, 16u, 8u, 4u, 2u, 1u };
+        for (uint32_t b_chunk : cand_b) {
+            if (b_chunk == 0 || b_chunk > max_tiles_thr) {
+                continue;
+            }
+            struct htp_lora_hvx_vtcm_layout L_lora;
+            htp_lora_hvx_layout_build(&L_lora, L_base.total_bytes, (uint32_t) k, act_nrows, n_hvx, (uint32_t) n_loras,
+                                      max_r, max_a_elem_bytes, max_b_row_bytes, max_loras_per_w, b_chunk, glu,
+                                      (uint32_t) max_n);
+            if (L_lora.total_bytes <= vtcm_budget) {
+                kparams->kernel_type       = (uint8_t) ktype;
+                kparams->lora_mode         = HTP_LORA_MODE_HVX;
+                kparams->n_hvx             = (uint8_t) n_hvx;
+                kparams->n_prefetch        = (uint8_t) d;
+                kparams->b_chunk_tiles     = (uint16_t) b_chunk;
+                kparams->tile_size         = (int32_t) htp_tensor_get_tile_size(wtype);
+                kparams->aligned_tile_size = (int32_t) htp_tensor_get_tile_padded_size(wtype);
+                kparams->act_row_size      = (int32_t) act_row_size;
+                kparams->vtcm_size         = (int32_t) L_lora.total_bytes;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool htp_kparams_solve_lora_add(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * base,
+    const struct ggml_tensor * dst,
+    const struct ggml_tensor * act,
+    const struct htp_lora_adapter_desc * loras,
+    int32_t n_loras,
+    struct htp_lora_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+    kparams->norm_w_slot = 0xff;
+
+    if (htp_session_mdev_count(sess) > 1 || n_loras <= 0 || n_loras > HTP_LORA_MAX_ADAPTERS ||
+        !base || !dst || !act || !loras) {
+        return false;
+    }
+    if (2 + 2 * n_loras > HTP_OP_MAX_INPUTS) {
+        return false;
+    }
+    if (base->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        (act->type != GGML_TYPE_F32 && act->type != GGML_TYPE_F16)) {
+        return false;
+    }
+    if (!ggml_are_same_shape(base, dst) || ggml_is_permuted(base) || ggml_is_permuted(dst) || ggml_is_permuted(act)) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(base) || !ggml_is_contiguous_rows(dst) || !ggml_is_contiguous_rows(act)) {
+        return false;
+    }
+    if (base->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || act->nb[0] != htp_lora_elem_size_host(act->type)) {
+        return false;
+    }
+    if (dst->ne[1] != act->ne[1] || dst->ne[2] != act->ne[2] || dst->ne[3] != act->ne[3]) {
+        return false;
+    }
+    if ((dst->data != base->data || !ggml_are_same_stride(dst, base)) && htp_tensors_overlap(dst, base)) {
+        return false;
+    }
+    if (htp_tensors_overlap(dst, act)) {
+        return false;
+    }
+
+    const int64_t k            = act->ne[0];
+    const int64_t n            = dst->ne[0];
+    const uint32_t m_total     = (uint32_t) (act->ne[1] * act->ne[2] * act->ne[3]);
+    if (k <= 0 || n <= 0 || m_total == 0) {
+        return false;
+    }
+
+    uint32_t lora_r_tiles[HTP_LORA_MAX_ADAPTERS] = {};
+    uint32_t max_r                               = 1;
+    size_t   max_a_elem_bytes                    = 2;
+    size_t   max_b_row_bytes                     = 0;
+    bool     need_f32_act                        = (act->type == GGML_TYPE_F32);
+    bool     hmx_scales_ok                       = true;
+
+    for (int32_t l = 0; l < n_loras; ++l) {
+        const struct htp_lora_adapter_desc & ad = loras[l];
+        if (!htp_lora_check_weight_tensor(ad.a) || !htp_lora_check_weight_tensor(ad.b)) {
+            return false;
+        }
+        if (ad.a->ne[0] != k || ad.a->ne[1] < 1 || ad.a->ne[1] > 256 ||
+            ad.b->ne[0] != ad.a->ne[1] || ad.b->ne[1] != n) {
+            return false;
+        }
+        if (htp_tensors_overlap(dst, ad.a) || htp_tensors_overlap(dst, ad.b)) {
+            return false;
+        }
+        if (ad.a->type != GGML_TYPE_F16) {
+            need_f32_act = true;
+        }
+        lora_r_tiles[l]  = ((uint32_t) ad.a->ne[1] + 31u) / 32u;
+        max_r            = std::max(max_r, (uint32_t) ad.a->ne[1]);
+        max_a_elem_bytes = std::max(max_a_elem_bytes, htp_lora_elem_size_host(ad.a->type));
+        max_b_row_bytes  = std::max(max_b_row_bytes, (size_t) ad.b->ne[0] * htp_lora_elem_size_host(ad.b->type));
+        const float asc  = std::fabs(ad.scale);
+        if (asc > 0.0f && (asc < 3.7e-9f || asc > 4e9f)) {
+            hmx_scales_ok = false;
+        }
+    }
+
+    const uint32_t n_hvx       = htp_session_n_hvx(sess);
+    const uint32_t n_hmx       = htp_session_n_hmx(sess);
+    const size_t   vtcm_budget = htp_session_vtcm_size(sess);
+
+    kparams->n_weights = 0;
+    kparams->n_loras   = (uint8_t) n_loras;
+    for (int32_t l = 0; l < n_loras; ++l) {
+        kparams->lora_target[l] = 0;
+        kparams->lora_a_slot[l] = (uint8_t) (2 + 2 * l + 0);
+        kparams->lora_b_slot[l] = (uint8_t) (2 + 2 * l + 1);
+        kparams->lora_scale[l]  = loras[l].scale;
+    }
+
+    if (m_total > HTP_MM_HMX_MIN_NROWS && (k % 32) == 0 && n_hmx > 0 && opt_mm_select >= 2 && hmx_scales_ok) {
+        const uint32_t k_pad = (uint32_t) k;
+        const size_t   max_mc = std::min<size_t>(hex_align_up(m_total, 32), 128);
+        const size_t   max_nc = std::min<size_t>(hex_align_up((size_t) n, 32), 512);
+        for (size_t mc = max_mc; mc >= 32; mc = (mc > 32) ? std::max<size_t>(32, mc - 32) : 0) {
+            for (size_t nc = max_nc; nc >= 32; nc /= 2) {
+                for (uint32_t ah = n_hvx; ah >= 1; ah = (ah > 1) ? ah / 2 : 0) {
+                    struct htp_lora_add_hmx_layout L;
+                    htp_lora_add_hmx_layout_build(&L, k_pad, mc, nc, ah, n_hvx, (uint32_t) n_loras, lora_r_tiles, max_r);
+                    if (L.total_bytes <= vtcm_budget) {
+                        kparams->lora_mode       = HTP_LORA_MODE_HMX;
+                        kparams->n_hmx           = 1;
+                        kparams->n_hvx           = (uint8_t) n_hvx;
+                        kparams->n_act_hvx       = (uint8_t) ah;
+                        kparams->m_chunk         = (int32_t) mc;
+                        kparams->n_chunk         = (int32_t) nc;
+                        kparams->vtcm_size       = (int32_t) L.total_bytes;
+                        kparams->div_n_act_hvx   = init_fastdiv_values(ah);
+                        kparams->div_ne00_padded = init_fastdiv_values(k_pad);
+                        return true;
+                    }
+                    if (ah == 1) break;
+                }
+                if (nc == 32) break;
+            }
+            if (mc == 32) break;
+        }
+    }
+
+    const size_t raw_elem = need_f32_act ? sizeof(float) : sizeof(uint16_t);
+    const uint32_t max_mc = std::min<uint32_t>(m_total, 16u);
+    const uint32_t max_nc = std::min<uint32_t>((uint32_t) hex_round_up((int) ((n + n_hvx - 1) / n_hvx), 32), 256u);
+    for (uint32_t mc = max_mc; mc >= 1; mc = (mc > 1) ? mc / 2 : 0) {
+        for (uint32_t nc = std::max(32u, max_nc); nc >= 32; nc /= 2) {
+            struct htp_lora_add_hvx_layout L;
+            htp_lora_add_hvx_layout_build(&L, (uint32_t) k, mc, nc, n_hvx, (uint32_t) n_loras, max_r,
+                                          raw_elem, max_a_elem_bytes, max_b_row_bytes);
+            if (L.total_bytes <= vtcm_budget) {
+                kparams->lora_mode = HTP_LORA_MODE_HVX;
+                kparams->n_hvx     = (uint8_t) n_hvx;
+                kparams->m_chunk   = (int32_t) mc;
+                kparams->n_chunk   = (int32_t) nc;
+                kparams->vtcm_size = (int32_t) L.total_bytes;
+                return true;
+            }
+            if (nc == 32) break;
+        }
+        if (mc == 1) break;
+    }
+
+    return false;
+}
+
 static bool htp_kparams_solve_binary(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op_tensor,

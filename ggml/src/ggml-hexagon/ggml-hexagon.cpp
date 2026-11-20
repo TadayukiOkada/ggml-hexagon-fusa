@@ -2844,13 +2844,25 @@ static void ggml_hexagon_tensor_repack(ggml_tensor * tensor, ggml_hexagon_sessio
     ggml_hexagon_tensor_set_flags(tensor, HTP_TENSOR_TILED);
 }
 
-static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_session * sess) {
+static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_session * sess,
+                                      std::unordered_set<const struct ggml_tensor *> * skipped_out = nullptr) {
+    std::unordered_set<const struct ggml_tensor *> lora_weights;
+    if (htp_fusion_enabled(HTP_FUSE_LORA) && htp_session_mdev_count(sess) <= 1) {
+        htp_fusion_collect_lora_weights(graph, lora_weights);
+    }
+
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * n = graph->nodes[i];
         if (!ggml_hexagon_op_is_compute(n)) {
             continue;
         }
         if (n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) {
+            if (!lora_weights.empty() && lora_weights.count(n->src[0]) != 0) {
+                if (skipped_out) {
+                    skipped_out->insert(n->src[0]);
+                }
+                continue;
+            }
             ggml_hexagon_tensor_repack(n->src[0], sess);
         }
     }
@@ -2872,7 +2884,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     if (cache_hit) {
         nodes_ptr = &sess->cached_nodes;
     } else {
-        ggml_hexagon_graph_repack(graph, sess);
+        std::unordered_set<const struct ggml_tensor *> skipped_lora_weights;
+        ggml_hexagon_graph_repack(graph, sess, &skipped_lora_weights);
 
         htp_fusion_tag_graph(graph);
 
@@ -2896,6 +2909,16 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
 
         htp_fusion_elide_gdn_state_rows(sess, graph, computed_nodes);
+        htp_fusion_lora(sess, graph, computed_nodes);
+
+        if (!skipped_lora_weights.empty()) {
+            for (const auto & node : computed_nodes) {
+                if ((node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) && !node.inputs.empty() &&
+                    skipped_lora_weights.count(node.inputs[0]) != 0) {
+                    ggml_hexagon_tensor_repack(const_cast<struct ggml_tensor *>(node.inputs[0]), sess);
+                }
+            }
+        }
 
         if (graph->uid != 0) {
             sess->cached_uid   = graph->uid;
