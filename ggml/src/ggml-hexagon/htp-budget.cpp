@@ -55,10 +55,11 @@ static double htp_estimate_sort_ms(const struct ggml_tensor * src0, const struct
     return (k <= 128 ? 0.3e-3 : 0.8e-3) * n * rounds;
 }
 
-// Matmul FLOP per ms for the op budget when src0 is not a weight (attention keys and values),
-// about 0.7 of what the slowest shapes reach on v73 (QCS9075, GGML_HEXAGON_PROFILE): batched F16
-// HMX 0.86-1.5 TFLOP/s (0.86 for KQV with head 64), F16 and F32 HVX 29-94 GFLOP/s (29 for
-// attention scores with head 128).
+// Matmul FLOP per ms for the op budget when src0 is not a weight (attention keys and values), or
+// is a weight on the HVX kernels over many rows, about 0.7 of what the slowest shapes reach on v73
+// (QCS9075, GGML_HEXAGON_PROFILE): batched F16 HMX 0.86-1.5 TFLOP/s (0.86 for KQV with head 64),
+// F16 and F32 HVX 29-94 GFLOP/s (29 for attention scores with head 128), the HVX tiled (quantized
+// row) kernels 115 GFLOP/s (F16 weight 128x3072 x 8 broadcast to 16 batches of 512 rows, 56 ms).
 static double htp_mm_flop_per_ms(int kernel_type) {
     switch (kernel_type) {
         case HTP_MM_KERNEL_HMX_BATCHED:
@@ -67,6 +68,9 @@ static double htp_mm_flop_per_ms(int kernel_type) {
         case HTP_MM_KERNEL_HVX_F32_F32_VTCM:
         case HTP_MM_KERNEL_HVX_BF16_F32_VTCM:
             return 20.0e6;
+        case HTP_MM_KERNEL_HVX_QUANT_ROW:
+        case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
+            return 80.0e6;
         default:
             return 5.0e9;
     }
@@ -114,10 +118,14 @@ static bool htp_mul_mat_within_budget(const struct ggml_hexagon_session * sess, 
     // Weights take the HMX rate: on HMX, and for a few rows (decode) on HVX, where the bytes bound
     // the time. F16/F32/BF16 weights that HMX does not take over many rows (K not a multiple of 32,
     // such as the SigLIP FFN down projection with K = 4304: 107 ms for 1024 tokens) run at the HVX rate.
+    // Weights that HMX does not take over many rows on the tiled kernels (a batched F16 weight
+    // broadcast over more batches) run at their HVX rate as well.
     const bool hvx_float = (kernel_type == HTP_MM_KERNEL_HVX_F16_F16_VTCM || kernel_type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||
                             kernel_type == HTP_MM_KERNEL_HVX_BF16_F32_VTCM) && ggml_nrows(src1) > 32;
+    const bool hvx_tiled = (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) &&
+                           ggml_nrows(src1) > 32;
     const double flops = 2.0 * src0->ne[0] * src0->ne[1] * ggml_nrows(src1);
-    const double rate  = src0_weight && !hvx_float ? 5.0e9 : htp_mm_flop_per_ms(kernel_type);
+    const double rate  = src0_weight && !hvx_float && !hvx_tiled ? 5.0e9 : htp_mm_flop_per_ms(kernel_type);
     double       est   = (std::max)(flops / rate, (double) ggml_nbytes(src0) / 45.0e6);
     // With a short K the HVX float kernels are bound by the number of dot products, not by FLOP:
     // the depthwise 3x3 convolution of NeMo's offline pre-encoder (K = 9, one weight row x 49533 x
@@ -150,6 +158,25 @@ static double htp_estimate_bytes_ms(const struct ggml_tensor * op, double bytes_
         bytes += (double) ggml_nbytes(op->src[i]);
     }
     return bytes / bytes_per_ms;
+}
+
+// UPSCALE runs in chunks of output rows of one plane, one HVX thread per chunk, from the kernel's
+// time per chunk (htp_upscale_chunk_ms). With yield inside ops VTCM/HMX can be released between
+// rounds of chunks, so the longest hold is one round; otherwise it is the whole op. The estimate
+// used to be the bytes at 20 GB/s, which let the old scalar antialiased kernel
+// hold VTCM for 86 ms (SigLIP2 position embeddings 16x16 -> 38x26 x 1152 channels).
+static double htp_estimate_upscale_ms(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    struct htp_upscale_kernel_params kp;
+    if (!htp_kparams_solve_upscale(sess, op, &kp) || kp.n_hvx == 0) {
+        return 0.0; // not supported: supports_op refuses it anyway
+    }
+    const double chunk_ms = htp_upscale_chunk_ms(&kp, op->src[0], op);
+#ifdef GGML_HEXAGON_HTP_YIELD_IN_OPS
+    const uint32_t chunks = kp.chunks_per_round ? kp.chunks_per_round : kp.total_chunks;
+#else
+    const uint32_t chunks = kp.total_chunks;
+#endif
+    return chunk_ms * (double) ((chunks + kp.n_hvx - 1) / kp.n_hvx);
 }
 
 // CONV_2D: kernel [KW, KH, IC, OC], dst [OW, OH, OC, N]
@@ -215,6 +242,7 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
                         ggml_op_desc(op), op->name);
             return false;
         case GGML_OP_UPSCALE:
+            return htp_budget_check(sess, op, htp_estimate_upscale_ms(sess, op));
         case GGML_OP_TOP_K_MASK:
             return htp_budget_check(sess, op, htp_estimate_bytes_ms(op, 20.0e6));
         case GGML_OP_DSV4_HC_PRE:

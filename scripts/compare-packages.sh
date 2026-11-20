@@ -14,6 +14,11 @@
 #   sv       run-sensevoice.sh --json on HTP0 and HTP1, 4 inputs, old vs new
 #   servers  nemo-speech serve and sensevoice-server on the same HTP0, back-to-back requests
 #            checked with scripts/rss-soak.py (new only)
+#   vlm      llama-mtmd-cli, LFM2.5-VL-450M and one image, 32 tokens greedy: the language model on
+#            HTP0 and the vision encoder (SigLIP2) on HTP1, then both on HTP0, with
+#            GGML_HEXAGON_PROFILE=1 for scripts/verdict.py (op budget on vlm_new_*.err). New only:
+#            before the separable UPSCALE kernels the encoder's position-embedding resize held
+#            VTCM/HMX for 86 ms and stopped a functional-safety cDSP.
 #
 # Packages are made by scripts/package.sh (flat or --split; both have run.sh, run-asr.sh and
 # run-sensevoice.sh). "-" as the old package skips the old runs. Set ADSP_LIBRARY_PATH as the
@@ -31,6 +36,7 @@ summary=$out/summary.txt
 M=$kit/models A=$kit/audio
 Q3=$M/Qwen3-0.6B-Q4_0.gguf Q35=$M/Qwen3.5-0.8B-Q4_0.gguf
 NM=$M/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf SM=$M/sensevoice-small-q8.gguf
+VL=$M/LFM2.5-VL-450M-Q4_0.gguf VLP=$M/mmproj-LFM2.5-VL-450m-Q8_0.gguf IMG=$kit/images/coco_000000002261.jpg
 
 log() { echo "$*" | tee -a "$summary"; }
 md5() { md5sum < "$1" | cut -c1-12; }
@@ -102,6 +108,12 @@ for step in "$@"; do
                 > "$out/sv_${v}_${d}_$n.json" 2> "$out/sv_${v}_${d}_$n.err"
             rc=$?; h=$(md5 "$out/sv_${v}_${d}_$n.json")
             log "sv $v $d $n rc=$rc md5=$h $(same sv_${d}_$n "$h" $v)"; sleep 2; done; done; done ;;
+    vlm)
+        for d in HTP1 HTP0; do
+            GGML_HEXAGON_DEVICES=HTP0,HTP1 GGML_HEXAGON_PROFILE=1 timeout 300 "$new/run.sh" llama-mtmd-cli -m "$VL" \
+                --mmproj "$VLP" --image "$IMG" -p "Describe this image in one sentence." -ngl 99 -dev HTP0 -mmdev $d \
+                --temp 0 -n 32 -lv 5 < /dev/null > "$out/vlm_new_$d.out" 2> "$out/vlm_new_$d.err"
+            log "vlm new $d rc=$? md5=$(md5 "$out/vlm_new_$d.out")"; sleep 3; done ;;
     servers)
         hex=$new/bin/libggml-hexagon.so; [ -f "$hex" ] || hex=$new/libggml-hexagon.so
         cat > "$out/nemo.yaml" <<YAML

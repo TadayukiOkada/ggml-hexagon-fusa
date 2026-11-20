@@ -1,0 +1,6 @@
+# Op groups of test-backend-ops-hex --ops runs that may exceed the op budget (checked by
+# scripts/verdict.py --ops with scripts/op-budget.py --fail). Every other group that holds VTCM/HMX
+# past the budget without yielding inside fails the verdict: on functional-safety firmware it stops
+# the DSP. One per line: <OP or OP:tag> <regex on "dims  types" of the op-budget row> <reason>
+# Remove a line when the case no longer runs over the budget.
+MUL_MAT:hvx-tiled  ^128:3072:8:1\sx\s128:512:16:1\s  test-backend-ops asks about a weight before its data exists, so the budget cannot estimate it; in a graph the F16 weight on the HVX tiled kernel (56 ms) is left to the CPU

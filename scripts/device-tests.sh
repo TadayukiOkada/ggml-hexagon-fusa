@@ -87,7 +87,7 @@ if [ $long -eq 1 ]; then
         "fa FLASH_ATTN_EXT hsk=128,hsv=128,nh=8,nr23=\[2,1\],kv=(512|4096|8192|16384),nb=512," \
         "convdw CONV_2D_DW ne_input=\[(4096,1,1024,1|64,3000,256,1)\]" \
         "conv2d CONV_2D ne_input=\[128,128,256,1\]" \
-        "upscale UPSCALE ne=\[512,512,64,1\]" \
+        "upscale UPSCALE ne=\[(512,512,64,1|1152,16,16,1)\]" \
         "topkmask TOP_K_MASK n_kv=32768," \
         "indexer LIGHTNING_INDEXER hsk=128,nh=64,kv=16384,"
     do

@@ -5,7 +5,9 @@
                   have exactly one result row with a pass count; every failing case must match
                   tests/known-failures.txt (op, case regex, largest error); an op that fails without
                   a list of failing cases (crash, timeout, signal) fails. --leak in the same summary
-                  must pass. An empty or partial summary fails.
+                  must pass. An empty or partial summary fails. The op times of test_*.log
+                  (GGML_HEXAGON_PROFILE) must stay within the op budget (scripts/op-budget.py --fail),
+                  except the groups in tests/known-over-budget.txt (--known-budget).
   --long DIR      device-tests.sh --long output: every long step rc=0 with a log that has profile
                   lines, then scripts/op-budget.py --fail on long_*.log (no op over the budget that
                   does not yield inside).
@@ -13,6 +15,8 @@
                   (counts below), each with rc=0; a server left running fails; llama-bench new below
                   old by more than --speed-drop fails (the means when a pair was run several times,
                   e.g. old/new/new/old); an output that differs from the old package's is REVIEW.
+                  The vlm step's profiles (vlm_new_*.err next to the summary) must stay within the
+                  op budget (scripts/op-budget.py --fail).
   --probe-dir D   tools/vtcmlat CSVs (header t_us,lat_us) under D: every CSV must have samples,
                   no failed (negative) sample and a maximum below --probe-ms (the FuSa self-test
                   stops the DSP at 50 ms); its .log, when present, must report no failure. No CSV
@@ -26,7 +30,8 @@
 Exit 0 PASS, 3 REVIEW, 1 FAIL. Prints one line per finding.
 
 usage: scripts/verdict.py [--ops DIR] [--long DIR] [--compare F]... [--probe-dir D]... [--probe F]...
-                          [--known tests/known-failures.txt] [--speed-drop 0.03] [--probe-ms 25]
+                          [--known tests/known-failures.txt] [--known-budget tests/known-over-budget.txt]
+                          [--speed-drop 0.03] [--probe-ms 25]
                           [--json OUT]
 """
 
@@ -55,6 +60,7 @@ COMPARE_LINES = {
     "sv":      (8, 0),
     "servers": (0, 4),
     "asr300":  (0, 1),
+    "vlm":     (0, 2),
 }
 
 
@@ -89,7 +95,7 @@ def rc_of(line):
     return int(m.group(1)) if m else None
 
 
-def check_ops(d, known, out):
+def check_ops(d, known, out, known_budget=()):
     summary = os.path.join(d, "summary.txt")
     if not os.path.isfile(summary):
         out.fail(f"ops: no {summary}")
@@ -146,6 +152,40 @@ def check_ops(d, known, out):
         elif k["op"] in seen:
             out.note(f"ops: known {k['op']} {k['re'].pattern} no longer fails: remove it from the list?")
     out.note(f"ops: {len(seen)} ops checked")
+    check_budget(sorted(glob.glob(os.path.join(d, "test_*.log"))), "ops", out, known_budget)
+
+
+def read_known_budget(path):
+    """tests/known-over-budget.txt: <OP or OP:tag> <regex> <reason> -> op-budget.py --exempt specs"""
+    specs = []
+    if path and os.path.isfile(path):
+        for line in open(path, errors="replace"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                raise SystemExit(f"verdict: {path}: expected '<op> <regex> <reason>': {line}")
+            specs.append(f"{parts[0]}={parts[1]}")
+    return specs
+
+
+def check_budget(logs, what, out, exempt=()):
+    """scripts/op-budget.py --fail on profile logs; no profile lines fails"""
+    if not logs:
+        out.fail(f"{what}: no logs for the op budget")
+        return
+    args = [a for e in exempt for a in ("--exempt", e)]
+    r = subprocess.run([sys.executable, os.path.join(HERE, "op-budget.py"), "--fail", "--top", "0", *args, *logs],
+                       capture_output=True, text=True)
+    if r.returncode == 2:
+        out.fail(f"{what}: no profile-op lines in {len(logs)} logs (run with GGML_HEXAGON_PROFILE=1)")
+        return
+    if r.returncode:
+        for line in r.stdout.splitlines():
+            if line.startswith("!!"):
+                out.fail(f"{what}: over the op budget: {' '.join(line[2:].split())}")
+    (out.fail if r.returncode else out.note)(f"{what}: op-budget.py --fail rc={r.returncode} on {len(logs)} logs")
 
 
 def check_long(d, out):
@@ -216,6 +256,8 @@ def check_compare(path, drop, out):
                 bench.setdefault((m.group(2), test, m.group(1)), []).append(float(value))
     if not steps:
         out.fail(f"compare: no steps in {path}")
+    if "vlm" in steps:
+        check_budget(sorted(glob.glob(os.path.join(os.path.dirname(path), "vlm_new_*.err"))), "compare: vlm", out)
     for step, n in steps.items():
         if step not in COMPARE_LINES:
             continue
@@ -343,6 +385,7 @@ def main(argv=None):
     ap.add_argument("--probe-dir", action="append", default=[])
     ap.add_argument("--probe", action="append", default=[])
     ap.add_argument("--known", default=os.path.join(HERE, "..", "tests", "known-failures.txt"))
+    ap.add_argument("--known-budget", default=os.path.join(HERE, "..", "tests", "known-over-budget.txt"))
     ap.add_argument("--speed-drop", type=float, default=0.03)
     ap.add_argument("--probe-ms", type=float, default=25.0)
     ap.add_argument("--accept")
@@ -359,7 +402,7 @@ def main(argv=None):
     if not (a.ops or a.long or a.compare or a.probe_dir or a.probe):
         out.fail("nothing to check")
     if a.ops:
-        check_ops(a.ops, load_known(a.known), out)
+        check_ops(a.ops, load_known(a.known), out, read_known_budget(a.known_budget))
     if a.long:
         check_long(a.long, out)
     for f in a.compare:

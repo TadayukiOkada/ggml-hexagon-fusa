@@ -51,6 +51,13 @@ struct htp_upscale_kernel_params {
     uint32_t total_chunks;
     uint32_t vtcm_size;
 
+    // Chunks per round: the op releases VTCM/HMX between rounds on request (skel built with
+    // yield inside ops). Chosen on the host from the kernel's time per output; 0 = one round.
+    uint32_t chunks_per_round;
+    // Separable filters (bicubic, antialiased bilinear): taps per output along x and y
+    uint16_t taps0;
+    uint16_t taps1;
+
     struct fastdiv_values div_chunks_per_slice;
     struct fastdiv_values div_dst_z;
 };
@@ -75,27 +82,57 @@ struct upscale_bilinear_y {
     float    wy1;
 };
 
-struct upscale_bicubic_x {
-    int32_t x[4];
-    float   w[4];
+// Antialiased bilinear and bicubic run as separable filters. Bicubic: the CPU sums each of the 4
+// source rows along x with the cubic weights and then the 4 row sums along y. Antialiased bilinear
+// (triangle filter): the weight of a source pixel is wx * wy and the normalisation
+// sum(wx * wy) = sum(wx) * sum(wy), so weights normalised per axis give the same sums. An output is
+// a weighted sum along y of contiguous source rows, each a weighted sum along x.
+// Along x, 32 outputs keep taps0 pairs of vectors: byte offsets into the row and weights (0 for
+// taps past the support).
+struct __attribute__((aligned(128))) upscale_sep_x_tap {
+    int32_t off[32];
+    float   w[32];
 };
 
-struct upscale_bicubic_y {
-    int32_t y[4];
-    float   w[4];
-};
-
-struct upscale_antialias_x {
-    int32_t x_min;
-    int32_t x_max;
-    float   xf;
-};
-
-struct upscale_antialias_y {
+// Along y: the source rows [y_min, y_max) of one output row; their weights are taps1 floats per
+// output row in a separate table.
+struct upscale_sep_y {
     int32_t y_min;
     int32_t y_max;
-    float   yf;
 };
+
+#define HTP_UPSCALE_BICUBIC_TAPS 4
+
+static inline bool htp_upscale_is_separable(uint32_t mode, bool antialias) {
+    return mode == HTP_UPSCALE_MODE_BICUBIC || (mode == HTP_UPSCALE_MODE_BILINEAR && antialias);
+}
+
+// Taps of the antialiased filter along one axis: the source range [trunc(c - r), trunc(c + r)) of a
+// support radius r holds at most ceil(2r) + 1 pixels.
+static inline uint32_t htp_upscale_antialias_taps(float filter_radius) {
+    return (uint32_t) ceilf(2.0f * filter_radius) + 1;
+}
+
+// Sizes of the lookup tables in the DDR scratch: along x, along y and, for the separable filters,
+// the weights along y. The host checks them against HTP_DDR_SPAD_SIZE, the DSP lays them out.
+static inline void htp_upscale_lut_sizes(uint32_t mode, bool antialias, uint32_t dst_x, uint32_t dst_y, uint32_t taps0,
+                                         uint32_t taps1, size_t * lut_x_size, size_t * lut_y_size, size_t * lut_wy_size) {
+    const uint32_t n_chunks = (dst_x + 31) / 32;
+    size_t x = 0, elem_y = sizeof(uint32_t), wy = 0;
+    if (htp_upscale_is_separable(mode, antialias)) {
+        x      = (size_t) n_chunks * taps0 * sizeof(struct upscale_sep_x_tap);
+        elem_y = sizeof(struct upscale_sep_y);
+        wy     = (size_t) dst_y * taps1 * sizeof(float);
+    } else if (mode == HTP_UPSCALE_MODE_BILINEAR) {
+        x      = n_chunks * sizeof(struct upscale_bilinear_x_chunk);
+        elem_y = sizeof(struct upscale_bilinear_y);
+    } else {
+        x = dst_x * sizeof(uint32_t);
+    }
+    *lut_x_size  = hex_round_up(x, 128);
+    *lut_y_size  = hex_round_up(dst_y * elem_y, 128);
+    *lut_wy_size = hex_round_up(wy, 128);
+}
 
 struct htp_upscale_vtcm_layout {
     size_t   total_bytes;
