@@ -12,6 +12,7 @@
 #include "htp/get-rows-ops.h"
 #include "htp/glu-ops.h"
 #include "htp/lightning-indexer-ops.h"
+#include "htp/lora-ops.h"
 #include "htp/matmul-ops.h"
 #include "htp/pad-ops.h"
 #include "htp/repeat-ops.h"
@@ -37,6 +38,8 @@ std::string htp_opnode::name() const {
         case HTP_OP_HADAMARD:      return "MUL_MAT_HADAMARD";
         case HTP_OP_MUL_MAT_NX:    return "MUL_MAT_NX";
         case HTP_OP_MUL_MAT_ID_NX: return "MUL_MAT_ID_NX";
+        case HTP_OP_MUL_MAT_LORA:  return "MUL_MAT_LORA";
+        case HTP_OP_LORA_ADD:      return "LORA_ADD";
         case HTP_OP_ADD:
         case HTP_OP_SUB:
         case HTP_OP_MUL:
@@ -144,9 +147,27 @@ static std::string format_kernel_params(const htp_opnode & node) {
     char str[128];
     const size_t max_size = sizeof(str);
 
-    if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID ||
-        node.opcode == HTP_OP_MUL_MAT_NX || node.opcode == HTP_OP_MUL_MAT_ID_NX ||
-        node.opcode == HTP_OP_MUL_MAT_ADD) {
+    if (node.opcode == HTP_OP_MUL_MAT_LORA) {
+        const auto * kparams = node.kparams<htp_lora_kernel_params>();
+        const char * path = kparams->lora_mode == HTP_LORA_MODE_HMX
+            ? (kparams->tile_size > 0 ? "hmx-tiled" : "hmx-flat")
+            : "hvx-tiled";
+        const char * norm_str = kparams->norm ? " norm" : "";
+        const char * glu_str  = kparams->glu == HTP_MM_GLU_GEGLU  ? " geglu"  :
+                                kparams->glu == HTP_MM_GLU_SWIGLU ? " swiglu" : "";
+        snprintf(str, max_size, "%s nhvx %u nw %u nl %u%s%s vtcm %u", path,
+                 (unsigned int) kparams->n_hvx, (unsigned int) kparams->n_weights,
+                 (unsigned int) kparams->n_loras, norm_str, glu_str,
+                 (unsigned int) kparams->vtcm_size);
+    } else if (node.opcode == HTP_OP_LORA_ADD) {
+        const auto * kparams = node.kparams<htp_lora_kernel_params>();
+        const char * path = (kparams->lora_mode == HTP_LORA_MODE_HMX) ? "hmx" : "hvx";
+        snprintf(str, max_size, "%s nhvx %u nl %u vtcm %u", path,
+                 (unsigned int) kparams->n_hvx, (unsigned int) kparams->n_loras,
+                 (unsigned int) kparams->vtcm_size);
+    } else if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID ||
+               node.opcode == HTP_OP_MUL_MAT_NX || node.opcode == HTP_OP_MUL_MAT_ID_NX ||
+               node.opcode == HTP_OP_MUL_MAT_ADD) {
         const auto * kparams = node.kparams<htp_mm_kernel_params>();
         const char * path = "unknown";
         int32_t type = kparams->kernel_type;

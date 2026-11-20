@@ -19,6 +19,7 @@
 #include "htp/glu-ops.h"
 #include "htp/im2col-ops.h"
 #include "htp/lightning-indexer-ops.h"
+#include "htp/lora-ops.h"
 #include "htp/matmul-ops.h"
 #include "htp/pad-ops.h"
 #include "htp/pool-ops.h"
@@ -126,6 +127,39 @@ bool htp_kparams_solve_mmnx(
     const struct ggml_tensor * act,
     int32_t n_weights,
     struct htp_mm_kernel_params * kparams
+);
+
+struct htp_lora_adapter_desc {
+    const struct ggml_tensor * a;
+    const struct ggml_tensor * b;
+    float scale;
+    uint8_t target; // output weight index 0..n_weights-1 (0 for LORA_ADD)
+};
+
+bool htp_kparams_solve_matmul_lora(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * const * weights,
+    int32_t n_weights,
+    const struct ggml_tensor * act,
+    const struct ggml_tensor * norm_w,
+    bool has_norm,
+    float norm_eps,
+    float norm_scale,
+    uint8_t glu,
+    const struct htp_lora_adapter_desc * loras,
+    int32_t n_loras,
+    struct htp_lora_kernel_params * kparams,
+    uint8_t * norm_w_slot_out
+);
+
+bool htp_kparams_solve_lora_add(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * base,
+    const struct ggml_tensor * dst,
+    const struct ggml_tensor * act,
+    const struct htp_lora_adapter_desc * loras,
+    int32_t n_loras,
+    struct htp_lora_kernel_params * kparams
 );
 
 bool htp_kparams_solve_mmidnx(

@@ -1,0 +1,202 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 6ddc3bf..2c01211 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6429,6 +6429,129 @@ struct test_rms_norm_rope : public test_case {
+     }
+ };
+ 
++// LoRA adapters on matmuls, Q/K/V norm-matmul groups, FFN gate/up GLU chains, and standalone LORA_ADD fallbacks
++struct test_lora_fusion : public test_case {
++    const int       kind;       // 0 = single mm (+ stacked LoRA), 1 = Q/K/V norm+mm+LoRA, 2 = FFN norm+gate/up+LoRA+GLU
++    const ggml_type type_w;     // base weight type
++    const ggml_type type_l;     // LoRA A/B weight type
++    const int64_t   k;          // input width
++    const int64_t   m;          // output width
++    const int64_t   n;          // token count
++    const int64_t   r;          // LoRA rank
++    const int       n_lora;     // stacked LoRA adapters per matmul
++    const float     scale;      // LoRA scale for adapter 0
++    const bool      with_norm;  // prepend RMS_NORM + MUL
++    const int       glu_mode;   // 0 = none, 1 = GEGLU split, 2 = SWIGLU split, 3 = GELU+MUL, 4 = SILU+MUL
++    const bool      up_first;   // emit up projection before gate projection
++    const int       qkv_mask;   // bitmask of Q/K/V projections receiving LoRA (kind == 1)
++    const bool      separate_x; // feed LoRA from a distinct activation tensor (forces LORA_ADD)
++
++    std::string vars() override {
++        return VARS_TO_STR14(kind, type_w, type_l, k, m, n, r, n_lora, scale, with_norm, glu_mode, up_first, qkv_mask, separate_x);
++    }
++    std::string op_desc(ggml_tensor *) override { return "LORA_FUSION"; }
++    bool run_whole_graph() override { return true; }
++    bool use_weight_context() override { return true; }
++    double max_nmse_err() override { return 5e-4; }
++
++    test_lora_fusion(int kind, ggml_type type_w, ggml_type type_l,
++            int64_t k, int64_t m, int64_t n, int64_t r, int n_lora, float scale,
++            bool with_norm = false, int glu_mode = 0, bool up_first = false,
++            int qkv_mask = 0, bool separate_x = false)
++        : kind(kind), type_w(type_w), type_l(type_l),
++          k(k), m(m), n(n), r(r), n_lora(n_lora), scale(scale),
++          with_norm(with_norm), glu_mode(glu_mode), up_first(up_first),
++          qkv_mask(qkv_mask), separate_x(separate_x) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        return build_graph(ctx, ctx);
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
++        ggml_context * ctx_w = ctx_weights ? ctx_weights : ctx;
++
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_set_name(x, "x");
++
++        ggml_tensor * cur = x;
++        if (with_norm) {
++            ggml_tensor * wn = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, k);
++            ggml_set_name(wn, "wn");
++            cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, 1e-6f), wn);
++        }
++
++        ggml_tensor * x_lora = cur;
++        if (separate_x) {
++            x_lora = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++            ggml_set_name(x_lora, "x_lora");
++        }
++
++        auto add_lora = [&](ggml_tensor * res, ggml_tensor * lx, int64_t out_dim, const char * tag) -> ggml_tensor * {
++            for (int a = 0; a < n_lora; a++) {
++                ggml_tensor * la = ggml_new_tensor_2d(ctx_w, type_l, k, r);
++                ggml_tensor * lb = ggml_new_tensor_2d(ctx_w, type_l, r, out_dim);
++                ggml_format_name(la, "%s_la%d", tag, a);
++                ggml_format_name(lb, "%s_lb%d", tag, a);
++                const float s = (a == 0) ? scale : (scale == 0.0f ? 0.5f : -0.5f * scale);
++                ggml_tensor * ab = ggml_mul_mat(ctx, lb, ggml_mul_mat(ctx, la, lx));
++                ab = ggml_scale(ctx, ab, s);
++                res = ggml_add(ctx, res, ab);
++            }
++            return res;
++        };
++
++        ggml_tensor * out = nullptr;
++        if (kind == 0) {
++            ggml_tensor * w = ggml_new_tensor_2d(ctx_w, type_w, k, m);
++            ggml_set_name(w, "w");
++            out = ggml_mul_mat(ctx, w, cur);
++            out = add_lora(out, x_lora, m, "w");
++        } else if (kind == 1) {
++            const char * tags[3] = { "q", "k", "v" };
++            ggml_tensor * mm[3];
++            for (int i = 0; i < 3; i++) {
++                ggml_tensor * w = ggml_new_tensor_2d(ctx_w, type_w, k, m);
++                ggml_set_name(w, tags[i]);
++                mm[i] = ggml_mul_mat(ctx, w, cur);
++                if ((qkv_mask >> i) & 1) {
++                    mm[i] = add_lora(mm[i], x_lora, m, tags[i]);
++                }
++            }
++            out = ggml_add(ctx, mm[0], ggml_add(ctx, mm[1], mm[2]));
++        } else {
++            ggml_tensor * w_gate = ggml_new_tensor_2d(ctx_w, type_w, k, m);
++            ggml_tensor * w_up   = ggml_new_tensor_2d(ctx_w, type_w, k, m);
++            ggml_set_name(w_gate, "w_gate");
++            ggml_set_name(w_up, "w_up");
++            ggml_tensor * g = nullptr;
++            ggml_tensor * u = nullptr;
++            if (up_first) {
++                u = ggml_mul_mat(ctx, w_up, cur);
++                u = add_lora(u, x_lora, m, "up");
++                g = ggml_mul_mat(ctx, w_gate, cur);
++                g = add_lora(g, x_lora, m, "gate");
++            } else {
++                g = ggml_mul_mat(ctx, w_gate, cur);
++                g = add_lora(g, x_lora, m, "gate");
++                u = ggml_mul_mat(ctx, w_up, cur);
++                u = add_lora(u, x_lora, m, "up");
++            }
++            if (glu_mode == 1) {
++                out = ggml_glu_split(ctx, g, u, GGML_GLU_OP_GEGLU);
++            } else if (glu_mode == 2) {
++                out = ggml_glu_split(ctx, g, u, GGML_GLU_OP_SWIGLU);
++            } else if (glu_mode == 3) {
++                out = ggml_mul(ctx, ggml_gelu(ctx, g), u);
++            } else {
++                out = ggml_mul(ctx, ggml_silu(ctx, g), u);
++            }
++        }
++
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_OUT_PROD
+ struct test_out_prod : public test_case {
+     const ggml_type type_a;
+@@ -14136,6 +14259,67 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // LoRA fusion: single MUL_MAT+LoRA across base/LoRA dtypes, ranks, batch sizes, outputs, scales
++    for (ggml_type type_w : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16}) {
++        for (ggml_type type_l : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
++            for (int64_t n : {1, 128}) {
++                test_cases.emplace_back(new test_lora_fusion(0, type_w, type_l, 256, 256, n, 16, 1, 2.0f));
++            }
++        }
++    }
++    for (int64_t r : {4, 8, 16, 24, 32, 64}) {
++        for (int64_t n : {2, 33}) {
++            test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_0, GGML_TYPE_F16, 256, 256, n, r, 1, 1.5f));
++        }
++    }
++    for (int64_t n : {1, 2, 4, 33, 128, 512}) {
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_0, GGML_TYPE_F16, 256, 1056, n, 32, 1, 1.25f));
++    }
++    for (int64_t m : {256, 1056, 100}) {
++        for (int64_t n : {1, 128}) {
++            test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_F16, GGML_TYPE_F16, 256, m, n, 16, 1, -1.5f));
++        }
++    }
++    for (int64_t n : {1, 128}) {
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_0, GGML_TYPE_F16, 256, 100, n, 16, 1, -1.5f));
++    }
++    for (float s : {2.0f, -1.5f, 0.0f, 1e-3f}) {
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 256, 4, 8, 1, s));
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_K, GGML_TYPE_F16, 256, 256, 128, 24, 1, s));
++    }
++
++    // Stacked multi-LoRA (2 adapters on same base)
++    for (int64_t n : {1, 2, 128}) {
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_0, GGML_TYPE_F16, 256, 256, n, 16, 2, 2.0f));
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 256, n, 16, 2, 2.0f));
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_F16, GGML_TYPE_BF16, 256, 256, n, 16, 2, 2.0f));
++    }
++
++    // RMS_NORM+MUL + Q/K/V MUL_MAT_NX + LoRA (all 3 LoRA'd and partial Q/V-only LoRA'd)
++    for (int qkv_mask : {7, 5}) {
++        for (int64_t n : {1, 2, 128}) {
++            test_cases.emplace_back(new test_lora_fusion(1, GGML_TYPE_Q4_0, GGML_TYPE_F16, 256, 256, n, 16, 1, 1.5f, true, 0, false, qkv_mask));
++            test_cases.emplace_back(new test_lora_fusion(1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 256, n, 16, 1, 1.5f, true, 0, false, qkv_mask));
++        }
++    }
++
++    // RMS_NORM+MUL + gate/up MUL_MAT_NX + LoRA + GEGLU/SWIGLU (split and unfused act+mul, gate-first and up-first, 1 and 2 adapters)
++    for (int glu_mode : {1, 2, 3, 4}) {
++        for (int64_t n : {1, 2, 70, 512}) {
++            const bool up_first = (n == 2 || n == 512);
++            const int n_lora = (n == 2 || n == 70) ? 2 : 1;
++            test_cases.emplace_back(new test_lora_fusion(2, GGML_TYPE_Q4_0, GGML_TYPE_F16, 256, 512, n, 16, n_lora, 1.5f, true, glu_mode, up_first));
++        }
++        test_cases.emplace_back(new test_lora_fusion(2, GGML_TYPE_Q4_K, GGML_TYPE_F16, 256, 1056, 70, 16, 1, 1.5f, true, glu_mode, true));
++        test_cases.emplace_back(new test_lora_fusion(2, GGML_TYPE_Q4_K, GGML_TYPE_F16, 256, 1056, 1, 16, 2, 1.5f, true, glu_mode, false));
++    }
++
++    // Standalone LORA_ADD fallback (x_lora != x_base and K = 48 non-multiple of 32)
++    for (int64_t n : {1, 2, 64}) {
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_Q4_0, GGML_TYPE_F16, 256, 256, n, 16, 1, 1.5f, false, 0, false, 0, true));
++        test_cases.emplace_back(new test_lora_fusion(0, GGML_TYPE_F16, GGML_TYPE_F16, 48, 256, n, 8, 1, 1.5f, false, 0, false, 0, false));
++    }
++
+     // matmul + residual (fusable into the HMX store) and matvec + logit softcap (fusable into the
+     // repacked matvec)
+     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_Q6_K}) {

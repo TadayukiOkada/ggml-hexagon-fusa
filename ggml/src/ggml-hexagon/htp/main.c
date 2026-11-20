@@ -1125,6 +1125,12 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_MUL_MAT_NX:
             return op_matmul_nx(octx);
 
+        case HTP_OP_LORA_ADD:
+            return op_lora_add(octx);
+
+        case HTP_OP_MUL_MAT_LORA:
+            return op_matmul_lora(octx);
+
         case HTP_OP_MUL:
         case HTP_OP_ADD:
         case HTP_OP_SUB:
