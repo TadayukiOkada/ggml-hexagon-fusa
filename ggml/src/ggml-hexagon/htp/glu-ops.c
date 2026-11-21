@@ -193,56 +193,17 @@ static inline void hvx_geglu_f32_aa(uint8_t * restrict dst, const uint8_t * rest
     const HVX_Vector * restrict vsrc0 = (const HVX_Vector *) src0;
     const HVX_Vector * restrict vsrc1 = (const HVX_Vector *) src1;
 
-    const uint32_t epv  = 128 / sizeof(float);
-    const uint32_t nvec = n / epv;
-    const uint32_t nloe = n % epv;
+    const uint32_t nvec = n / VLEN_FP32;
+    const uint32_t nloe = n % VLEN_FP32;
 
-    const float GELU_COEF_A_TIMES_SQRT = GELU_COEF_A * SQRT_2_OVER_PI;
-
-    const HVX_Vector v_coef_a_times_sqrt = hvx_vec_splat_f32(GELU_COEF_A_TIMES_SQRT);
-    const HVX_Vector v_sqrt_2_pi         = hvx_vec_splat_f32(SQRT_2_OVER_PI);
-    const HVX_Vector v_one               = hvx_vec_splat_f32(1.0f);
-    const HVX_Vector v_max_exp           = hvx_vec_splat_f32(87.0f);
-    const HVX_Vector v_min_exp           = hvx_vec_splat_f32(-87.0f);
-
+    // the operations of hvx_vec_geglu_f32, shared with the unary GELU and the fused matmul store
     uint32_t i = 0;
-
     _Pragma("unroll(4)")
     for (; i < nvec; i++) {
-        HVX_Vector x = vsrc0[i];
-        HVX_Vector g = vsrc1[i];
-
-        HVX_Vector x2 = hvx_vec_mul_f32_f32(x, x);
-        HVX_Vector coef = hvx_vec_mul_f32_f32(x2, v_coef_a_times_sqrt);
-        coef = hvx_vec_add_f32_f32(coef, v_sqrt_2_pi);
-        HVX_Vector inner = hvx_vec_mul_f32_f32(x, coef);
-
-        // y2 = 2 * inner = inner + inner
-        HVX_Vector y2 = hvx_vec_add_f32_f32(inner, inner);
-
-        // Fast sigmoid approximation (2 iterations)
-        HVX_Vector sig2y = hvx_vec_fast_sigmoid_f32_guard_2it(y2, v_one, v_max_exp, v_min_exp);
-
-        HVX_Vector gelu_x = hvx_vec_mul_f32_f32(x, sig2y);
-        vdst[i] = hvx_vec_mul_f32_f32(gelu_x, g);
+        vdst[i] = hvx_vec_geglu_f32(vsrc0[i], vsrc1[i]);
     }
-
     if (nloe) {
-        HVX_Vector x = vsrc0[i];
-        HVX_Vector g = vsrc1[i];
-
-        HVX_Vector x2 = hvx_vec_mul_f32_f32(x, x);
-        HVX_Vector coef = hvx_vec_mul_f32_f32(x2, v_coef_a_times_sqrt);
-        coef = hvx_vec_add_f32_f32(coef, v_sqrt_2_pi);
-        HVX_Vector inner = hvx_vec_mul_f32_f32(x, coef);
-
-        HVX_Vector y2 = hvx_vec_add_f32_f32(inner, inner);
-
-        HVX_Vector sig2y = hvx_vec_fast_sigmoid_f32_guard_2it(y2, v_one, v_max_exp, v_min_exp);
-
-        HVX_Vector gelu_x = hvx_vec_mul_f32_f32(x, sig2y);
-        HVX_Vector res = hvx_vec_mul_f32_f32(gelu_x, g);
-        hvx_vec_store_a((void *) &vdst[i], nloe * sizeof(float), res);
+        hvx_vec_store_a((void *) &vdst[i], nloe * sizeof(float), hvx_vec_geglu_f32(vsrc0[i], vsrc1[i]));
     }
 }
 

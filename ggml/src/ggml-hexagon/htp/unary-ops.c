@@ -12,6 +12,7 @@
 #include "hex-fastdiv.h"
 #include "hvx-exp.h"
 #include "hvx-sigmoid.h"
+#include "hvx-glu.h"
 #include "hvx-utils.h"
 #include "unary-ops.h"
 
@@ -565,19 +566,12 @@ static void silu_f32(const void * restrict src,
     }
 }
 
-// GELU uses the tanh approximation.
+// GELU uses the tanh approximation, computed with the same operations as the gate of GEGLU
+// (hvx_vec_geglu_gate_f32): a GELU followed by a MUL then gives the same values as the GELU+MUL
+// that the backend fuses into GEGLU, and whether the pair is fused (which depends on the graph,
+// e.g. on the rows pruned before Gemma 4's shared-KV layers) does not change the result.
 static __attribute__((noinline)) HVX_Vector hvx_vec_gelu_f32(HVX_Vector x) {
-    const HVX_Vector half = hvx_vec_splat_f32(0.5f);
-    const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
-
-    HVX_Vector inner = hvx_vec_mul_f32_f32(x, x);
-    inner = hvx_vec_mul_f32_f32(inner, hvx_vec_splat_f32(0.044715f));
-    inner = hvx_vec_add_f32_f32(inner, one);
-    inner = hvx_vec_mul_f32_f32(inner, x);
-    inner = hvx_vec_mul_f32_f32(inner, hvx_vec_splat_f32(0.7978845608028654f));
-
-    return hvx_vec_mul_f32_f32(hvx_vec_mul_f32_f32(half, x),
-                               hvx_vec_add_f32_f32(one, hvx_vec_tanh_f32(inner)));
+    return hvx_vec_geglu_gate_f32(x);
 }
 
 static inline void hvx_gelu_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
