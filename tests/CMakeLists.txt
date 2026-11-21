@@ -35,3 +35,7 @@ target_link_libraries(test-backend-ops-hex PRIVATE llama llama-common)
 # Metadata of persistent buffers must not grow as graphs are allocated again (run on the target).
 add_executable(test-hexagon-metadata test-hexagon-metadata.cpp)
 target_link_libraries(test-hexagon-metadata PRIVATE ggml)
+
+# A row of a quantized mat-mul gets the same bits for one to four rows (run on the target).
+add_executable(test-hexagon-mm-rows test-hexagon-mm-rows.cpp)
+target_link_libraries(test-hexagon-mm-rows PRIVATE ggml)

@@ -3,11 +3,14 @@
 # POSIX sh, so it also runs under busybox. Logs go to <out dir>; nothing is killed
 # with SIGKILL (a killed session can leave the DSP holding its resources).
 #
-# usage: scripts/device-tests.sh <package dir> <out dir> [--ops] [--long] [--leak] [--bench MODEL.gguf]...
+# usage: scripts/device-tests.sh <package dir> <out dir> [--ops] [--long] [--leak] [--rows] [--bench MODEL.gguf]...
 #
 #   --leak    test-hexagon-metadata on HTP0: graphs allocated again and again with views of a
 #             weight, of a cache and scratch views must not grow the backend's tensor metadata
 #             (seconds; scripts/rss-soak.py checks a running server end to end)
+#   --rows    test-hexagon-mm-rows on HTP0: each row of a quantized mat-mul with two to four
+#             activation rows must have the same bits as the row computed alone (speculative
+#             decoding verifies draft tokens in such batches); short ops, fine on any firmware
 #   --ops     test-backend-ops-hex against the CPU, one process per op, on HTP0, with
 #             GGML_HEXAGON_PROFILE=1: run scripts/op-budget.py --fail on test_*.log from a
 #             device without the self-test before running --ops on functional-safety firmware
@@ -25,19 +28,20 @@
 # self-test only.
 set -u
 
-pkg=$(cd "${1:?usage: $0 <package dir> <out dir> [--ops] [--long] [--leak] [--bench MODEL]...}" && pwd)
-out=${2:?usage: $0 <package dir> <out dir> [--ops] [--long] [--leak] [--bench MODEL]...}
+pkg=$(cd "${1:?usage: $0 <package dir> <out dir> [--ops] [--long] [--leak] [--rows] [--bench MODEL]...}" && pwd)
+out=${2:?usage: $0 <package dir> <out dir> [--ops] [--long] [--leak] [--rows] [--bench MODEL]...}
 shift 2
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 pause=${TEST_PAUSE:-20}
 
-ops=0; long=0; leak=0; models=""
+ops=0; long=0; leak=0; rows=0; models=""
 while [ $# -gt 0 ]; do
     case $1 in
         --ops) ops=1 ;;
         --long) long=1 ;;
         --leak) leak=1 ;;
+        --rows) rows=1 ;;
         --bench) shift; models="$models ${1:?--bench needs a model}" ;;
         *) echo "device-tests: unknown option $1" >&2; exit 2 ;;
     esac
@@ -104,6 +108,13 @@ if [ $leak -eq 1 ]; then
     run 300 "$out/metadata.log" test-hexagon-metadata HTP0 64
     rc=$?
     echo "metadata rc=$rc $(tail -1 "$out/metadata.log")" | tee -a "$summary"
+    [ $rc -ne 0 ] && sleep "$pause"
+fi
+
+if [ $rows -eq 1 ]; then
+    run 600 "$out/mm_rows.log" test-hexagon-mm-rows HTP0
+    rc=$?
+    echo "mm-rows rc=$rc $(tail -1 "$out/mm_rows.log")" | tee -a "$summary"
     [ $rc -ne 0 ] && sleep "$pause"
 fi
 

@@ -1606,6 +1606,274 @@ static void tiled_vec_dot_q6_k_32x2(const uint32_t n, float * restrict s0, float
     }
 }
 
+// ---- Q4_0 / Q6_K kernels on a compact activation copy (vec_dot_c1 / _c2 / _c4) ----
+//
+// On v73, vrmpy(Vu.b, Vv.b) takes both HVX multiply resources and needs its activation group repeated
+// across a vector (one vector load each, one load per packet), and the qf32 conversions and adds of the
+// per-k-tile scaling all go to the single shift resource. With several rows that bounds the kernels
+// above. These kernels take the activation groups from scalar registers, vrmpy(Vu.ub, Rt.b) (one
+// multiply resource, two per packet), with unsigned weights and the zero point applied in the int32
+// accumulator (sum((w - z) * a) = sum(w * a) - z * sum(a), exact), and share the conversion of the
+// weight scales between rows. The scaling is that of tiled_vec_dot_*_32x1 / _32x2, operation for
+// operation, so a row gives the same bits as with those kernels, for 1, 2 or 4 rows.
+//
+// Compact copy of a row, 256 bytes per 128-k block (4 k-tiles), built from the tiled activation
+// (hvx_act_compact_block):
+//   [0, 128)   int32 word 8 kt + g = activation group g of k-tile kt (vector g of the k-tile above)
+//   [128, 256) int32 lanes of k-tile kt, with S0 / S1 the sums of the activations of groups 0..3 / 4..7:
+//                    8 kt + 0 = -8 (S0 + S1)   (Q4_0 zero point)
+//                    8 kt + 1 = activation scale of the k-tile, fp16 in both halves (as in vector 8)
+//                    8 kt + 2 = -32 S0, 8 kt + 3 = -32 S1   (Q6_K zero point, per half)
+#define HTP_ACT_COMPACT_BLOCK 256
+
+static inline uint32_t hvx_act_compact_row_size(uint32_t k) {
+    return ((k + 127) / 128) * HTP_ACT_COMPACT_BLOCK;
+}
+
+// one 128-k block: act = the 4 x 1152 bytes of the block in VTCM, dst = 256 bytes, 128-byte aligned
+static inline void hvx_act_compact_block(const uint8_t * restrict act, uint8_t * restrict dst) {
+    // byte i: its word index i / 4
+    static const uint8_t __attribute__((aligned(128))) word_idx[128] = {
+         0, 0, 0, 0,  1, 1, 1, 1,  2, 2, 2, 2,  3, 3, 3, 3,  4, 4, 4, 4,  5, 5, 5, 5,  6, 6, 6, 6,  7, 7, 7, 7,
+         8, 8, 8, 8,  9, 9, 9, 9, 10,10,10,10, 11,11,11,11, 12,12,12,12, 13,13,13,13, 14,14,14,14, 15,15,15,15,
+        16,16,16,16, 17,17,17,17, 18,18,18,18, 19,19,19,19, 20,20,20,20, 21,21,21,21, 22,22,22,22, 23,23,23,23,
+        24,24,24,24, 25,25,25,25, 26,26,26,26, 27,27,27,27, 28,28,28,28, 29,29,29,29, 30,30,30,30, 31,31,31,31,
+    };
+    const HVX_Vector v_idx = *(const HVX_Vector *) word_idx;
+    const HVX_VectorPred q0 = Q6_Q_vand_VR(v_idx, 0x01010101);
+    const HVX_VectorPred q1 = Q6_Q_vand_VR(v_idx, 0x02020202);
+    const HVX_VectorPred q2 = Q6_Q_vand_VR(v_idx, 0x04040404);
+    const HVX_VectorPred q3 = Q6_Q_vand_VR(v_idx, 0x08080808);
+    const HVX_VectorPred q4 = Q6_Q_vand_VR(v_idx, 0x10101010);
+    // lanes 8 kt + c: word index & 7 == c
+    const HVX_VectorPred q_l1 = Q6_Q_and_QQn(Q6_Q_and_QQn(q0, q1), q2);
+    const HVX_VectorPred q_l2 = Q6_Q_and_QQn(Q6_Q_and_QQn(q1, q0), q2);
+    const HVX_VectorPred q_l3 = Q6_Q_and_QQn(Q6_Q_and_QQ(q0, q1), q2);
+
+    // every lane of activation vector g holds group g: lane j of the result takes vector j
+    HVX_Vector v_kt[4], v_ssf[4];
+    #pragma unroll
+    for (int kt = 0; kt < 4; kt++) {
+        const HVX_Vector * restrict v = (const HVX_Vector *) (act + kt * 1152);
+        const HVX_Vector m01 = Q6_V_vmux_QVV(q0, v[1], v[0]);
+        const HVX_Vector m23 = Q6_V_vmux_QVV(q0, v[3], v[2]);
+        const HVX_Vector m45 = Q6_V_vmux_QVV(q0, v[5], v[4]);
+        const HVX_Vector m67 = Q6_V_vmux_QVV(q0, v[7], v[6]);
+        v_kt[kt] = Q6_V_vmux_QVV(q2, Q6_V_vmux_QVV(q1, m67, m45), Q6_V_vmux_QVV(q1, m23, m01));
+        // every fp16 lane of the scale vector holds the scale of the k-tile
+        v_ssf[kt] = v[8];
+    }
+    const HVX_Vector v_w   = Q6_V_vmux_QVV(q4, Q6_V_vmux_QVV(q3, v_kt[3], v_kt[2]), Q6_V_vmux_QVV(q3, v_kt[1], v_kt[0]));
+    const HVX_Vector v_asf = Q6_V_vmux_QVV(q4, Q6_V_vmux_QVV(q3, v_ssf[3], v_ssf[2]), Q6_V_vmux_QVV(q3, v_ssf[1], v_ssf[0]));
+
+    // lane 8 kt + 4 j of s4: the sum of groups 4 j .. 4 j + 3 of k-tile kt
+    const HVX_Vector s1 = Q6_Vw_vrmpy_VbVb(v_w, Q6_Vb_vsplat_R(1));
+    const HVX_Vector s2 = Q6_Vw_vadd_VwVw(s1, Q6_V_vror_VR(s1, 4));
+    const HVX_Vector s4 = Q6_Vw_vadd_VwVw(s2, Q6_V_vror_VR(s2, 8));
+    const HVX_Vector s8 = Q6_Vw_vadd_VwVw(s4, Q6_V_vror_VR(s4, 16));
+    const HVX_Vector zero = Q6_V_vzero();
+    const HVX_Vector v_z40 = Q6_Vw_vsub_VwVw(zero, Q6_Vw_vasl_VwR(s8, 3));                       // lane 8 kt
+    const HVX_Vector v_z6  = Q6_Vw_vsub_VwVw(zero, Q6_Vw_vasl_VwR(s4, 5));                       // 8 kt, 8 kt + 4
+    const HVX_Vector v_z60 = Q6_V_vror_VR(v_z6, 120);                                            // to 8 kt + 2
+    const HVX_Vector v_z61 = Q6_V_vror_VR(v_z6, 4);                                              // to 8 kt + 3
+
+    HVX_Vector v_m = Q6_V_vmux_QVV(q_l1, v_asf, v_z40);
+    v_m = Q6_V_vmux_QVV(q_l2, v_z60, v_m);
+    v_m = Q6_V_vmux_QVV(q_l3, v_z61, v_m);
+
+    ((HVX_Vector *) dst)[0] = v_w;
+    ((HVX_Vector *) dst)[1] = v_m;
+}
+
+// all blocks of nrows rows: act rows act_row_size apart in VTCM, compact rows dst_row_size apart
+static inline void hvx_act_compact_rows(const uint8_t * restrict act, size_t act_row_size, uint8_t * restrict dst,
+                                        size_t dst_row_size, uint32_t k, uint32_t nrows) {
+    const uint32_t nb = (k + 127) / 128;
+    for (uint32_t r = 0; r < nrows; r++) {
+        for (uint32_t b = 0; b < nb; b++) {
+            hvx_act_compact_block(act + r * act_row_size + b * 4 * 1152, dst + r * dst_row_size + b * HTP_ACT_COMPACT_BLOCK);
+        }
+    }
+}
+
+static inline __attribute__((always_inline)) void tiled_vec_dot_c_store(float * restrict s, size_t s_stride,
+        uint32_t valid_rows, const float * restrict sz, size_t sz_stride, const HVX_Vector * v_acc_sf, const int NR) {
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < NR; i++) {
+        float * restrict d = (float *) ((uint8_t *) s + i * s_stride);
+        const HVX_Vector v = v_acc_sf[i];
+        if (sz) {
+            const float * restrict z = (const float *) ((const uint8_t *) sz + i * sz_stride);
+            hvx_vec_store_u(d, valid_rows * sizeof(float), hvx_vec_add_f32_f32(v, hvx_vmemu(z)));
+        } else {
+            hvx_vec_store_u(d, valid_rows * sizeof(float), v);
+        }
+    }
+}
+
+// Q4_0: per k-tile, sum(q * a) - 8 sum(a) in int32, scaled as tiled_vec_dot_q4_0_32x1. With three or
+// four rows the scaling of k-tile kt - 1 runs alongside the integer dot products of k-tile kt (same
+// operations and order as one k-tile at a time).
+static inline __attribute__((always_inline)) void tiled_q4_0_c_int(const uint8_t * restrict tile,
+        const uint8_t * restrict vc, size_t vc_stride, uint32_t kt, HVX_Vector * v_sum, int32_t * a_sf, const int NR) {
+    const HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
+    const size_t c_off = (kt / 4) * HTP_ACT_COMPACT_BLOCK + (kt % 4) * 32;
+    const int64_t * restrict w[4];
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < NR; r++) {
+        w[r] = (const int64_t *) (vc + r * vc_stride + c_off);
+        const int64_t m = w[r][16];                        // zero point term, activation scale (fp16 x 2)
+        v_sum[r] = Q6_V_vsplat_R((int32_t) m);
+        a_sf[r]  = (int32_t) (m >> 32);
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const HVX_Vector v  = hvx_vmemu(tile + i * VLEN);
+        const HVX_Vector lo = Q6_V_vand_VV(v, mask_h4);
+        const HVX_Vector hi = Q6_Vub_vlsr_VubR(v, 4);
+        _Pragma("clang loop unroll(full)")
+        for (int r = 0; r < NR; r++) {
+            const int64_t x = w[r][i];
+            v_sum[r] = Q6_Vw_vrmpyacc_VwVubRb(v_sum[r], lo, (int32_t) x);
+            v_sum[r] = Q6_Vw_vrmpyacc_VwVubRb(v_sum[r], hi, (int32_t) (x >> 32));
+        }
+    }
+}
+
+static inline __attribute__((always_inline)) void tiled_q4_0_c_scale(HVX_Vector * v_acc, const HVX_Vector * v_sum,
+        const int32_t * a_hf, HVX_Vector v_scale_w, const int NR) {
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < NR; r++) {
+        const HVX_Vector v_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w, Q6_V_vsplat_R(a_hf[r]));
+        v_acc[r] = hvx_vec_add_f32_f32(v_acc[r], hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(v_sum[r]), v_comb));
+    }
+}
+
+static inline __attribute__((always_inline)) void tiled_vec_dot_q4_0_c(const uint32_t n, float * restrict s, size_t s_stride,
+        const void * restrict vx, const uint8_t * restrict vc, size_t vc_stride, uint32_t valid_rows,
+        const float * restrict sz, size_t sz_stride, const int NR) {
+    const uint8_t * restrict tile_ptr = vx;
+    HVX_Vector v_acc[4] = { Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
+    HVX_Vector v_sum[4], v_prev[4];
+    int32_t    a_sf[4], a_prev[4];
+
+    const uint32_t n_k_tiles = n / 32;
+    if (NR < 3) {
+        // fewer rows run faster one k-tile at a time (same operations and order)
+        for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
+            const uint8_t * restrict tile = tile_ptr + kt * HTP_MM_VTCM_TILE_STRIDE_Q4_0;
+            tiled_q4_0_c_int(tile, vc, vc_stride, kt, v_sum, a_sf, NR);
+            tiled_q4_0_c_scale(v_acc, v_sum, a_sf, hvx_vmemu(tile + 512), NR);
+        }
+        tiled_vec_dot_c_store(s, s_stride, valid_rows, sz, sz_stride, v_acc, NR);
+        return;
+    }
+    tiled_q4_0_c_int(tile_ptr, vc, vc_stride, 0, v_prev, a_prev, NR);
+    for (uint32_t kt = 1; kt < n_k_tiles; kt++) {
+        const uint8_t * restrict tile = tile_ptr + kt * HTP_MM_VTCM_TILE_STRIDE_Q4_0;
+        tiled_q4_0_c_int(tile, vc, vc_stride, kt, v_sum, a_sf, NR);
+        tiled_q4_0_c_scale(v_acc, v_prev, a_prev, hvx_vmemu(tile - HTP_MM_VTCM_TILE_STRIDE_Q4_0 + 512), NR);
+        _Pragma("clang loop unroll(full)")
+        for (int r = 0; r < NR; r++) {
+            v_prev[r] = v_sum[r];
+            a_prev[r] = a_sf[r];
+        }
+    }
+    tiled_q4_0_c_scale(v_acc, v_prev, a_prev, hvx_vmemu(tile_ptr + (n_k_tiles - 1) * HTP_MM_VTCM_TILE_STRIDE_Q4_0 + 512), NR);
+
+    tiled_vec_dot_c_store(s, s_stride, valid_rows, sz, sz_stride, v_acc, NR);
+}
+
+// unsigned (0..63) Q6_K k-group g, see unpack_q6_k_group
+static inline HVX_Vector unpack_q6_k_group_u(const HVX_Vector * restrict vptr, int g, HVX_Vector mask_0f, HVX_Vector mask_03) {
+    HVX_Vector v_lo = (g & 1) ? Q6_Vub_vlsr_VubR(vptr[g >> 1], 4) : Q6_V_vand_VV(vptr[g >> 1], mask_0f);
+    HVX_Vector v_hi = (g & 3) ? Q6_Vub_vlsr_VubR(vptr[4 + (g >> 2)], 2 * (g & 3)) : vptr[4 + (g >> 2)];
+    return Q6_V_vor_VV(v_lo, Q6_Vw_vasl_VwR(Q6_V_vand_VV(v_hi, mask_03), 4));
+}
+
+// Q6_K: per k-tile and half, sum(q * a) - 32 sum(a) in int32, scaled as tiled_vec_dot_q6_k_32x1;
+// pipelined as Q4_0
+static inline __attribute__((always_inline)) void tiled_q6_k_c_int(const HVX_Vector * restrict vptr,
+        const uint8_t * restrict vc, size_t vc_stride, uint32_t kt, HVX_Vector * v_lo, HVX_Vector * v_hi,
+        int32_t * a_sf, const int NR) {
+    const HVX_Vector mask_0f = Q6_Vb_vsplat_R(0x0F);
+    const HVX_Vector mask_03 = Q6_Vb_vsplat_R(0x03);
+    const size_t c_off = (kt / 4) * HTP_ACT_COMPACT_BLOCK + (kt % 4) * 32;
+    const int64_t * restrict w[4];
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < NR; r++) {
+        w[r] = (const int64_t *) (vc + r * vc_stride + c_off);
+        const int64_t z = w[r][17];                        // zero point terms of the two halves
+        v_lo[r] = Q6_V_vsplat_R((int32_t) z);
+        v_hi[r] = Q6_V_vsplat_R((int32_t) (z >> 32));
+        a_sf[r] = ((const int32_t *) w[r])[33];            // activation scale (fp16 x 2)
+    }
+    #pragma unroll
+    for (int g = 0; g < 4; g += 2) {
+        const HVX_Vector v_W_lo0 = unpack_q6_k_group_u(vptr, g,     mask_0f, mask_03);
+        const HVX_Vector v_W_lo1 = unpack_q6_k_group_u(vptr, g + 1, mask_0f, mask_03);
+        const HVX_Vector v_W_hi0 = unpack_q6_k_group_u(vptr, g + 4, mask_0f, mask_03);
+        const HVX_Vector v_W_hi1 = unpack_q6_k_group_u(vptr, g + 5, mask_0f, mask_03);
+        _Pragma("clang loop unroll(full)")
+        for (int r = 0; r < NR; r++) {
+            const int64_t xl = w[r][g / 2];
+            const int64_t xh = w[r][g / 2 + 2];
+            v_lo[r] = Q6_Vw_vrmpyacc_VwVubRb(v_lo[r], v_W_lo0, (int32_t) xl);
+            v_hi[r] = Q6_Vw_vrmpyacc_VwVubRb(v_hi[r], v_W_hi0, (int32_t) xh);
+            v_lo[r] = Q6_Vw_vrmpyacc_VwVubRb(v_lo[r], v_W_lo1, (int32_t) (xl >> 32));
+            v_hi[r] = Q6_Vw_vrmpyacc_VwVubRb(v_hi[r], v_W_hi1, (int32_t) (xh >> 32));
+        }
+    }
+}
+
+static inline __attribute__((always_inline)) void tiled_q6_k_c_scale(HVX_Vector * v_acc, const HVX_Vector * v_lo,
+        const HVX_Vector * v_hi, const int32_t * a_hf, HVX_Vector v_scale_w, const int NR) {
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < NR; r++) {
+        v_acc[r] = hvx_vec_add_f32_f32(v_acc[r], scale_q6_k_32x1(Q6_W_vcombine_VV(v_hi[r], v_lo[r]), v_scale_w,
+                                                                 Q6_V_vsplat_R(a_hf[r])));
+    }
+}
+
+static inline __attribute__((always_inline)) void tiled_vec_dot_q6_k_c(const uint32_t n, float * restrict s, size_t s_stride,
+        const void * restrict vx, const uint8_t * restrict vc, size_t vc_stride, uint32_t valid_rows,
+        const float * restrict sz, size_t sz_stride, const int NR) {
+    const uint8_t * restrict tile_ptr = vx;
+    HVX_Vector v_acc[4] = { Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
+    HVX_Vector v_lo[4], v_hi[4], p_lo[4], p_hi[4];
+    int32_t    a_sf[4], a_prev[4];
+
+    const uint32_t n_k_tiles = n / 32;
+    tiled_q6_k_c_int((const HVX_Vector *) tile_ptr, vc, vc_stride, 0, p_lo, p_hi, a_prev, NR);
+    for (uint32_t kt = 1; kt < n_k_tiles; kt++) {
+        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 896);
+        tiled_q6_k_c_int(vptr, vc, vc_stride, kt, v_lo, v_hi, a_sf, NR);
+        tiled_q6_k_c_scale(v_acc, p_lo, p_hi, a_prev, ((const HVX_Vector *) (tile_ptr + (kt - 1) * 896))[6], NR);
+        _Pragma("clang loop unroll(full)")
+        for (int r = 0; r < NR; r++) {
+            p_lo[r] = v_lo[r];
+            p_hi[r] = v_hi[r];
+            a_prev[r] = a_sf[r];
+        }
+    }
+    tiled_q6_k_c_scale(v_acc, p_lo, p_hi, a_prev, ((const HVX_Vector *) (tile_ptr + (n_k_tiles - 1) * 896))[6], NR);
+
+    tiled_vec_dot_c_store(s, s_stride, valid_rows, sz, sz_stride, v_acc, NR);
+}
+
+#define TILED_VEC_DOT_C(type, nr)                                                                             \
+static void tiled_vec_dot_##type##_c##nr(const uint32_t n, float * restrict s, size_t s_stride,               \
+        const void * restrict vx, const uint8_t * restrict vc, size_t vc_stride, uint32_t valid_rows,         \
+        const float * restrict sz, size_t sz_stride) {                                                        \
+    tiled_vec_dot_##type##_c(n, s, s_stride, vx, vc, vc_stride, valid_rows, sz, sz_stride, nr);               \
+}
+TILED_VEC_DOT_C(q4_0, 1)
+TILED_VEC_DOT_C(q4_0, 2)
+TILED_VEC_DOT_C(q4_0, 4)
+TILED_VEC_DOT_C(q6_k, 1)
+TILED_VEC_DOT_C(q6_k, 2)
+TILED_VEC_DOT_C(q6_k, 4)
+
 static void tiled_vec_dot_q3_k_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
     const uint8_t * restrict tile_ptr = vx;
     const uint8_t * restrict y_q = vy;

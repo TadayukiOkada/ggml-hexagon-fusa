@@ -1,0 +1,23 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12720,6 +12720,19 @@
+         test_cases.emplace_back(new test_mul_mat_fusion(type_a, GGML_GLU_OP_SWIGLU, 1, 1000, 1024, true, 4, 2));
+     }
+ 
++    // two to four activation rows against many weight rows (4096 and more): the HVX kernels that take
++    // the activations from a compact copy (vec_dot_c1/c2/c4), for a plain mat-mul, a pair sharing src1
++    // (fused into one op), a gate/up pair with GLU, and a partial last weight tile (4100 rows)
++    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q6_K}) {
++        for (int64_t n : {2, 3, 4}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4100, n, 1536, {1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, n, 256, {1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat_add(type_a, 4100, n, 1536, MUL_MAT_ADD_MM_MM));
++            test_cases.emplace_back(new test_mul_mat_fusion(type_a, GGML_GLU_OP_GEGLU, n, 4100, 1536, false, 1, 1, false,
++                                                            false, true, false, {1, 1}));
++        }
++    }
++
+ #if 0
+     {
+         // Test paths in OpenCL
