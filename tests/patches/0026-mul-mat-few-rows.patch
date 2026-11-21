@@ -6,7 +6,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
      }
  
 +    // two to four activation rows against many weight rows (4096 and more): the HVX kernels that take
-+    // the activations from a compact copy (vec_dot_c1/c2/c4), for a plain mat-mul, a pair sharing src1
++    // the activations from a compact copy (vec_dot_c1 to c4), for a plain mat-mul, a pair sharing src1
 +    // (fused into one op), a gate/up pair with GLU, and a partial last weight tile (4100 rows)
 +    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q6_K}) {
 +        for (int64_t n : {2, 3, 4}) {

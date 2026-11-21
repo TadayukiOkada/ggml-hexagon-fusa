@@ -1869,9 +1869,11 @@ static void tiled_vec_dot_##type##_c##nr(const uint32_t n, float * restrict s, s
 }
 TILED_VEC_DOT_C(q4_0, 1)
 TILED_VEC_DOT_C(q4_0, 2)
+TILED_VEC_DOT_C(q4_0, 3)
 TILED_VEC_DOT_C(q4_0, 4)
 TILED_VEC_DOT_C(q6_k, 1)
 TILED_VEC_DOT_C(q6_k, 2)
+TILED_VEC_DOT_C(q6_k, 3)
 TILED_VEC_DOT_C(q6_k, 4)
 
 static void tiled_vec_dot_q3_k_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {

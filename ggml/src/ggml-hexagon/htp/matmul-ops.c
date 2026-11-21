@@ -105,12 +105,13 @@ struct htp_mm_context {
          const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows,
          const float * restrict sz0, const float * restrict sz1);
 
-    // kernels on the compact activation copy for 1, 2 and 4 rows (see hvx_act_compact_block), row i at
+    // kernels on the compact activation copy for 1 to 4 rows (see hvx_act_compact_block), row i at
     // s + i * s_stride, vc + i * vc_stride and sz + i * sz_stride bytes, the same bits as vec_dot_32x1.
     // Used for the rows of an op when act_compact is set (hvx_mm_setup_act_compact; the activation
     // quantization fills it). NULL for the types without them.
     tiled_vec_dot_c_t vec_dot_c1;
     tiled_vec_dot_c_t vec_dot_c2;
+    tiled_vec_dot_c_t vec_dot_c3;
     tiled_vec_dot_c_t vec_dot_c4;
     uint8_t *         act_compact;
     uint32_t          act_compact_stride;
@@ -295,7 +296,7 @@ static inline void hvx_mm_iq2xxs_lut_init(uint8_t * restrict base, const struct 
 #include "hmx-mm-kernels-tiled.h"
 
 // nrows activation rows (from row 0 of the compact copy at vc) against one weight tile column, four,
-// then two, then one at a time
+// then three, then two, then one at a time
 static inline void hvx_mm_c_rows(const struct htp_mm_context * mmctx, uint32_t n, uint32_t nrows, float * s,
                                  size_t s_stride, const uint8_t * w_tile, const uint8_t * vc, uint32_t valid_rows,
                                  const float * sz, size_t sz_stride) {
@@ -303,6 +304,10 @@ static inline void hvx_mm_c_rows(const struct htp_mm_context * mmctx, uint32_t n
     uint32_t i = 0;
     for (; i + 3 < nrows; i += 4) {
         mmctx->vec_dot_c4(n, (float *) ((uint8_t *) s + i * s_stride), s_stride, w_tile, vc + i * vc_stride, vc_stride,
+                          valid_rows, sz ? (const float *) ((const uint8_t *) sz + i * sz_stride) : NULL, sz_stride);
+    }
+    for (; i + 2 < nrows; i += 3) {
+        mmctx->vec_dot_c3(n, (float *) ((uint8_t *) s + i * s_stride), s_stride, w_tile, vc + i * vc_stride, vc_stride,
                           valid_rows, sz ? (const float *) ((const uint8_t *) sz + i * sz_stride) : NULL, sz_stride);
     }
     for (; i + 1 < nrows; i += 2) {
@@ -812,7 +817,7 @@ static inline void hvx_mm_act_compact_blocks(const struct htp_mm_context * mmctx
     }
 }
 
-// The compact-activation kernels (c1 / c2 / c4) give the same bits as vec_dot_32x1 / _32x2 and are
+// The compact-activation kernels (c1 to c4) give the same bits as vec_dot_32x1 / _32x2 and are
 // faster from two rows on, as long as the compact copy of the rows stays in L1 (the kernels read it
 // with scalar loads for every weight column tile) and there are enough column tiles to pay for
 // building it.
@@ -1918,6 +1923,7 @@ static void hvx_mm_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsign
 static int hvx_mm_init_tiled_vec_dot(struct htp_mm_context * mmctx, enum htp_data_type type) {
     mmctx->vec_dot_c1  = NULL;
     mmctx->vec_dot_c2  = NULL;
+    mmctx->vec_dot_c3  = NULL;
     mmctx->vec_dot_c4  = NULL;
     mmctx->act_compact = NULL;
     switch (type) {
@@ -1927,6 +1933,7 @@ static int hvx_mm_init_tiled_vec_dot(struct htp_mm_context * mmctx, enum htp_dat
             mmctx->vec_dot_32x2 = tiled_vec_dot_q4_0_32x2;
             mmctx->vec_dot_c1   = tiled_vec_dot_q4_0_c1;
             mmctx->vec_dot_c2   = tiled_vec_dot_q4_0_c2;
+            mmctx->vec_dot_c3   = tiled_vec_dot_q4_0_c3;
             mmctx->vec_dot_c4   = tiled_vec_dot_q4_0_c4;
             return 0;
         case HTP_TYPE_Q4_1:
@@ -1957,6 +1964,7 @@ static int hvx_mm_init_tiled_vec_dot(struct htp_mm_context * mmctx, enum htp_dat
             mmctx->vec_dot_32x2 = tiled_vec_dot_q6_k_32x2;
             mmctx->vec_dot_c1   = tiled_vec_dot_q6_k_c1;
             mmctx->vec_dot_c2   = tiled_vec_dot_q6_k_c2;
+            mmctx->vec_dot_c3   = tiled_vec_dot_q6_k_c3;
             mmctx->vec_dot_c4   = tiled_vec_dot_q6_k_c4;
             return 0;
         case HTP_TYPE_Q3_K:
