@@ -86,6 +86,7 @@ struct htp_fa_kernel_params {
             int32_t  mask_broadcast;
             int32_t  pipeline;
             struct fastdiv_values div_G;
+            uint32_t kv_cap;     // KV rows of the cache that K views (>= n_kv): fixed for a context
         } hmx;
         struct {
             uint32_t size_q_row_padded;
@@ -329,7 +330,13 @@ static inline size_t hvx_fa_compute_vtcm_usage(size_t DK, size_t DV, bool is_q_f
 
 #define FA_MIN_KV_BLOCKS 3
 
-// Cost-based (Br, Bc) search for flash attention with pipeline constraint.
+// Query rows up to this count (decode, a speculative verify batch) use the KV block size of the
+// KV cache rather than of the padded KV length (see htp_kparams_solve_flash_attn_ext)
+#define HTP_FA_FEW_ROWS 16
+
+// Cost-based (Br, Bc) search for flash attention with pipeline constraint. Bc_fixed != 0 takes
+// that Bc and searches Br only (the Bc of a few query rows is chosen once per KV cache, see
+// htp_kparams_solve_flash_attn_ext).
 static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                                          size_t * Bc_out,
                                          size_t   gqa_factor,
@@ -343,7 +350,8 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                                          bool     has_sinks,
                                          size_t   n_heads,
                                          size_t   q_split,
-                                         bool     causal) {
+                                         bool     causal,
+                                         size_t   Bc_fixed) {
     const size_t T       = HMX_FP16_TILE_N_ROWS;  // 32
     const size_t br_unit = hmx_ceil_div(T, gqa_factor);
     const size_t bc_unit = HMX_FP16_TILE_N_COLS * 2;  // 64
@@ -370,7 +378,7 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
 
     for (size_t Br = Br_max; Br >= br_unit; Br -= br_unit) {
         // Try all Bc candidates from Bc_limit down to bc_unit
-        for (size_t Bc = Bc_limit; Bc >= bc_unit; Bc -= bc_unit) {
+        for (size_t Bc = Bc_fixed ? Bc_fixed : Bc_limit; Bc >= bc_unit; Bc -= bc_unit) {
             size_t vtcm_needed = hmx_fa_compute_vtcm_usage(gqa_factor, DK, DV, Br, Bc, n_hvx, can_pipeline, is_q_fp32, has_sinks, n_heads);
             if (vtcm_needed <= vtcm_budget) {
                 // This Bc fits for this Br!
@@ -409,6 +417,9 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                 // Since we iterate Bc from largest to smallest, this is the largest Bc that fits
                 // for this Br. We can break to the next Br.
                 break;
+            }
+            if (Bc_fixed) {
+                break;  // only that Bc
             }
         }
 

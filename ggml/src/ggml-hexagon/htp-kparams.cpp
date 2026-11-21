@@ -462,7 +462,28 @@ static bool htp_kparams_solve_flash_attn(
         size_t Br = 0, Bc = 0;
         // a mask over several query rows is taken to be causal (the kernel skips fully masked KV blocks)
         const bool causal = mask != nullptr && neq1 > 1;
-        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_hvx, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size, causal);
+        // KV rows of the cache K is a view of (the KV length is padded per graph and grows, the cache
+        // is fixed for a context)
+        const ggml_tensor * k_base = k->view_src ? k->view_src : k;
+        const uint64_t      k_cell = (uint64_t) k->ne[0] * k->ne[2] * k->ne[3];
+        const uint32_t      kv_cap = (uint32_t) (std::max)((uint64_t) nek1, k_cell ? (uint64_t) ggml_nelements(k_base) / k_cell : 0);
+        // A few query rows (decode, a speculative verify batch) take the KV block size of the cache,
+        // not of the padded KV length: the blocks, and with them the rounding of the output between
+        // blocks, are then the same for a row decoded alone and in a batch, and over the decode steps.
+        size_t Bc_fixed = 0;
+        int    ret      = 0;
+        if (neq1 <= HTP_FA_FEW_ROWS) {
+            size_t Br_cap = 0;
+            ret = hmx_fa_find_chunk_size(&Br_cap, &Bc_fixed, G, DK_pad, DV_pad, HTP_FA_FEW_ROWS, kv_cap, vtcm_size, n_hvx,
+                                         (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size, true, 0);
+            if (ret != 0) {
+                Bc_fixed = 0;
+            }
+        }
+        ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_hvx, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size, causal, Bc_fixed);
+        if (ret != 0 && Bc_fixed) {  // no Br fits that Bc: search both
+            ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_hvx, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size, causal, 0);
+        }
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
             if (opt_fa_q8_prep) {
@@ -487,6 +508,7 @@ static bool htp_kparams_solve_flash_attn(
             kparams->vtcm_size           = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, kparams->n_hvx, kparams->u.hmx.pipeline != 0, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
             kparams->u.hmx.mask_broadcast = (mask != nullptr && mask->ne[2] == 1) ? 1 : 0;
             kparams->u.hmx.div_G         = init_fastdiv_values(G);
+            kparams->u.hmx.kv_cap        = kv_cap;
             if (mask) {
                 kparams->src3_div2 = init_fastdiv_values(mask->ne[2]);
                 kparams->src3_div3 = init_fastdiv_values(mask->ne[3]);

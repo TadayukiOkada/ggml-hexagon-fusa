@@ -140,6 +140,7 @@ struct hmx_fa_context {
     uint32_t     DK, DV;
     uint32_t     DK_pad, DV_pad;  // head_dim rounded up to 64 for HMX tiling
     uint32_t     n_kv;        // kv_len
+    uint32_t     kv_cap;      // KV rows of the cache (>= n_kv), fixed for a context
     uint32_t     n_kv_heads;  // number of KV heads
     uint32_t     n_heads;     // number of Q heads
     uint32_t     G;           // GQA factor = n_heads / n_kv_heads
@@ -2879,14 +2880,17 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     // in every model seen; the padded Q tiles of other sizes keep the K weight tiles)
     const bool k_rows = n_rows_g <= HMX_FP16_TILE_N_ROWS && g_br == HMX_FP16_TILE_N_ROWS && DK % 64 == 0;
 
-    // largest KV block (multiple of 64, at most 1024) whose buffers fit
+    // largest KV block (multiple of 64, at most 1024) whose buffers fit, chosen from the KV cache
+    // rows and the most query rows this path takes: the same blocks, and so the same rounding of
+    // the output between blocks, for a row decoded alone or in a batch and over the decode steps
+    // (the padded KV length grows by 256 at a time)
     struct fa_mh_layout L;
     uint32_t Bc = 1024;
-    while (Bc > 64 && Bc / 2 >= nek1) {
+    while (Bc > 64 && Bc / 2 >= proto->kv_cap) {
         Bc /= 2;
     }
     for (;; Bc /= 2) {
-        fa_mh_layout_build(&L, g_br, DK, DV, Bc, n_h, n_rows_q, proto->is_q_fp32, proto->sinks != NULL, proto->n_heads, n_thr,
+        fa_mh_layout_build(&L, g_br, DK, DV, Bc, n_h, FA_MH_MAX_ROWS, proto->is_q_fp32, proto->sinks != NULL, proto->n_heads, n_thr,
                            sizeof(fa_mh_head_t), kd, vd, k_rows);
         if (L.total <= ctx->vtcm_size) {
             break;
@@ -2895,6 +2899,8 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
             return HTP_STATUS_NO_SUPPORT;  // the step loop takes it
         }
     }
+    fa_mh_layout_build(&L, g_br, DK, DV, Bc, n_h, n_rows_q, proto->is_q_fp32, proto->sinks != NULL, proto->n_heads, n_thr,
+                       sizeof(fa_mh_head_t), kd, vd, k_rows);
     const uint32_t n_kv_blocks = (nek1 + Bc - 1) / Bc;
     if (n_kv_blocks > FA_MH_MAX_BLOCKS) {
         return HTP_STATUS_NO_SUPPORT;
@@ -3202,6 +3208,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     factx.DK_pad         = DK_pad;
     factx.DV_pad         = DV_pad;
     factx.n_kv           = nek1;
+    factx.kv_cap         = kparams->u.hmx.kv_cap > nek1 ? kparams->u.hmx.kv_cap : nek1;
     factx.n_kv_heads     = n_kv_heads;
     factx.n_heads        = neq2;
     factx.G              = kparams->G;
