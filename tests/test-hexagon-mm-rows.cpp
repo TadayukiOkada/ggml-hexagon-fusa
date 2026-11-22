@@ -5,9 +5,11 @@
 // (vec_dot_32x1 / _32x2, and from two rows on large weights the kernels on a compact activation copy),
 // so each row of an R-row product is compared bit for bit with the same row computed alone.
 //
-// Cases: Q4_0 and Q6_K weights (as llama.cpp places them, so the HTP repacks them into tiles), K 256 and
-// 1536, 2048 to 8192 weight rows with a partial last tile, a plain mat-mul and a gate/up pair with GEGLU,
-// activation rows of very different magnitudes (fp16-subnormal activation scales).
+// Cases: Q4_0 and Q6_K weights (as llama.cpp places them, so the HTP repacks them into tiles), K 256,
+// 1536 and 2560, 1536 to 8200 weight rows with a partial last tile, a plain mat-mul, a gate/up pair with
+// GEGLU, and the final logit softcap (scale, tanh, scale, fused into the matmul store) on the compact
+// kernels and on the others (fewer weight rows, Q8_0 / Q4_K, and K 2560, whose 4-row compact copy does
+// not fit in L1); activation rows of very different magnitudes (fp16-subnormal activation scales).
 //
 // usage: test-hexagon-mm-rows [device, default HTP0]
 // exit: 0 pass, 1 fail, 77 no such device (skip)
@@ -29,6 +31,7 @@ struct mm_case {
     int       k;
     int       n;      // weight rows
     bool      glu;
+    bool      softcap;
 };
 
 struct runner {
@@ -55,6 +58,10 @@ struct runner {
         ggml_tensor *  o  = ggml_mul_mat(cc, a0, b);
         if (c.glu) {
             o = ggml_geglu_split(cc, o, ggml_mul_mat(cc, a1, b));
+        } else if (c.softcap) {
+            o = ggml_scale(cc, o, 1.0f / 30.0f);
+            o = ggml_tanh(cc, o);
+            o = ggml_scale(cc, o, 30.0f);
         }
         ggml_cgraph * gf = ggml_new_graph(cc);
         ggml_build_forward_expand(gf, o);
@@ -90,13 +97,21 @@ int main(int argc, char ** argv) {
 
     constexpr int MAX_ROWS = 4;
     const mm_case cases[] = {
-        { GGML_TYPE_Q4_0, 1536, 8192, false },
-        { GGML_TYPE_Q4_0, 1536, 4100, true  },
-        { GGML_TYPE_Q4_0,  256, 8192, false },
-        { GGML_TYPE_Q4_0, 1536, 2048, false },
-        { GGML_TYPE_Q6_K, 1536, 8200, false },
-        { GGML_TYPE_Q6_K, 1536, 4100, true  },
-        { GGML_TYPE_Q6_K,  256, 8192, false },
+        { GGML_TYPE_Q4_0, 1536, 8192, false, false },
+        { GGML_TYPE_Q4_0, 1536, 4100, true,  false },
+        { GGML_TYPE_Q4_0,  256, 8192, false, false },
+        { GGML_TYPE_Q4_0, 1536, 2048, false, false },
+        { GGML_TYPE_Q4_0, 1536, 1536, false, false },
+        { GGML_TYPE_Q4_0, 1536, 8192, false, true  },
+        { GGML_TYPE_Q6_K, 1536, 8200, false, false },
+        { GGML_TYPE_Q6_K, 1536, 8200, false, true  },
+        { GGML_TYPE_Q6_K, 1536, 1536, false, true  },
+        { GGML_TYPE_Q6_K, 2560, 8200, false, false },
+        { GGML_TYPE_Q6_K, 2560, 8200, false, true  },
+        { GGML_TYPE_Q6_K, 1536, 4100, true,  false },
+        { GGML_TYPE_Q6_K,  256, 8192, false, false },
+        { GGML_TYPE_Q8_0, 1536, 8200, false, true  },
+        { GGML_TYPE_Q4_K, 1536, 8200, false, true  },
     };
 
     std::mt19937                    rng(1234);
@@ -141,7 +156,7 @@ int main(int argc, char ** argv) {
                 }
             }
         }
-        printf("%-5s k %4d n %4d %-4s %s%s\n", ggml_type_name(c.type), c.k, c.n, c.glu ? "glu" : "mm",
+        printf("%-5s k %4d n %4d %-4s %s%s\n", ggml_type_name(c.type), c.k, c.n, c.glu ? "glu" : (c.softcap ? "cap" : "mm"),
                bad_case ? "FAIL" : "ok", res.c_str());
         n_fail += bad_case != 0;
     }

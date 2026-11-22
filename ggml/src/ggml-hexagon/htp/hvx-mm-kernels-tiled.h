@@ -1696,6 +1696,23 @@ static inline void hvx_act_compact_rows(const uint8_t * restrict act, size_t act
     }
 }
 
+// The SCALE / TANH ops fused into a quantized matmul (kparams->post, the final logit softcap: scale,
+// tanh, scale), on one output vector. Every matmul path (the matvec, the few-row kernels, the
+// compact-activation kernels) applies it through this one function, so that a row gets the same
+// bits whatever the number of rows.
+static inline __attribute__((always_inline)) HVX_Vector hvx_mm_post_vec(HVX_Vector v, const struct htp_mm_kernel_params * kp) {
+    v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(v, hvx_vec_splat_f32(kp->post_scale[0])),
+                                                   hvx_vec_splat_f32(kp->post_bias[0])));
+    if (kp->post >= 2) {
+        v = hvx_vec_tanh_f32(v);
+    }
+    if (kp->post >= 3) {
+        v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(v, hvx_vec_splat_f32(kp->post_scale[1])),
+                                                       hvx_vec_splat_f32(kp->post_bias[1])));
+    }
+    return v;
+}
+
 static inline __attribute__((always_inline)) void tiled_vec_dot_c_store(float * restrict s, size_t s_stride,
         uint32_t valid_rows, const float * restrict sz, size_t sz_stride, const HVX_Vector * v_acc_sf, const int NR) {
     _Pragma("clang loop unroll(full)")
