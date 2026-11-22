@@ -242,8 +242,9 @@ static inline bool htp_mm_kernel_is_hvx_quant(int kernel_type) {
     return kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK;
 }
 
-// SCALE, TANH, SCALE on the output of a matrix-vector product (the final logit softcap) run in the
-// epilogue of the tiled HVX matvec, one step at a time (kparams.post).
+// SCALE, TANH, SCALE on the output of a quantized matmul with one to four activation rows (the final
+// logit softcap of a decode step or a speculative verify batch) run in the epilogue of the tiled HVX
+// kernels, one step at a time (kparams.post).
 static bool fuse_mul_mat_post(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
     GGML_UNUSED(sess);
     if (prev.opcode != HTP_OP_MUL_MAT || prev.inputs.size() != 2 || prev.outputs.size() != 1) return false;
@@ -260,7 +261,7 @@ static bool fuse_mul_mat_post(const ggml_hexagon_session * sess, htp_opnode & pr
     // the graph node, not cur.dst(): a long SCALE / TANH row runs reshaped into several rows
     const ggml_tensor * out = cur.node;
     if (kp->n_hmx || !htp_mm_kernel_is_hvx_quant(kp->kernel_type) || !htp_is_tiled_weight_tensor(w)) return false;
-    if (ggml_nrows(x) != 1 || w->ne[2] * w->ne[3] != 1) return false;
+    if (ggml_nrows(x) > HTP_MM_HMX_MIN_NROWS || w->ne[2] * w->ne[3] != 1) return false;
     if (cur.node->src[0] != mo || !ggml_hexagon_tensor_is_fuseable(mo)) return false;
     if (out->type != GGML_TYPE_F32 || mo->type != GGML_TYPE_F32 || !ggml_are_same_shape(out, mo) ||
         !ggml_is_contiguous(out)) return false;

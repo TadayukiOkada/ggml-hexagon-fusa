@@ -73,6 +73,11 @@ static bool htp_matmul_has_extended_weight(const struct htp_ops_context * octx, 
     return false;
 }
 
+// see hvx_act_compact_block
+typedef void (*tiled_vec_dot_c_t)(const uint32_t n, float * restrict s, size_t s_stride, const void * restrict vx,
+                                  const uint8_t * restrict vc, size_t vc_stride, uint32_t valid_rows,
+                                  const float * restrict sz, size_t sz_stride);
+
 struct htp_mm_context {
     const char * type;
     struct htp_ops_context * octx;
@@ -99,6 +104,17 @@ struct htp_mm_context {
          const void * restrict vx,
          const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows,
          const float * restrict sz0, const float * restrict sz1);
+
+    // kernels on the compact activation copy for 1 to 4 rows (see hvx_act_compact_block), row i at
+    // s + i * s_stride, vc + i * vc_stride and sz + i * sz_stride bytes, the same bits as vec_dot_32x1.
+    // Used for the rows of an op when act_compact is set (hvx_mm_setup_act_compact; the activation
+    // quantization fills it). NULL for the types without them.
+    tiled_vec_dot_c_t vec_dot_c1;
+    tiled_vec_dot_c_t vec_dot_c2;
+    tiled_vec_dot_c_t vec_dot_c3;
+    tiled_vec_dot_c_t vec_dot_c4;
+    uint8_t *         act_compact;
+    uint32_t          act_compact_stride;
 
     // Precomputed values
     uint32_t src0_nrows_per_hvx;
@@ -279,6 +295,63 @@ static inline void hvx_mm_iq2xxs_lut_init(uint8_t * restrict base, const struct 
 #include "hvx-mm-kernels-float.h"
 #include "hmx-mm-kernels-tiled.h"
 
+// nrows activation rows (from row 0 of the compact copy at vc) against one weight tile column, four,
+// then three, then two, then one at a time
+static inline void hvx_mm_c_rows(const struct htp_mm_context * mmctx, uint32_t n, uint32_t nrows, float * s,
+                                 size_t s_stride, const uint8_t * w_tile, const uint8_t * vc, uint32_t valid_rows,
+                                 const float * sz, size_t sz_stride) {
+    const size_t vc_stride = mmctx->act_compact_stride;
+    uint32_t i = 0;
+    for (; i + 3 < nrows; i += 4) {
+        mmctx->vec_dot_c4(n, (float *) ((uint8_t *) s + i * s_stride), s_stride, w_tile, vc + i * vc_stride, vc_stride,
+                          valid_rows, sz ? (const float *) ((const uint8_t *) sz + i * sz_stride) : NULL, sz_stride);
+    }
+    for (; i + 2 < nrows; i += 3) {
+        mmctx->vec_dot_c3(n, (float *) ((uint8_t *) s + i * s_stride), s_stride, w_tile, vc + i * vc_stride, vc_stride,
+                          valid_rows, sz ? (const float *) ((const uint8_t *) sz + i * sz_stride) : NULL, sz_stride);
+    }
+    for (; i + 1 < nrows; i += 2) {
+        mmctx->vec_dot_c2(n, (float *) ((uint8_t *) s + i * s_stride), s_stride, w_tile, vc + i * vc_stride, vc_stride,
+                          valid_rows, sz ? (const float *) ((const uint8_t *) sz + i * sz_stride) : NULL, sz_stride);
+    }
+    for (; i < nrows; i++) {
+        mmctx->vec_dot_c1(n, (float *) ((uint8_t *) s + i * s_stride), s_stride, w_tile, vc + i * vc_stride, vc_stride,
+                          valid_rows, sz ? (const float *) ((const uint8_t *) sz + i * sz_stride) : NULL, sz_stride);
+    }
+}
+
+// The few-row paths with the fused epilogue (kparams->post, at most HTP_MM_HMX_MIN_NROWS rows): the
+// kernel writes each row of the tile column to a vector on the stack, and hvx_mm_post_vec takes it
+// from there to dst. The epilogue stays out of the kernels and of the loop in hvx_mm_2d_tiled, which
+// run unchanged without it, and nothing past valid_rows of dst is read or written.
+static void __attribute__((noinline)) hvx_mm_c_rows_post(const struct htp_mm_context * mmctx, uint32_t n,
+        uint32_t nrows, float * s, size_t s_stride, const uint8_t * w_tile, const uint8_t * vc, uint32_t valid_rows,
+        const struct htp_mm_kernel_params * kp) {
+    HVX_Vector t[HTP_MM_HMX_MIN_NROWS];
+    assert(nrows <= HTP_MM_HMX_MIN_NROWS);
+    hvx_mm_c_rows(mmctx, n, nrows, (float *) t, sizeof(HVX_Vector), w_tile, vc, valid_rows, NULL, 0);
+    for (uint32_t i = 0; i < nrows; i++) {
+        hvx_vec_store_u((uint8_t *) s + i * s_stride, valid_rows * sizeof(float), hvx_mm_post_vec(t[i], kp));
+    }
+}
+
+static void __attribute__((noinline)) hvx_mm_rows_post(const struct htp_mm_context * mmctx, uint32_t n,
+        uint32_t nrows, uint8_t * dst, size_t dst_row_size, const uint8_t * w_tile, const uint8_t * act,
+        size_t act_stride, uint32_t valid_rows, const struct htp_mm_kernel_params * kp) {
+    HVX_Vector t[2];
+    uint32_t i = 0;
+    for (; i + 1 < nrows; i += 2) {
+        mmctx->vec_dot_32x2(n, (float *) &t[0], (float *) &t[1], w_tile, act + i * act_stride,
+                            act + (i + 1) * act_stride, valid_rows, NULL, NULL);
+        hvx_vec_store_u(dst + i * dst_row_size, valid_rows * sizeof(float), hvx_mm_post_vec(t[0], kp));
+        hvx_vec_store_u(dst + (i + 1) * dst_row_size, valid_rows * sizeof(float), hvx_mm_post_vec(t[1], kp));
+    }
+    for (; i < nrows; i++) {
+        mmctx->vec_dot_32x1(n, (float *) &t[0], w_tile, act + i * act_stride, valid_rows, NULL);
+        hvx_vec_store_u(dst + i * dst_row_size, valid_rows * sizeof(float), hvx_mm_post_vec(t[0], kp));
+    }
+}
+
 // VTCM stride of the weight tiles in the HVX kernels: Q4_0 tiles stay packed (their DDR stride, see
 // HTP_MM_VTCM_TILE_STRIDE_Q4_0), the other types keep the 128-byte aligned stride.
 static inline uint32_t htp_mm_hvx_vtcm_tile_stride(uint32_t type) {
@@ -309,6 +382,7 @@ static void hvx_mm_2d_tiled(const htp_thread_t * th, unsigned int nth, unsigned 
     uint8_t * restrict vtcm_dst_ptr  = mmctx->vtcm_dst  + mmctx->vtcm_dst_size_per_hvx  * ith;
     uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_hvx * ith;
     uint8_t * restrict act_data = mmctx->vtcm_act;
+    const bool post = kparams->post != 0;  // src2 is NULL then (hvx_mm_matmul)
 
     const dma_addr_t src0_row = src0->data;
 
@@ -342,6 +416,23 @@ static void hvx_mm_2d_tiled(const htp_thread_t * th, unsigned int nth, unsigned 
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
         uint32_t ir1 = 0;
+        if (post) {
+            float * dst_ptr = (float *) (dst->data + cur_m_start * dst_row_size) + ct * 32;
+            if (mmctx->act_compact) {
+                hvx_mm_c_rows_post(mmctx, ne10, act_nrows, dst_ptr, dst_row_size, w_tile, mmctx->act_compact, valid_rows,
+                                   kparams);
+            } else {
+                hvx_mm_rows_post(mmctx, ne10, act_nrows, (uint8_t *) dst_ptr, dst_row_size, w_tile, act_data, act_stride,
+                                 valid_rows, kparams);
+            }
+            ir1 = act_nrows;
+        } else if (mmctx->act_compact) {
+            hvx_mm_c_rows(mmctx, ne10, act_nrows, (float *) (dst->data + cur_m_start * dst_row_size) + ct * 32, dst_row_size,
+                          w_tile, mmctx->act_compact, valid_rows,
+                          src2 ? (const float *) ((const uint8_t *) src2->data + cur_m_start * src2_stride) + ct * 32 : NULL,
+                          src2_stride);
+            ir1 = act_nrows;
+        }
         for (; ir1 + 1 < act_nrows; ir1 += 2) {
             const uint8_t * restrict act_col0 = (const uint8_t *) (act_data + (ir1+0) * act_stride);
             const uint8_t * restrict act_col1 = (const uint8_t *) (act_data + (ir1+1) * act_stride);
@@ -396,21 +487,10 @@ static inline void hvx_mm_job_quant_barrier(const htp_thread_t * th, struct htp_
     }
 }
 
-// SCALE / TANH ops fused into the matvec (the final logit softcap: scale, tanh, scale), with the
-// vector operations of the SCALE and TANH ops. Applied to each output tile in VTCM while the next
-// weight tiles stream in.
+// SCALE / TANH ops fused into the matvec (hvx_mm_post_vec), applied to each output tile in VTCM while
+// the next weight tiles stream in.
 static inline void hvx_mm_post_tile(float * tile, const struct htp_mm_kernel_params * kp) {
-    HVX_Vector v = *(HVX_Vector *) tile;
-    v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(v, hvx_vec_splat_f32(kp->post_scale[0])),
-                                                   hvx_vec_splat_f32(kp->post_bias[0])));
-    if (kp->post >= 2) {
-        v = hvx_vec_tanh_f32(v);
-    }
-    if (kp->post >= 3) {
-        v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(v, hvx_vec_splat_f32(kp->post_scale[1])),
-                                                       hvx_vec_splat_f32(kp->post_bias[1])));
-    }
-    *(HVX_Vector *) tile = v;
+    *(HVX_Vector *) tile = hvx_mm_post_vec(*(HVX_Vector *) tile, kp);
 }
 
 static void hvx_mv_2d_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
@@ -545,7 +625,7 @@ static void hvx_mm_nx_2d_tiled(const htp_thread_t * th, unsigned int nth, unsign
 
     // fused GLU: the gate outputs go to VTCM, the up tile to a scratch, and the store writes act(gate) * up
     const uint32_t glu = kparams->glu;
-    float * restrict glu_up = mmctx->vtcm_glu_up + ith * 64;
+    float * restrict glu_up = mmctx->vtcm_glu_up + ith * HTP_MM_GLU_UP_FLOATS;
 
     bool quant_pending = mmctx->fused_quant;  // see hvx_mm_job_quant_barrier: once, after the first prefetch
 
@@ -612,6 +692,25 @@ static void hvx_mm_nx_2d_tiled(const htp_thread_t * th, unsigned int nth, unsign
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
             uint32_t ir1 = 0;
+            if (mmctx->act_compact) {
+                for (; ir1 < act_nrows; ir1 += 4) {
+                    const uint32_t  nr      = MIN(4, act_nrows - ir1);
+                    const uint8_t * act_c   = mmctx->act_compact + ir1 * mmctx->act_compact_stride;
+                    float * dst_ptr = (float *) (dst->data + (ir1 * dst_row_size)) + ct * 32;
+                    float * gate    = mmctx->vtcm_glu_gate + ir1 * mmctx->glu_stride + ct * 32;
+                    if (glu_gate) {
+                        hvx_mm_c_rows(mmctx, ne10, nr, gate, mmctx->glu_stride * sizeof(float), w_tile, act_c, valid_rows, NULL, 0);
+                    } else if (glu_out) {
+                        hvx_mm_c_rows(mmctx, ne10, nr, glu_up, 32 * sizeof(float), w_tile, act_c, valid_rows, NULL, 0);
+                        for (uint32_t i = 0; i < nr; i++) {
+                            hvx_mm_glu_store((float *) ((uint8_t *) dst_ptr + i * dst_row_size), gate + i * mmctx->glu_stride,
+                                             glu_up + i * 32, valid_rows, glu);
+                        }
+                    } else {
+                        hvx_mm_c_rows(mmctx, ne10, nr, dst_ptr, dst_row_size, w_tile, act_c, valid_rows, NULL, 0);
+                    }
+                }
+            }
             for (; ir1 + 1 < act_nrows; ir1 += 2) {
                 const uint8_t * restrict act_col0 = (const uint8_t *) (act_data + (ir1+0) * act_stride);
                 const uint8_t * restrict act_col1 = (const uint8_t *) (act_data + (ir1+1) * act_stride);
@@ -734,6 +833,41 @@ static void hvx_mm_transfer_act_dma(
     }
 }
 
+// the compact activation copy of blocks [ib_first, ib_last) (block ib = row ib / nb, 128-k block ib % nb)
+static inline void hvx_mm_act_compact_blocks(const struct htp_mm_context * mmctx, uint32_t ib_first, uint32_t ib_last) {
+    if (!mmctx->act_compact) {
+        return;
+    }
+    const uint32_t k        = mmctx->act->ne[0];
+    const uint32_t nb       = (k + HTP_MM_ACT_BLOCK_K - 1) / HTP_MM_ACT_BLOCK_K;
+    const size_t   row_size = htp_mm_q8_0_tiled_row_size(k);
+    for (uint32_t ib = ib_first; ib < ib_last; ib++) {
+        const uint32_t r = ib / nb;
+        const uint32_t c = ib - r * nb;
+        hvx_act_compact_block(mmctx->vtcm_act + r * row_size + c * 4 * 1152,
+                              mmctx->act_compact + r * mmctx->act_compact_stride + c * HTP_ACT_COMPACT_BLOCK);
+    }
+}
+
+// The compact-activation kernels (c1 to c4) give the same bits as vec_dot_32x1 / _32x2 and are
+// faster from two rows on, as long as the compact copy of the rows stays in L1 (the kernels read it
+// with scalar loads for every weight column tile) and there are enough column tiles to pay for
+// building it.
+#define HTP_ACT_COMPACT_MAX_BYTES  (16 * 1024)
+#define HTP_ACT_COMPACT_MIN_NE01   4096
+
+static inline void hvx_mm_setup_act_compact(const struct htp_ops_context * octx, struct htp_mm_context * mmctx,
+                                            uint32_t k, uint32_t nrows, uint32_t ne01) {
+    const size_t stride = hvx_act_compact_row_size(k);
+    if (mmctx->vec_dot_c1 && octx->ctx->ddr_spad_base && nrows >= 2 && ne01 >= HTP_ACT_COMPACT_MIN_NE01 &&
+        nrows * stride <= HTP_ACT_COMPACT_MAX_BYTES && nrows * stride <= octx->ctx->ddr_spad_size) {
+        mmctx->act_compact        = (uint8_t *) octx->ctx->ddr_spad_base;
+        mmctx->act_compact_stride = (uint32_t) stride;
+    } else {
+        mmctx->act_compact = NULL;
+    }
+}
+
 #define QUANTIZE_IMPL(name, log_name, kernel_fn, dst_row_size_expr)                                        \
 static void name(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {               \
     (void) nth;                                                                                            \
@@ -760,6 +894,10 @@ static void name(const htp_thread_t * th, unsigned int nth, unsigned int ith, vo
     const uint8_t * restrict src_data = (const uint8_t *) mmctx->vtcm_act_raw + (raw_row_size * ir_first); \
     uint8_t * restrict dst_data = (uint8_t *) dst + (dst_row_size * ir_first);                             \
     kernel_fn(src_data, dst_data, NULL, ne0, ir_last - ir_first, raw_row_size, dst_row_size);              \
+    if (mmctx->act_compact) {                                                                              \
+        hvx_act_compact_rows(dst_data, dst_row_size, mmctx->act_compact + mmctx->act_compact_stride * ir_first, \
+                             mmctx->act_compact_stride, ne0, ir_last - ir_first);                          \
+    }                                                                                                      \
                                                                                                            \
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);                                         \
 }
@@ -799,6 +937,8 @@ static void quantize_f32_q8_0_tiled_block(const htp_thread_t * th, unsigned int 
         mmctx->quant_c[ith]
     );
 
+    hvx_mm_act_compact_blocks(mmctx, mmctx->quant_ib_first[ith], mmctx->quant_ib_last[ith]);
+
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 }
 
@@ -826,6 +966,8 @@ static void quantize_f32_q8_0q40_tiled_block(const htp_thread_t * th, unsigned i
         mmctx->quant_r[ith],
         mmctx->quant_c[ith]
     );
+
+    hvx_mm_act_compact_blocks(mmctx, mmctx->quant_ib_first[ith], mmctx->quant_ib_last[ith]);
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 }
@@ -1062,6 +1204,12 @@ static void hvx_mm_4d_tiled(const htp_thread_t * th, unsigned int nth, unsigned 
                 const uint32_t batch_nrows    = m_last - m_first;
 
                 uint32_t ir1 = 0;
+                if (mmctx->act_compact) {
+                    hvx_mm_c_rows(mmctx, ne10, batch_nrows, (float *) (dst_batch_base + dst_m_offset * dst_row_size) + ct * 32,
+                                  dst_row_size, w_tile, mmctx->act_compact + chunk_m_offset * mmctx->act_compact_stride,
+                                  valid_rows, NULL, 0);
+                    ir1 = batch_nrows;
+                }
                 for (; ir1 + 1 < batch_nrows; ir1 += 2) {
                     const uint8_t * restrict act_col0 = (const uint8_t *) (act_data + (chunk_m_offset + ir1 + 0) * act_stride);
                     const uint8_t * restrict act_col1 = (const uint8_t *) (act_data + (chunk_m_offset + ir1 + 1) * act_stride);
@@ -1805,11 +1953,20 @@ static void hvx_mm_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsign
 }
 
 static int hvx_mm_init_tiled_vec_dot(struct htp_mm_context * mmctx, enum htp_data_type type) {
+    mmctx->vec_dot_c1  = NULL;
+    mmctx->vec_dot_c2  = NULL;
+    mmctx->vec_dot_c3  = NULL;
+    mmctx->vec_dot_c4  = NULL;
+    mmctx->act_compact = NULL;
     switch (type) {
         case HTP_TYPE_Q4_0:
             mmctx->type         = "q4_0_tiled-f32";
             mmctx->vec_dot_32x1 = tiled_vec_dot_q4_0_32x1;
             mmctx->vec_dot_32x2 = tiled_vec_dot_q4_0_32x2;
+            mmctx->vec_dot_c1   = tiled_vec_dot_q4_0_c1;
+            mmctx->vec_dot_c2   = tiled_vec_dot_q4_0_c2;
+            mmctx->vec_dot_c3   = tiled_vec_dot_q4_0_c3;
+            mmctx->vec_dot_c4   = tiled_vec_dot_q4_0_c4;
             return 0;
         case HTP_TYPE_Q4_1:
         case HTP_TYPE_Q4_K:
@@ -1837,6 +1994,10 @@ static int hvx_mm_init_tiled_vec_dot(struct htp_mm_context * mmctx, enum htp_dat
             mmctx->type         = "q6_k_tiled-f32";
             mmctx->vec_dot_32x1 = tiled_vec_dot_q6_k_32x1;
             mmctx->vec_dot_32x2 = tiled_vec_dot_q6_k_32x2;
+            mmctx->vec_dot_c1   = tiled_vec_dot_q6_k_c1;
+            mmctx->vec_dot_c2   = tiled_vec_dot_q6_k_c2;
+            mmctx->vec_dot_c3   = tiled_vec_dot_q6_k_c3;
+            mmctx->vec_dot_c4   = tiled_vec_dot_q6_k_c4;
             return 0;
         case HTP_TYPE_Q3_K:
             mmctx->type         = "q3_k_tiled-f32";
@@ -1943,8 +2104,8 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     work_queue_func_t matmul_job_func;
     uint32_t n_quant_tasks = 1;
     const bool is_batched = (ne12 > 1 || ne13 > 1 || ne02 > 1 || ne03 > 1);
-    // the fused epilogue ops (kparams->post) exist in the tiled matvec only
-    if (kparams->post && (is_batched || act_nrows != 1 || !is_tiled || octx->src[2])) {
+    // the fused epilogue ops (kparams->post) exist in the tiled matvec and few-row HVX matmul (M <= 4)
+    if (kparams->post && (is_batched || act_nrows > HTP_MM_HMX_MIN_NROWS || !is_tiled || octx->src[2])) {
         return HTP_STATUS_NO_SUPPORT;
     }
     if (is_batched) {
@@ -2022,6 +2183,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     const uint32_t m_chunk = (kparams->m_chunk > 0 && (uint32_t) kparams->m_chunk < act_nrows)
                            ? (uint32_t) kparams->m_chunk : act_nrows;
     const uint32_t m_layout_rows = m_chunk;
+    hvx_mm_setup_act_compact(octx, mmctx, ne10, m_chunk, ne01);
 
     struct htp_mm_hvx_vtcm_layout L;
     htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, ne10, m_layout_rows, octx->n_hvx,
@@ -5359,6 +5521,7 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     }
 
     const size_t act_row_size = htp_mm_tiled_act_row_size(src0->type, act->ne[0]);
+    hvx_mm_setup_act_compact(octx, mmctx, act->ne[0], act_nrows, src0->ne[1]);
 
     struct htp_mm_hvx_vtcm_layout L;
     htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, act->ne[0], act_nrows, octx->n_hvx,
@@ -5386,7 +5549,7 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
     if (kparams->glu) {
         mmctx->vtcm_glu_up   = (float *) (base + hex_align_up(L.total_bytes, 128));
-        mmctx->vtcm_glu_gate = mmctx->vtcm_glu_up + octx->n_hvx * 64;
+        mmctx->vtcm_glu_gate = mmctx->vtcm_glu_up + octx->n_hvx * HTP_MM_GLU_UP_FLOATS;
     }
 
     // A few tokens: the NX job quantizes the activation itself while its first weight tiles load

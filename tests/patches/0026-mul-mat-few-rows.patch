@@ -1,0 +1,71 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11214,6 +11214,36 @@
+     double max_nmse_err() override { return 0.0; }
+ };
+ 
++// final logit softcap (scale, tanh, scale) on a matmul with a few activation rows, run as one graph:
++// backends may apply it in the matmul store for the rows of a speculative verify batch
++struct test_mul_mat_softcap_rows : public test_case {
++    const ggml_type type;
++    const int64_t k;
++    const int64_t m;
++    const int64_t n;
++
++    std::string vars() override { return VARS_TO_STR4(type, k, m, n); }
++    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_SOFTCAP"; }
++    bool run_whole_graph() override { return true; }
++    double max_nmse_err() override { return 5e-4; }
++
++    test_mul_mat_softcap_rows(ggml_type type, int64_t k, int64_t m, int64_t n)
++        : type(type), k(k), m(m), n(n) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
++        ggml_set_name(x, "x");
++        ggml_set_name(w, "w");
++        ggml_tensor * out = ggml_mul_mat(ctx, w, x);
++        out = ggml_scale(ctx, out, 1.0f / 3.0f);
++        out = ggml_tanh(ctx, out);
++        out = ggml_scale(ctx, out, 3.0f);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+     std::default_random_engine rng(0);
+@@ -12720,6 +12750,30 @@
+         test_cases.emplace_back(new test_mul_mat_fusion(type_a, GGML_GLU_OP_SWIGLU, 1, 1000, 1024, true, 4, 2));
+     }
+ 
++    // two to four activation rows against many weight rows (4096 and more): the HVX kernels that take
++    // the activations from a compact copy (vec_dot_c1 to c4), for a plain mat-mul, a pair sharing src1
++    // (fused into one op), a gate/up pair with GLU, and a partial last weight tile (4100 rows)
++    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q6_K}) {
++        for (int64_t n : {2, 3, 4}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4100, n, 1536, {1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, n, 256, {1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat_add(type_a, 4100, n, 1536, MUL_MAT_ADD_MM_MM));
++            test_cases.emplace_back(new test_mul_mat_fusion(type_a, GGML_GLU_OP_GEGLU, n, 4100, 1536, false, 1, 1, false,
++                                                            false, true, false, {1, 1}));
++        }
++    }
++
++    // the logit softcap fused into a matmul with one to four rows: the compact-activation kernels (Q4_0,
++    // Q6_K with 4096 weight rows or more), the other few-row kernels (fewer weight rows, other types,
++    // and K 2560, whose 4-row compact copy does not fit in L1)
++    for (int64_t n : {1, 2, 3, 4}) {
++        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
++            test_cases.emplace_back(new test_mul_mat_softcap_rows(type_a, 1536, 8200, n));
++        }
++        test_cases.emplace_back(new test_mul_mat_softcap_rows(GGML_TYPE_Q6_K, 1536, 1536, n));
++        test_cases.emplace_back(new test_mul_mat_softcap_rows(GGML_TYPE_Q6_K, 2560, 8200, n));
++    }
++
+ #if 0
+     {
+         // Test paths in OpenCL

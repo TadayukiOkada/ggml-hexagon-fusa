@@ -451,10 +451,11 @@ static inline void htp_mm_hmx_vtcm_layout_build(
     L->total_bytes = off;
 }
 
-// VTCM after the HVX layout for a gate/up matmul with a fused GLU: an up tile of 2 x 32 floats per
-// thread, then the gate outputs of all activation rows
+// VTCM after the HVX layout for a gate/up matmul with a fused GLU: an up tile of 4 x 32 floats per
+// thread (vec_dot_32x4), then the gate outputs of all activation rows
+#define HTP_MM_GLU_UP_FLOATS 128
 static inline size_t htp_mm_hvx_glu_vtcm_size(uint32_t act_nrows, uint32_t ne01, uint32_t n_hvx) {
-    return (size_t) n_hvx * 64 * sizeof(float) + (size_t) act_nrows * hex_round_up(ne01, 32) * sizeof(float);
+    return (size_t) n_hvx * HTP_MM_GLU_UP_FLOATS * sizeof(float) + (size_t) act_nrows * hex_round_up(ne01, 32) * sizeof(float);
 }
 
 // VTCM per thread for streaming a full-matrix src2 (the residual) into the HMX output store
