@@ -26,6 +26,7 @@ struct work_queue_task_s {
     void *            data;
     unsigned int      n_threads;
     atomic_uint       barrier;
+    atomic_uint       seq;  // q->seqn after this task's push; seq + 1 (no task of this slot) while it is filled
 };
 
 // internal structure kept in thread-local storage per instance of work queue
@@ -56,11 +57,13 @@ static void work_queue_thread(void * context) {
 
     FARF(HIGH, "work-queue: thread %u (tid %u) started", id, me->th.tid);
 
-    unsigned int prev_seqn = 0;
+    // Tasks are numbered by q->seqn (one increment per push); task s sits in slot (s - 1) & idx_mask, since
+    // idx_write and seqn advance together. done = the last task this worker has looked at.
+    unsigned int done = 0;
 
     while (!atomic_load_explicit(&q->killed, memory_order_relaxed)) {
         unsigned int seqn = atomic_load_explicit(&q->seqn, memory_order_acquire);
-        if (seqn == prev_seqn) {
+        if (seqn == done) {
             if (atomic_load_explicit(&q->active, memory_order_relaxed)) {
                 hex_pause();
             } else {
@@ -70,30 +73,34 @@ static void work_queue_thread(void * context) {
             continue;
         }
 
-        prev_seqn = seqn;
-
-        // Process all active tasks in the queue
-        unsigned int ir = atomic_load_explicit(&q->idx_read, memory_order_relaxed);
-        unsigned int iw = atomic_load_explicit(&q->idx_write, memory_order_relaxed);
-
-        while (ir != iw) {
-            struct work_queue_task_s * task = &q->queue[ir];
-
-            unsigned int n = task->n_threads;
-            if (id < n) {
-                atomic_store_explicit(&me->busy, 1, memory_order_relaxed);
-                task->func(&me->th, n, id, task->data);
-                atomic_store_explicit(&me->busy, 0, memory_order_relaxed);
-
-                atomic_fetch_sub_explicit(&task->barrier, 1, memory_order_release);
-            } else {
-                while (atomic_load_explicit(&task->barrier, memory_order_relaxed) > 0) {
-                    hex_pause();
-                }
+        // Look at each new task exactly once, oldest first. Taking the range from idx_read instead (it moves
+        // only when the oldest task completes) let a worker that stalled between reading seqn and idx_read
+        // (preempted by a higher-priority thread) run the next task once with the old seqn and again on the
+        // next pass: barrier wrapped below zero and the main thread spun forever, holding VTCM/HMX, or it
+        // reached zero early and the main thread went on while another worker was still running the task.
+        // A task this worker takes part in cannot be overwritten before it runs it (the main thread waits for
+        // it); a slot reused by a later task while this worker lagged fails the seq check (seqlock: the
+        // producer marks seq before refilling the slot) and that task is taken at its own number.
+        for (unsigned int s = done + 1; s != seqn + 1; s++) {
+            struct work_queue_task_s * task = &q->queue[(s - 1) & q->idx_mask];
+            if (atomic_load_explicit(&task->seq, memory_order_acquire) != s) {
+                continue;
+            }
+            work_queue_func_t func = task->func;
+            void *            data = task->data;
+            unsigned int      n    = task->n_threads;
+            atomic_thread_fence(memory_order_acquire);
+            if (atomic_load_explicit(&task->seq, memory_order_relaxed) != s || id >= n) {
+                continue;
             }
 
-            ir = (ir + 1) & q->idx_mask;
+            atomic_store_explicit(&me->busy, 1, memory_order_relaxed);
+            func(&me->th, n, id, data);
+            atomic_store_explicit(&me->busy, 0, memory_order_relaxed);
+
+            atomic_fetch_sub_explicit(&task->barrier, 1, memory_order_release);
         }
+        done = seqn;
     }
 
     FARF(HIGH, "work-queue: thread %u (tid %u) stopped", id, me->th.tid);
@@ -119,10 +126,14 @@ bool work_queue_run(work_queue_t q, work_queue_func_t func, void * data, unsigne
     }
 
     struct work_queue_task_s * task = &q->queue[iw];
+    const unsigned int seq = atomic_load_explicit(&q->seqn, memory_order_relaxed) + 1;  // only this thread pushes
+    atomic_store_explicit(&task->seq, seq + 1, memory_order_relaxed);  // slot iw only holds tasks seq + k * capacity
+    atomic_thread_fence(memory_order_release);
     task->func      = func;
     task->data      = data;
     task->n_threads = n;
     atomic_store_explicit(&task->barrier, n, memory_order_relaxed);
+    atomic_store_explicit(&task->seq, seq, memory_order_release);
 
     atomic_store_explicit(&q->idx_write, (iw + 1) & q->idx_mask, memory_order_relaxed);
 
@@ -189,6 +200,7 @@ work_queue_t work_queue_init(void * ptr, uint32_t n_threads, uint32_t capacity, 
     q->killed    = 0;
     for (int i = 0; i < (int) capacity; i++) {
         atomic_init(&q->queue[i].barrier, 0);
+        atomic_init(&q->queue[i].seq, 0);
         q->queue[i].func      = NULL;
         q->queue[i].data      = NULL;
         q->queue[i].n_threads = 0;
