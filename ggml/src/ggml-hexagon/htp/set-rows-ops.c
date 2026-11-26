@@ -101,7 +101,7 @@ static inline void set_rows_row_kv_f16_common(void * restrict dst, const void * 
     uint32_t       i  = 0;
     while (i < n) {
         const uint32_t chunk = MIN(n - i, 256u);
-        hvx_copy_f32_f16_uu((uint8_t *) tmp, (const uint8_t *) (sp + i), chunk);
+        kv_f16_to_f32_exact(tmp, sp + i, chunk);
         kv_quantize_row(dp, tmp, chunk, dst_type);
         dp += htp_tensor_get_row_size(dst_type, chunk);
         i  += chunk;

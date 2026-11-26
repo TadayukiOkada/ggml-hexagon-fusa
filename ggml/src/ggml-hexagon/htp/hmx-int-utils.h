@@ -97,9 +97,9 @@ static inline void int_hmx_inv127_from_max_f16(
 }
 
 static inline HVX_Vector int_hmx_m_b4_from_sc_qf(HVX_Vector v_sc_qf, HVX_Vector v_inv127_qf) {
-    const HVX_Vector v12M_sf = Q6_V_vsplat_R(0x4B400000);
-    HVX_Vector v_m_biased    = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(v_sc_qf, v_inv127_qf), v12M_sf));
-    HVX_Vector v_m_h         = Q6_Vh_vpacke_VwVw(v_m_biased, v_m_biased);
+    const HVX_Vector v_half_sf = hvx_vec_splat_f32(0.5f);
+    HVX_Vector v_m_i32         = Q6_Vw_equals_Vsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_Vqf32Vqf32(v_sc_qf, v_inv127_qf), v_half_sf)));
+    HVX_Vector v_m_h           = Q6_Vh_vpacke_VwVw(v_m_i32, v_m_i32);
     return Q6_Vh_vshuff_Vh(Q6_Vb_vshuff_Vb(Q6_Vb_vpacke_VhVh(v_m_h, v_m_h)));
 }
 

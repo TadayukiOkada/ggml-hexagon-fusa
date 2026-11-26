@@ -2430,10 +2430,11 @@ static __attribute__((always_inline)) inline void fa_w8a8_mask_and_rowmax_pair(
     int32_t slope0_u16 = 0;
     int32_t slope1_u16 = 0;
     if (has_alibi) {
-        const HVX_Vector v_sl = hvx_vmem(slopes_row64);
-        slope0_u16 = Q6_R_vextract_VR(v_sl, (int) (r_vec_off * 2));
+        const HVX_Vector v_sl    = hvx_vmem(slopes_row64);
+        const uint32_t   sl_pair = (uint32_t) Q6_R_vextract_VR(v_sl, (int) (r_vec_off * 2));
+        slope0_u16 = (int32_t) (sl_pair & 0xffffu);
         if (r + 1 < n_rows_g) {
-            slope1_u16 = Q6_R_vextract_VR(v_sl, (int) ((r_vec_off + 1) * 2));
+            slope1_u16 = (int32_t) (sl_pair >> 16);
         }
     }
 

@@ -314,13 +314,13 @@ static bool htp_flash_attn_is_hmx_eligible(
         return true;
     }
 
+    if (DK == 256 && n_kv_heads < total_threads) {
+        return true;
+    }
+
     // W8A8 HMX pads M=1 decode rows to 64, so HVX is much faster for Q8_0 KV decode.
     if (k->type == GGML_TYPE_Q8_0 || v->type == GGML_TYPE_Q8_0) {
         return false;
-    }
-
-    if (DK == 256 && n_kv_heads < total_threads) {
-        return true;
     }
 
     const bool is_tile_aligned = (G > 0 && (32 % G == 0));
@@ -441,7 +441,7 @@ static bool htp_kparams_solve_flash_attn(
         const uint32_t DK_pad = hex_round_up(DK, 64);
         const uint32_t DV_pad = hex_round_up(DV, 64);
         const bool use_w8a8 = (opt_fa_select >= 3 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
-                               DK % 32 == 0 && DV % 32 == 0 && DK <= 768);
+                               DK % 32 == 0 && DV % 32 == 0 && DK <= 768 && neq1 > 1);
         const bool has_mask       = (mask != nullptr);
         const bool mask_broadcast = (has_mask && mask->ne[2] == 1);
 
@@ -475,7 +475,23 @@ static bool htp_kparams_solve_flash_attn(
         if (ret != 0 && Bc_fixed) {
             ret = hmx_fa_find_chunk_size(&lp, neq1, nek1, vtcm_size, fa_team_size, 0);
         }
+        if (ret != 0 && use_w8a8) {
+            // W8A8 requires more VTCM for wide/long KV (e.g. DK=256, kv>=16384); retry HMX FP16 before HVX.
+            lp.kernel_type = HTP_FA_KERNEL_HMX_F16;
+            Bc_fixed       = 0;
+            if (neq1 <= HTP_FA_FEW_ROWS) {
+                struct hmx_fa_layout_params lp_cap = lp;
+                if (hmx_fa_find_chunk_size(&lp_cap, HTP_FA_FEW_ROWS, kv_cap, vtcm_size, fa_team_size, 0) == 0) {
+                    Bc_fixed = lp_cap.Bc;
+                }
+            }
+            ret = hmx_fa_find_chunk_size(&lp, neq1, nek1, vtcm_size, fa_team_size, Bc_fixed);
+            if (ret != 0 && Bc_fixed) {
+                ret = hmx_fa_find_chunk_size(&lp, neq1, nek1, vtcm_size, fa_team_size, 0);
+            }
+        }
         if (ret == 0) {
+            const bool is_w8a8   = (lp.kernel_type == HTP_FA_KERNEL_HMX_W8A8);
             kparams->kernel_type = lp.kernel_type;
             if (opt_fa_q8_prep) {
                 kparams->flags |= HTP_FA_FLAG_FUSED_Q8_PREP;
@@ -494,7 +510,7 @@ static bool htp_kparams_solve_flash_attn(
             kparams->Bc                   = lp.Bc;
             kparams->n_kv_blocks          = (nek1 + lp.Bc - 1) / lp.Bc;
             kparams->n_hvx                = (kparams->n_kv_blocks >= 3 && n_hvx >= 2) ? n_hvx : 1;
-            kparams->u.hmx.g_br           = hex_align_up(G * lp.Br, use_w8a8 ? HMX_W8A8_ACT_TILE_N_ROWS : HMX_FP16_TILE_N_ROWS);
+            kparams->u.hmx.g_br           = hex_align_up(G * lp.Br, is_w8a8 ? HMX_W8A8_ACT_TILE_N_ROWS : HMX_FP16_TILE_N_ROWS);
             kparams->u.hmx.mask_broadcast = mask_broadcast ? 1 : 0;
             // vtcm_mask_buf is single-buffered for non-broadcast masks, so disable block pipelining.
             kparams->u.hmx.pipeline       = (kparams->n_kv_blocks >= 3 && n_hvx >= 2 && (!has_mask || mask_broadcast)) ? 1 : 0;
@@ -732,9 +748,8 @@ static bool htp_matmul_is_hmx_eligible(
         return false;
     }
 
-    // HMX paths require K aligned to 32. The flat 2D path pads F16/F32 weights with zeros.
-    const bool can_pad_k = (wtype == GGML_TYPE_F16 || wtype == GGML_TYPE_F32) && !is_batched && !is_matmul_id;
-    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0 && !can_pad_k) {
+    // HMX paths require K aligned to 32.
+    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0) {
         return false;
     }
 

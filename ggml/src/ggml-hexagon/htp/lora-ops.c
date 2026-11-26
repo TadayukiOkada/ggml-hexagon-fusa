@@ -6,6 +6,7 @@
 #include <HAP_farf.h>
 #include <HAP_perf.h>
 #include <HAP_compute_res.h>
+#include <qurt_memory.h>
 
 #include <assert.h>
 #include <math.h>
@@ -87,7 +88,22 @@ typedef void (*lora_vec_dot_32x2_t)(const uint32_t n, void * restrict s0, void *
                                     hvx_tiled_store_row_fn_t store_row);
 
 static inline uint32_t lora_hvx_vtcm_tile_stride(uint32_t type) {
-    return type == HTP_TYPE_Q4_0 ? HTP_MM_VTCM_TILE_STRIDE_Q4_0 : htp_tensor_get_tile_padded_size(type);
+    return htp_tensor_get_tile_padded_size(type);
+}
+
+// LoRA ops write outputs (and in HMX mode read base_out/norm_w) via direct cached HVX loads/stores
+// while other ops in the same opbatch access DDR via bypass UDMA. Flush written outputs and
+// invalidate directly-read inputs to keep DDR coherent across ops within a batch.
+static inline void lora_dcache_flush_tensor(const struct htp_tensor * t) {
+    if (t && t->data && t->size > 0) {
+        qurt_mem_cache_clean((qurt_addr_t) t->data, t->size, QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE);
+    }
+}
+
+static inline void lora_dcache_invalidate_tensor(const struct htp_tensor * t) {
+    if (t && t->data && t->size > 0) {
+        qurt_mem_cache_clean((qurt_addr_t) t->data, t->size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+    }
 }
 
 static int lora_init_tiled_vec_dot(enum htp_data_type type, lora_vec_dot_32x1_t * out1, lora_vec_dot_32x2_t * out2) {
@@ -1825,6 +1841,7 @@ static int hvx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
 
     // Stage activation into vtcm_act_raw and optionally fuse RMS_NORM+MUL
     if (kp->norm) {
+        lora_dcache_invalidate_tensor(octx->src[kp->norm_w_slot]);
         hex_l2fetch((const void *) octx->src[kp->norm_w_slot]->data, k * sizeof(float), k * sizeof(float), 1);
     }
     const size_t act_elem_sz = lora_elem_size(act->type);
@@ -1878,6 +1895,11 @@ static int hvx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
 
     // Barrier 2: base tiled matmul + fused LoRA B addition (+ optional GLU)
     work_queue_run(octx->ctx->hvx_queue, hvx_mm_lora_2d_tiled, lctx, octx->n_hvx);
+
+    const uint32_t n_dsts = kp->glu ? 1u : n_weights;
+    for (uint32_t p = 0; p < n_dsts; ++p) {
+        lora_dcache_flush_tensor(octx->dsts[p]);
+    }
 
     return HTP_STATUS_OK;
 }
@@ -2564,6 +2586,7 @@ static int hmx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
         if (act->type != HTP_TYPE_F32) {
             return HTP_STATUS_NO_SUPPORT;
         }
+        lora_dcache_invalidate_tensor(octx->src[kp->norm_w_slot]);
         hex_l2fetch((const void *) norm_w, k_valid * sizeof(float), k_valid * sizeof(float), 1);
     }
 
@@ -2964,6 +2987,11 @@ static int hmx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
         }
     }
 
+    const uint32_t n_dsts = kp->glu ? 1u : n_weights;
+    for (uint32_t p = 0; p < n_dsts; ++p) {
+        lora_dcache_flush_tensor(octx->dsts[p]);
+    }
+
     return HTP_STATUS_OK;
 }
 
@@ -3211,6 +3239,8 @@ static int hvx_lora_add_op(struct htp_ops_context * octx, const struct htp_lora_
 #endif
     }
 
+    lora_dcache_flush_tensor(dst);
+
     return HTP_STATUS_OK;
 }
 
@@ -3266,6 +3296,7 @@ static int hmx_lora_add_op(struct htp_ops_context * octx, const struct htp_lora_
 
     hmx_mm_lora_vtcm_setup(vtcm_scales, vtcm_eye, NULL, 0);
     ctx->mm_out_writeback = true;
+    lora_dcache_invalidate_tensor(base_out);
 
     for (uint32_t mr = 0; mr < m; mr += mc) {
         const uint32_t n_rows      = hex_smin(m - mr, mc);
@@ -3335,6 +3366,8 @@ static int hmx_lora_add_op(struct htp_ops_context * octx, const struct htp_lora_
         }
 #endif
     }
+
+    lora_dcache_flush_tensor(dst);
 
     return HTP_STATUS_OK;
 }
