@@ -5304,6 +5304,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     dma_queue_flush(dma_q);
                     htp_vtcm_yield(ctx);
                     fa_vtcm_setup(&factx, &L, dma_q, size_k_row_padded, size_v_row_padded);
+                    if (has_next) {
+                        // Restore the dummy O writeback expected by the next kv_head iteration.
+                        dma_queue_push(dma_q, dma_make_data(dst->data, factx.vtcm_o_tiles[0]), 0, 0, 0, 0);
+                    }
                     push_step_dma = true;
                 }
 #else
