@@ -110,7 +110,7 @@ static bool htp_mul_mat_within_budget(const struct ggml_hexagon_session * sess, 
         }
     }
 #ifdef GGML_HEXAGON_HTP_YIELD_IN_OPS
-    if (kernel_type == HTP_MM_KERNEL_HMX_2D) {
+    if (htp_mm_kernel_is_hmx_2d(kernel_type)) {
         return true;
     }
 #endif
@@ -137,13 +137,55 @@ static bool htp_mul_mat_within_budget(const struct ggml_hexagon_session * sess, 
     return htp_budget_check(sess, op, est);
 }
 
+static bool htp_mul_mat_id_within_budget(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * ids  = op->src[2];
+
+    const struct ggml_tensor * src0_base     = src0->view_src ? src0->view_src : src0;
+    const bool                 src0_computed = src0_base->op != GGML_OP_NONE;
+    if (src0->data == nullptr && !src0_computed) {
+        return true;
+    }
+
+    int kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
+    if (htp_op_remap(op) == HTP_OP_MUL_MAT_ID) {
+        htp_opnode node(HTP_OP_MUL_MAT_ID, op);
+        if (htp_kparams_solve(sess, node)) {
+            kernel_type = node.kparams<htp_mm_kernel_params>()->kernel_type;
+        }
+    }
+#ifdef GGML_HEXAGON_HTP_YIELD_IN_OPS
+    if (htp_mm_kernel_is_hmx_2d(kernel_type)) {
+        return true;
+    }
+#endif
+
+    const int64_t total_rows     = ids ? ids->ne[0] * ids->ne[1] : 1;
+    const int64_t n_experts      = (std::max)(int64_t(1), src0->ne[2]);
+    const int64_t active_experts = (std::min)(n_experts, total_rows);
+    const double  flops          = 2.0 * src0->ne[0] * src0->ne[1] * total_rows;
+    const double  expert_bytes   = (double) ggml_nbytes(src0) / (double) n_experts;
+    const double  rate           = htp_mm_kernel_is_hmx_2d(kernel_type) ? 5.0e9 : htp_mm_flop_per_ms(kernel_type);
+    const double  est            = (std::max)(flops / rate, active_experts * expert_bytes / 45.0e6);
+    return htp_budget_check(sess, op, est);
+}
+
 // GATED_DELTA_NET has no point where VTCM could be released. On v73 (QCS9075) it takes about
 // 0.27-0.32 us per token and V head with 128x128 states (0.64 us with few tokens per sequence):
 // 2047 tokens x 2 sequences x 48 heads, 53 ms. Estimate at 0.7 us, scaled by the state size.
+// With replay (src[6] != nullptr && src[7] != nullptr), each kept pending token runs recurrent
+// HVX steps before the main tokens; add a conservative 2x weight per static n_pend upper bound.
 static double htp_estimate_gdn_ms(const struct ggml_tensor * op) {
     const struct ggml_tensor * v = op->src[2];
     const double s = (double) v->ne[0] / 128.0;
-    return 0.7e-3 * (double) v->ne[1] * v->ne[2] * v->ne[3] * s * s;
+    double tokens = (double) v->ne[2];
+    if (op->src[6] != nullptr && op->src[7] != nullptr) {
+        const int32_t n_pend = ggml_get_op_params_i32(op, 1);
+        if (n_pend > 0) {
+            tokens += 2.0 * (double) n_pend;
+        }
+    }
+    return 0.7e-3 * (double) v->ne[1] * tokens * (double) v->ne[3] * s * s;
 }
 
 // Ops added with llama.cpp v0.9.0. On v73 (QCS9075, one shape each, GGML_HEXAGON_PROFILE): UPSCALE
@@ -227,6 +269,8 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
             return htp_budget_check(sess, op, htp_estimate_sort_ms(op->src[0], op, op->ne[0], n_threads));
         case GGML_OP_MUL_MAT:
             return htp_mul_mat_within_budget(sess, op);
+        case GGML_OP_MUL_MAT_ID:
+            return htp_mul_mat_id_within_budget(sess, op);
         case GGML_OP_GATED_DELTA_NET:
             return htp_budget_check(sess, op, htp_estimate_gdn_ms(op));
         case GGML_OP_CONV_2D:
@@ -236,11 +280,12 @@ bool htp_op_within_budget(const struct ggml_hexagon_session * sess, const struct
         case GGML_OP_LIGHTNING_INDEXER:
             return htp_budget_check(sess, op, htp_estimate_lightning_indexer_ms(op));
         case GGML_OP_SSM_SCAN:
-            // New on the HTP after llama.cpp v1.0.0: not timed on v73 and no point where VTCM is
-            // released, so there is no estimate to compare with the budget.
+            // These HTP ops have no measured v73 bound or VTCM yield point yet.
             HEX_VERBOSE("ggml-hex: %s %s %s has no time estimate, left to the CPU\n", htp_session_name(sess),
                         ggml_op_desc(op), op->name);
             return false;
+        case GGML_OP_TIMESTEP_EMBEDDING:
+            return htp_budget_check(sess, op, htp_estimate_bytes_ms(op, 5.0e6));
         case GGML_OP_UPSCALE:
             return htp_budget_check(sess, op, htp_estimate_upscale_ms(sess, op));
         case GGML_OP_TOP_K_MASK:

@@ -27,7 +27,6 @@
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
 #include "htp-ctx.h"
-#include "htp-dcache.h"
 #include "htp-ops.h"
 #include "htp-tensor.h"
 #include "htp-vtcm.h"
@@ -73,17 +72,19 @@ static inline void iq2xxs_lut_copy(uint8_t * restrict lut) {
 
 #include "hvx-mm-kernels-tiled.h"
 #include "hvx-mm-kernels-float.h"
-#include "hmx-mm-kernels-tiled.h"
+#include "hmx-mm-kernels-tiled-fp.h"
 
 // ============================================================================
 // Shared Kernel Dispatch & HMX Helpers (Replicated locally to leave matmul-ops.c untouched)
 // ============================================================================
 
-typedef void (*lora_vec_dot_32x1_t)(const uint32_t n, float * restrict s, const void * restrict vx,
-                                    const void * restrict vy, uint32_t valid_rows, const float * restrict sz);
-typedef void (*lora_vec_dot_32x2_t)(const uint32_t n, float * restrict s0, float * restrict s1,
+typedef void (*lora_vec_dot_32x1_t)(const uint32_t n, void * restrict s, const void * restrict vx,
+                                    const void * restrict vy, uint32_t valid_rows, const void * restrict sz,
+                                    hvx_tiled_store_row_fn_t store_row);
+typedef void (*lora_vec_dot_32x2_t)(const uint32_t n, void * restrict s0, void * restrict s1,
                                     const void * restrict vx, const void * restrict vy0, const void * restrict vy1,
-                                    uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1);
+                                    uint32_t valid_rows, const void * restrict sz0, const void * restrict sz1,
+                                    hvx_tiled_store_row_fn_t store_row);
 
 static inline uint32_t lora_hvx_vtcm_tile_stride(uint32_t type) {
     return type == HTP_TYPE_Q4_0 ? HTP_MM_VTCM_TILE_STRIDE_Q4_0 : htp_tensor_get_tile_padded_size(type);
@@ -753,14 +754,6 @@ static inline void hvx_mm_glu_store(float * dst, const float * gate, const float
         hvx_vmemu(dst) = v;
     } else {
         hvx_vec_store_u(dst, n * sizeof(float), v);
-    }
-}
-
-static inline void lora_hmx_mark_rows_clean(struct htp_context * ctx, const struct htp_tensor * dst,
-                                            uint32_t m_start, uint32_t m_rows) {
-    if (dst->nb[1] == dst->ne[0] * sizeof(float)) {
-        htp_dcache_mark_range_clean(ctx, dst->data + m_start * dst->nb[1],
-                                    dst->data + (m_start + m_rows) * dst->nb[1]);
     }
 }
 
@@ -1625,7 +1618,8 @@ static void hvx_mm_lora_2d_tiled(const htp_thread_t * th, unsigned int nth, unsi
                     float *                  gate1    = gate0 + lctx->glu_stride;
 
                     if (glu_gate) {
-                        lctx->vec_dot_32x2(ne10, gate0, gate1, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);
+                        lctx->vec_dot_32x2(ne10, gate0, gate1, w_tile, act_col0, act_col1, valid_rows, NULL, NULL,
+                                           hvx_tiled_store_row_f32_none);
                         if (n_active > 0) {
                             lora_apply_tile_32(gate0, n_active, active_b_types, b_tile_ptrs, h_f32_m[ir1 + 0],
                                                h_f16_m[ir1 + 0], active_r, active_scales);
@@ -1634,7 +1628,7 @@ static void hvx_mm_lora_2d_tiled(const htp_thread_t * th, unsigned int nth, unsi
                         }
                     } else if (glu_out) {
                         lctx->vec_dot_32x2(ne10, tile_out_base, tile_out_base + 32, w_tile, act_col0, act_col1,
-                                           valid_rows, NULL, NULL);
+                                           valid_rows, NULL, NULL, hvx_tiled_store_row_f32_none);
                         if (n_active > 0) {
                             lora_apply_tile_32(tile_out_base, n_active, active_b_types, b_tile_ptrs, h_f32_m[ir1 + 0],
                                                h_f16_m[ir1 + 0], active_r, active_scales);
@@ -1645,7 +1639,7 @@ static void hvx_mm_lora_2d_tiled(const htp_thread_t * th, unsigned int nth, unsi
                         hvx_mm_glu_store(dst_ptr1, gate1, tile_out_base + 32, (uint32_t) valid_rows, glu);
                     } else if (n_active > 0) {
                         lctx->vec_dot_32x2(ne10, tile_out_base, tile_out_base + 32, w_tile, act_col0, act_col1,
-                                           valid_rows, NULL, NULL);
+                                           valid_rows, NULL, NULL, hvx_tiled_store_row_f32_none);
                         lora_apply_tile_32(tile_out_base, n_active, active_b_types, b_tile_ptrs, h_f32_m[ir1 + 0],
                                            h_f16_m[ir1 + 0], active_r, active_scales);
                         lora_apply_tile_32(tile_out_base + 32, n_active, active_b_types, b_tile_ptrs,
@@ -1660,7 +1654,7 @@ static void hvx_mm_lora_2d_tiled(const htp_thread_t * th, unsigned int nth, unsi
                         }
                     } else {
                         lctx->vec_dot_32x2(ne10, dst_ptr0, dst_ptr1, w_tile, act_col0, act_col1, valid_rows, NULL,
-                                           NULL);
+                                           NULL, hvx_tiled_store_row_f32_none);
                     }
                 }
                 for (; ir1 < act_nrows; ++ir1) {
@@ -1669,20 +1663,23 @@ static void hvx_mm_lora_2d_tiled(const htp_thread_t * th, unsigned int nth, unsi
                     float *                  gate    = lctx->vtcm_glu_gate + ir1 * lctx->glu_stride + ct * 32;
 
                     if (glu_gate) {
-                        lctx->vec_dot_32x1(ne10, gate, w_tile, act_col, valid_rows, NULL);
+                        lctx->vec_dot_32x1(ne10, gate, w_tile, act_col, valid_rows, NULL,
+                                           hvx_tiled_store_row_f32_none);
                         if (n_active > 0) {
                             lora_apply_tile_32(gate, n_active, active_b_types, b_tile_ptrs, h_f32_m[ir1], h_f16_m[ir1],
                                                active_r, active_scales);
                         }
                     } else if (glu_out) {
-                        lctx->vec_dot_32x1(ne10, tile_out_base, w_tile, act_col, valid_rows, NULL);
+                        lctx->vec_dot_32x1(ne10, tile_out_base, w_tile, act_col, valid_rows, NULL,
+                                           hvx_tiled_store_row_f32_none);
                         if (n_active > 0) {
                             lora_apply_tile_32(tile_out_base, n_active, active_b_types, b_tile_ptrs, h_f32_m[ir1],
                                                h_f16_m[ir1], active_r, active_scales);
                         }
                         hvx_mm_glu_store(dst_ptr, gate, tile_out_base, (uint32_t) valid_rows, glu);
                     } else if (n_active > 0) {
-                        lctx->vec_dot_32x1(ne10, tile_out_base, w_tile, act_col, valid_rows, NULL);
+                        lctx->vec_dot_32x1(ne10, tile_out_base, w_tile, act_col, valid_rows, NULL,
+                                           hvx_tiled_store_row_f32_none);
                         lora_apply_tile_32(tile_out_base, n_active, active_b_types, b_tile_ptrs, h_f32_m[ir1],
                                            h_f16_m[ir1], active_r, active_scales);
                         if (valid_rows == 32) {
@@ -1691,7 +1688,8 @@ static void hvx_mm_lora_2d_tiled(const htp_thread_t * th, unsigned int nth, unsi
                             hvx_vec_store_u(dst_ptr, (uint32_t) valid_rows * sizeof(float), hvx_vmem(tile_out_base));
                         }
                     } else {
-                        lctx->vec_dot_32x1(ne10, dst_ptr, w_tile, act_col, valid_rows, NULL);
+                        lctx->vec_dot_32x1(ne10, dst_ptr, w_tile, act_col, valid_rows, NULL,
+                                           hvx_tiled_store_row_f32_none);
                     }
                 }
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
@@ -1771,7 +1769,7 @@ static int hvx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
 
     struct htp_mm_hvx_vtcm_layout L_base;
     htp_mm_hvx_vtcm_layout_build(&L_base, kp->kernel_type, w0->type, k, act_nrows, octx->n_hvx, 0, 0,
-                                 (size_t) kp->act_row_size, 0, kp->n_prefetch, false, true);
+                                 sizeof(float), 0, kp->n_prefetch, false, true);
 
     struct htp_lora_hvx_vtcm_layout L_lora;
     htp_lora_hvx_layout_build(&L_lora, L_base.total_bytes, k, act_nrows, octx->n_hvx, kp->n_loras, max_r,
@@ -2737,7 +2735,6 @@ static int hmx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
             }
 #endif
         }
-        lora_hmx_mark_rows_clean(ctx, dst, 0, m);
     } else if (pipeline) {
         void * vtcm_raw_b[4] = {
             vtcm_w_raw[0], vtcm_w_raw[1],
@@ -2881,9 +2878,6 @@ static int hmx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
             }
 #endif
         }
-        for (uint32_t p = 0; p < n_weights; ++p) {
-            lora_hmx_mark_rows_clean(ctx, octx->dsts[p], 0, m);
-        }
     } else {
         // Synchronous non-pipelined loop
         void *             vtcm_w_b = dequant_fn ? vtcm_s0 : vtcm_w_raw[0];
@@ -2975,9 +2969,6 @@ static int hmx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
                 hmx_mm_lora_vtcm_setup(vtcm_scales, vtcm_eye, vtcm_lut, L_hmx.lut_bytes);
             }
 #endif
-        }
-        for (uint32_t p = 0; p < n_weights; ++p) {
-            lora_hmx_mark_rows_clean(ctx, octx->dsts[p], 0, m);
         }
     }
 
@@ -3353,7 +3344,6 @@ static int hmx_lora_add_op(struct htp_ops_context * octx, const struct htp_lora_
 #endif
     }
 
-    lora_hmx_mark_rows_clean(ctx, dst, 0, m);
     return HTP_STATUS_OK;
 }
 
