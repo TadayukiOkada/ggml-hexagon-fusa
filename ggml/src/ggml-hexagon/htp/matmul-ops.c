@@ -3594,6 +3594,14 @@ static inline void hmx_matmul_task_init_int(hmx_matmul_task_t * task,
     task->n_groups    = n_groups;
 }
 
+// Zero the padded tail of each raw weight row. The DMA never writes it,
+// but the activation scratch overlaps the raw weight buffers, so redo this after each activation transfer.
+static void hmx_mm_zero_weight_row_tails(uint8_t * raw, size_t n_rows, size_t row_stride, size_t valid_bytes) {
+    for (size_t r = 0; r < n_rows; ++r) {
+        memset(raw + r * row_stride + valid_bytes, 0, row_stride - valid_bytes);
+    }
+}
+
 static void hmx_mm_2d_vtcm_setup(bool is_int_hmx, __fp16 * vtcm_scales, uint8_t * vtcm_lut, size_t lut_bytes,
                                  bool has_bias, dma_queue * weight_dma, void * vtcm_bias,
                                  dma_addr_t bias_addr, size_t bias_bytes) {
@@ -3669,9 +3677,12 @@ static int hmx_mm_2d_f32(struct htp_ops_context *octx,
 
     const size_t vtcm_budget  = ctx->vtcm_size;
 
+    // F16/F32 weights: k may be k_valid padded to 32. Copy only the valid part of each row.
+    const size_t   w_elem_size     = (weight_type == HTP_TYPE_F32) ? sizeof(float) : sizeof(__fp16);
+    const bool     pad_k           = !is_tiled && k_valid < k;
     const uint32_t dma_dst_stride  = is_tiled ? aligned_tile_size : row_stride;
     const uint32_t dma_src_stride  = is_tiled ? tile_size : weight_stride;
-    const uint32_t dma_width_bytes = is_tiled ? tile_size : row_stride;
+    const uint32_t dma_width_bytes = is_tiled ? tile_size : (pad_k ? (uint32_t) (k_valid * w_elem_size) : row_stride);
 
     size_t m_chunk_n_rows = m_chunk;
     size_t n_chunk_n_cols = n_chunk;
@@ -3790,6 +3801,14 @@ pipelined_pass: __attribute__((unused));
                     .act_elem_size = act_elem_size,
                 };
                 transfer_activation_chunk_threaded(&act_params);
+            }
+
+            if (pad_k) {
+                for (int b = 0; b < 2; ++b) {
+                    if (vtcm_weight_raw[b]) {
+                        hmx_mm_zero_weight_row_tails((uint8_t *) vtcm_weight_raw[b], n_chunk_n_cols, row_stride, dma_width_bytes);
+                    }
+                }
             }
 
             if (!preissue_w0 && i_start < n_chunk_cnt) {
@@ -4077,6 +4096,14 @@ sync_pass: __attribute__((unused));
                     .act_elem_size = act_elem_size,
                 };
                 transfer_activation_chunk_threaded(&act_params);
+            }
+
+            if (pad_k) {
+                for (int b = 0; b < 2; ++b) {
+                    if (vtcm_weight_raw[b]) {
+                        hmx_mm_zero_weight_row_tails((uint8_t *) vtcm_weight_raw[b], n_chunk_n_cols, row_stride, dma_width_bytes);
+                    }
+                }
             }
 
             if (!preissue_w0 && i_start < n_chunk_cnt) {
@@ -6357,7 +6384,8 @@ id_fp16_pass: __attribute__((unused));
 static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_kernel_params * kparams) {
     htp_matmul_tensors_preamble;
 
-    int k = (int) src0->ne[0];
+    // F16/F32 weights may have K not aligned to 32. HMX runs on K padded with zeros.
+    int k = (int) hex_round_up((uint32_t) src0->ne[0], 32);
     int n = (int) src0->ne[1];
     const int m_total    = (int) act->ne[1];
     const uint32_t act_elem_size  = (act->type == HTP_TYPE_F16) ? sizeof(__fp16) : sizeof(float);
