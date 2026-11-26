@@ -990,7 +990,6 @@ int op_im2col(struct htp_ops_context * octx) {
     struct htp_im2col_context ictx = { 0 };
     uint8_t * const base = octx->ctx->vtcm_base;
 
-    const uint32_t pth = octx->n_hvx;
     ictx.octx                   = octx;
     ictx.pe_src_row_bytes       = kparams->src_row_bytes;
     ictx.pe_dst_row_bytes       = kparams->dst_row_bytes;
@@ -1070,7 +1069,6 @@ int op_im2col_3d(struct htp_ops_context * octx) {
     struct htp_im2col_context ictx = { 0 };
     uint8_t * const base = octx->ctx->vtcm_base;
 
-    const uint32_t pth = octx->n_hvx;
     ictx.octx                   = octx;
     ictx.pe_src_row_bytes       = kparams->src_row_bytes;
     ictx.pe_dst_row_bytes       = kparams->dst_row_bytes;

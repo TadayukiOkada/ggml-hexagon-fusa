@@ -1736,15 +1736,6 @@ struct ggml_hexagon_opbatch {
         sync_op_desc(n_ops - 1, last_node);
         HEX_VERBOSE("ggml-hex: %s fused %s (N=%zu, #%u)\n",
                     sess->c_name(), last_node.name().c_str(), last_node.fused.size() + 1, n_ops - 1);
-
-        // the NX op takes the place of the RMS_NORM+MUL before it when it normalizes its activation itself
-        if (n_ops >= 2 && htp_fusion_try_absorb_norm(ops[n_ops - 2], last_node)) {
-            ops[n_ops - 2] = last_node;
-            n_ops--;
-            sync_op_desc(n_ops - 1);
-            HEX_VERBOSE("ggml-hex: %s fused RMS_NORM+%s (N=%zu, #%u)\n",
-                        sess->c_name(), ops[n_ops - 1].name().c_str(), ops[n_ops - 1].fused.size() + 1, n_ops - 1);
-        }
         return true;
     }
 };
@@ -2104,8 +2095,6 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
     }
 
-    // Let very short DSP batches complete without paying a host wake-up delay.
-    auto poll_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
     auto wait_start    = std::chrono::steady_clock::now();
     auto diag_next     = wait_start + std::chrono::seconds(opt_diag_wait);
     dsp_state diag_prev;
@@ -2185,8 +2174,7 @@ void ggml_hexagon_session::flush_pending(bool all) {
                             (uint64_t) rsp.seq, (unsigned) rsp.status);
 
         if (!all) break;
-        poll_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
-        wait_start    = poll_deadline;
+        wait_start    = std::chrono::steady_clock::now();
         diag_next     = wait_start + std::chrono::seconds(opt_diag_wait);
         diag_prev     = {};
     }

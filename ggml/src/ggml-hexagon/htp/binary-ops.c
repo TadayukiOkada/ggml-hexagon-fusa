@@ -1637,7 +1637,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
         // Large element-wise ops run in rounds of about 32 MiB of src0, so VTCM can be given away
         // between rounds when a release is requested. Rounds start on chunk boundaries, and the
         // scalar operand is already in a register.
-        const uint32_t round_chunks = MAX(n_hvx, (uint32_t) MAX((size_t) 1, (32u << 20) / ((size_t) chunk_size * elem_size)) / n_hvx * n_hvx);
+        const uint32_t round_chunks = MAX(n_hvx, (uint32_t) MAX((size_t) 1, (32u << 20) / ((size_t) chunk_size * src0_elem_size)) / n_hvx * n_hvx);
         if (round_chunks < total_chunks) {
             for (uint32_t done = 0; done < total_chunks;) {
                 const uint32_t n = MIN(round_chunks, total_chunks - done);

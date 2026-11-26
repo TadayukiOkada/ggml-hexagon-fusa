@@ -1885,37 +1885,6 @@ typedef struct {
     bool                      s_by_word;  // S tiles from fa_tile_transpose_*: a query row is a word lane
 } fa_softmax_args_t;
 
-// 2^x in fp16 for the softmax: hvx_vec_exp2_f16 with a degree-4 polynomial instead of degree 6.
-// With the coefficients in fp16, degrees 4 to 6 have the same error on the fractional part
-// (about 1.5e-4 relative, set by the rounding of the coefficients), below half an fp16 ulp.
-static inline HVX_Vector fa_exp2_f16(HVX_Vector x_v) {
-    const HVX_Vector zero_v    = Q6_V_vzero();
-    const HVX_Vector half_hf_v = Q6_Vh_vsplat_R(0x3800);  // fp16 0.5
-
-    x_v = Q6_Vhf_vmax_VhfVhf(hvx_vec_splat_f16(-24.0f), x_v);
-
-    HVX_Vector x_minus_half = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(x_v, half_hf_v));
-    HVX_Vector k_v          = Q6_Vh_equals_Vhf(x_minus_half);
-    HVX_Vector f_v          = Q6_Vhf_equals_Vh(k_v);
-    HVX_Vector x_qf16       = Q6_Vqf16_vsub_VhfVhf(x_v, f_v);
-
-    HVX_Vector y = Q6_Vqf16_vmpy_Vqf16Vhf(x_qf16, Q6_Vh_vsplat_R(0x20ee));  // 0.00962830
-    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x2b25));        // 0.0558167
-    y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
-    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x33b0));        // 0.240234
-    y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
-    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x398c));        // 0.693359
-    y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
-    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x3c00));        // 1.0
-
-    y                          = Q6_Vhf_equals_Vqf16(y);
-    HVX_Vector y_exp           = Q6_Vuh_vlsr_VuhR(Q6_Vh_vasl_VhR(y, 1), 11);
-    y_exp                      = Q6_Vh_vadd_VhVh(k_v, y_exp);
-    HVX_VectorPred q_underflow = Q6_Q_vcmp_gt_VhVh(zero_v, y_exp);
-    y                          = Q6_Vh_vaslacc_VhVhR(y, k_v, 10);
-    return Q6_V_vmux_QVV(q_underflow, zero_v, y);
-}
-
 // acc (qf32) += the 64 fp16 values of p, as 32 pairwise sums
 static inline HVX_Vector fa_rowsum_acc(HVX_Vector acc, HVX_Vector p, HVX_Vector one_hf) {
 #if __HVX_ARCH__ >= 79
@@ -4160,13 +4129,6 @@ static void fa_mh_softmax_thread(const htp_thread_t * th, unsigned int n, unsign
     }
 }
 
-static void fa_mh_store_thread(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
-    const fa_mh_args_t * a = (const fa_mh_args_t *) data;
-    for (uint32_t h = 0; h < a->n_h; h++) {
-        a->store_fn(th, n, i, &a->hd[h].o);
-    }
-}
-
 static void fa_mh_qk_worker(const htp_thread_t * th, void * data) {
     const fa_mh_args_t * a = (const fa_mh_args_t *) data;
     for (uint32_t h = 0; h < a->n_h; h++) {
@@ -4374,10 +4336,7 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     for (uint32_t h = 0; h < n_h; h++) {
         fa_q_load_args_t * x = &qa[h];
         x->factx        = &hd[h].f;
-        x->q            = q;
         x->q_start      = q_start;
-        x->kv_head      = kvh0 + h;
-        x->ib3          = 0;
         x->n_rows_g     = n_rows_g;
         x->rows_per_t   = hex_align_up(hmx_ceil_div(g_br, n_thr), 2);
         x->n_rows_q     = n_rows_q;
@@ -4511,11 +4470,11 @@ static int fa_mh_run(struct htp_ops_context * octx, const struct hmx_fa_context 
     hmx_queue_pop(hmx_q);
 
     for (uint32_t h = 0; h < n_h; h++) {
-        hd[h].o = (fa_o_store_args_t) { &hd[h].f, dst, hd[h].f.vtcm_o_tiles[o_cur], q_start, kvh0 + h, 0, n_rows_g,
-                                        hmx_ceil_div(n_rows_g, n_thr) };
+        fa_phase_o_store(&hd[h].f, dq, dst, hd[h].f.vtcm_o_tiles[o_cur],
+                         (uint8_t *) hd[h].f.vtcm_o_tiles[1 - o_cur],
+                         q_start, kvh0 + h, 0, n_rows_g);
+        dma_queue_pop(dq);
     }
-    a.store_fn = proto->is_dst_fp32 ? fa_o_store_thread_f32 : fa_o_store_thread_f16;
-    work_queue_run(ctx->hvx_queue, fa_mh_store_thread, &a, n_thr);
 
     return HTP_STATUS_OK;
 }
@@ -5382,7 +5341,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         (v->type != HTP_TYPE_F16 && v->ne[0] % 32 != 0)) {
         return HTP_STATUS_NO_SUPPORT;
     }
-    if (htp_tensor_is_extended(dst)) {
+    if (htp_tensor_is_extended(octx->dst)) {
         return HTP_STATUS_NO_SUPPORT;
     }
 

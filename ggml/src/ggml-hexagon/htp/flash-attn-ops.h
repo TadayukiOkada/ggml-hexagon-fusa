@@ -511,7 +511,7 @@ static inline int hmx_fa_find_chunk_size(struct hmx_fa_layout_params * p,
                 // causal: Q block b needs the KV blocks up to its last row only (the kernel skips
                 // blocks its mask rows fully mask), the past tokens all, so smaller Q blocks do less
                 size_t kv_iters = q_blocks * kv_blocks;
-                if (causal && kv_len >= qo_len) {
+                if (p->has_mask && p->mask_broadcast && kv_len >= qo_len) {
                     kv_iters = 0;
                     for (size_t b = 0; b < q_blocks; b++) {
                         const size_t last = kv_len - qo_len + (b + 1) * Br;  // KV rows seen by the block

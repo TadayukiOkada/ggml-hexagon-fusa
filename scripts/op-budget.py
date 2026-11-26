@@ -41,7 +41,16 @@ YIELDS = re.compile(r" yields (\d+)\s*$")
 # "OP:tag" only counts the op with that tag: the kernel
 # path for matmuls and flash attention (e.g. hmx-tiled, hmx-flat for the HMX 2D matmul),
 # otherwise multi-row or single-row.
-YIELDING = ["CONT", "CPY", "FENCE_WAIT", "FLASH_ATTN_EXT", "IM2COL", "CONV_2D_DW", "GET_ROWS", "PAD", "MUL_MAT:hmx-tiled", "MUL_MAT:hmx-flat",
+YIELDING = ["CONT", "CPY", "FENCE_WAIT", "FLASH_ATTN_EXT", "IM2COL", "CONV_2D_DW", "GET_ROWS", "PAD",
+            "MUL_MAT:hmx-tiled", "MUL_MAT:hmx-flat", "MUL_MAT:hmx-w8a8",
+            "MUL_MAT+ADD:hmx-tiled", "MUL_MAT+ADD:hmx-flat", "MUL_MAT+ADD:hmx-w8a8",
+            "MUL_MAT_NX:hmx-tiled", "MUL_MAT_NX:hmx-flat", "MUL_MAT_NX:hmx-w8a8",
+            "MUL_MAT_NX_SWIGLU:hmx-tiled", "MUL_MAT_NX_SWIGLU:hmx-flat", "MUL_MAT_NX_SWIGLU:hmx-w8a8",
+            "MUL_MAT_NX_GEGLU:hmx-tiled", "MUL_MAT_NX_GEGLU:hmx-flat", "MUL_MAT_NX_GEGLU:hmx-w8a8",
+            "MUL_MAT_NX_GEGLU_QUICK:hmx-tiled", "MUL_MAT_NX_GEGLU_QUICK:hmx-flat", "MUL_MAT_NX_GEGLU_QUICK:hmx-w8a8",
+            "MUL_MAT_NX_REGLU:hmx-tiled", "MUL_MAT_NX_REGLU:hmx-flat", "MUL_MAT_NX_REGLU:hmx-w8a8",
+            "MUL_MAT_ID:hmx-tiled", "MUL_MAT_ID:hmx-flat", "MUL_MAT_ID:hmx-w8a8",
+            "MUL_MAT_ID_NX:hmx-tiled", "MUL_MAT_ID_NX:hmx-flat", "MUL_MAT_ID_NX:hmx-w8a8",
             "MUL_MAT_LORA:hmx-tiled", "MUL_MAT_LORA:hmx-flat", "LORA_ADD:hmx",
             "SOFT_MAX", "SET_ROWS", "UPSCALE", "ADD", "SUB", "MUL", "DIV", "ADD_ID", "ARGSORT:multi-row", "TOP_K:multi-row",
             "SCALE", "CLAMP", "LEAKY_RELU", "SQR", "SQRT", "NEG", "EXP", "SIGMOID", "SILU", "GELU",

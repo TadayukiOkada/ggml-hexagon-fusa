@@ -462,11 +462,11 @@ static void lora_out_col_worker(const htp_thread_t * th, unsigned int n, unsigne
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, c_first);
     const int chunk_dst_cols = (int) st->dst_cols - (int) c_first;
     if (chunk_dst_cols > 0) {
-        transfer_output_chunk_fp16_to_fp32_col_chunk(
-            st->dst + c_first, st->src2 ? (st->src2 + c_first) : NULL,
-            st->vtcm_src + b_first * HTP_MM_HMX_TILE_N_ELMS,
-            0, st->n_rows, c_len, st->n_cols, st->dst_stride, st->src2_stride,
-            (uint32_t) chunk_dst_cols, st->writeback);
+        hmx_fp16_output_col_chunk_fn_t fn = resolve_fp16_output_col_chunk_fn(sizeof(float), st->src2, sizeof(float), false);
+        fn(st->dst + c_first, st->src2 ? (st->src2 + c_first) : NULL,
+           st->vtcm_src + b_first * HTP_MM_HMX_TILE_N_ELMS,
+           0, st->n_rows, c_len, st->n_cols, st->dst_stride, st->src2_stride,
+           (uint32_t) chunk_dst_cols, sizeof(float));
     }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, c_first);
 }
@@ -475,16 +475,16 @@ static void lora_out_row_worker(const htp_thread_t * th, unsigned int n, unsigne
     const lora_out_row_state_t * st = (const lora_out_row_state_t *) data;
     struct htp_thread_trace *    tr = th->trace;
     const uint32_t start_chunk_idx  = i * st->n_chunks_per_task;
+    hmx_fp16_output_col_chunk_fn_t fn = resolve_fp16_output_col_chunk_fn(sizeof(float), st->src2, sizeof(float), false);
 
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, start_chunk_idx);
     for (unsigned int task_id = i; task_id < st->n_tasks; task_id += n) {
         const uint32_t chunk_idx  = task_id * st->n_chunks_per_task;
         const uint32_t chunk_size = hex_smin(st->n_tot_chunks - chunk_idx, st->n_chunks_per_task);
-        transfer_output_chunk_fp16_to_fp32(
-            st->dst + chunk_idx * st->dst_stride,
-            st->src2 ? (st->src2 + chunk_idx * st->src2_stride) : NULL,
-            st->vtcm_src, chunk_idx, chunk_size, st->n_cols, st->dst_stride, st->src2_stride,
-            st->dst_cols, st->writeback);
+        fn(st->dst + chunk_idx * st->dst_stride,
+           st->src2 ? (st->src2 + chunk_idx * st->src2_stride) : NULL,
+           st->vtcm_src, chunk_idx, chunk_size, st->n_cols, st->n_cols, st->dst_stride, st->src2_stride,
+           st->dst_cols, sizeof(float));
     }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, start_chunk_idx);
 }
@@ -1243,10 +1243,6 @@ static void lora_run_quant_slice(const htp_thread_t * th, unsigned int ith, lora
             quantize_f32_q8_1_s16_tiled_block_kernel((const float *) lctx->vtcm_act_raw, lctx->vtcm_act, NULL, ne0,
                                                      ib_first, ib_last, lctx->vtcm_act_raw_stride,
                                                      htp_mm_q8_1_tiled_row_size(ne0), r0, c0);
-        } else if (wtype == HTP_TYPE_Q4_0) {
-            quantize_f32_q8_0q40_tiled_block_kernel((const float *) lctx->vtcm_act_raw, lctx->vtcm_act, NULL, ne0,
-                                                    ib_first, ib_last, lctx->vtcm_act_raw_stride,
-                                                    htp_mm_q8_0_tiled_row_size(ne0), r0, c0);
         } else if (htp_mm_weight_has_offset(wtype)) {
             quantize_f32_q8_1_tiled_block_kernel((const float *) lctx->vtcm_act_raw, lctx->vtcm_act, NULL, ne0,
                                                  ib_first, ib_last, lctx->vtcm_act_raw_stride,
@@ -1280,10 +1276,6 @@ static void lora_run_quant_slice(const htp_thread_t * th, unsigned int ith, lora
         const size_t d_stride = htp_mm_q8_1_tiled_row_size(ne0);
         quantize_f32_q8_1_s16_tiled_kernel(src_p, lctx->vtcm_act + ir_first * d_stride, NULL, ne0, nrows,
                                            lctx->vtcm_act_raw_stride, d_stride);
-    } else if (wtype == HTP_TYPE_Q4_0) {
-        const size_t d_stride = htp_mm_q8_0_tiled_row_size(ne0);
-        quantize_f32_q8_0q40_tiled_kernel(src_p, lctx->vtcm_act + ir_first * d_stride, NULL, ne0, nrows,
-                                          lctx->vtcm_act_raw_stride, d_stride);
     } else if (htp_mm_weight_has_offset(wtype)) {
         const size_t d_stride = htp_mm_q8_1_tiled_row_size(ne0);
         quantize_f32_q8_1_tiled_kernel(src_p, lctx->vtcm_act + ir_first * d_stride, NULL, ne0, nrows,
@@ -1334,10 +1326,10 @@ static void lora_a_compute_batch(
             }
             for (; r + 2 <= batch_n; r += 2) {
                 flat_vec_dot_f16_f16_aa_2x1(k, h_f32_row + r, buf_a + (r + 0) * p1_row,
-                                            buf_a + (r + 1) * p1_row, x_hf);
+                                            buf_a + (r + 1) * p1_row, x_hf, hvx_flat_store_2x1_f32);
             }
             if (r < batch_n) {
-                flat_vec_dot_f16_f16_aa_1x1(k, h_f32_row + r, buf_a + r * p1_row, x_hf);
+                flat_vec_dot_f16_f16_aa_1x1(k, h_f32_row + r, buf_a + r * p1_row, x_hf, hvx_flat_store_1x1_f32);
             }
         } else {
             // A->type is F32 or BF16: convert VTCM row m of x_f32 if needed (for F16 x_raw fallback)
@@ -1346,19 +1338,19 @@ static void lora_a_compute_batch(
                 uint32_t r = 0;
                 for (; r + 2 <= batch_n; r += 2) {
                     flat_vec_dot_f32_f32_aa_2x1(k, h_f32_row + r, buf_a + (r + 0) * p1_row,
-                                                buf_a + (r + 1) * p1_row, x_f32);
+                                                buf_a + (r + 1) * p1_row, x_f32, hvx_flat_store_2x1_f32);
                 }
                 if (r < batch_n) {
-                    flat_vec_dot_f32_f32_aa_1x1(k, h_f32_row + r, buf_a + r * p1_row, x_f32);
+                    flat_vec_dot_f32_f32_aa_1x1(k, h_f32_row + r, buf_a + r * p1_row, x_f32, hvx_flat_store_1x1_f32);
                 }
             } else {
                 uint32_t r = 0;
                 for (; r + 2 <= batch_n; r += 2) {
                     flat_vec_dot_bf16_f32_aa_2x1(k, h_f32_row + r, buf_a + (r + 0) * p1_row,
-                                                 buf_a + (r + 1) * p1_row, x_f32);
+                                                 buf_a + (r + 1) * p1_row, x_f32, hvx_flat_store_2x1_f32);
                 }
                 if (r < batch_n) {
-                    flat_vec_dot_bf16_f32_aa_1x1(k, h_f32_row + r, buf_a + r * p1_row, x_f32);
+                    flat_vec_dot_bf16_f32_aa_1x1(k, h_f32_row + r, buf_a + r * p1_row, x_f32, hvx_flat_store_1x1_f32);
                 }
             }
         }
@@ -1790,7 +1782,7 @@ static int hvx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
     lctx->vtcm_act_raw           = VTCM_LAYOUT_PTR(uint8_t, base, L_base.off_act_raw);
     lctx->vtcm_src0_size_per_hvx = fastdiv(L_base.src0_bytes, &octx->n_hvx_div);
     lctx->vtcm_act_stride        = (size_t) kp->act_row_size;
-    lctx->vtcm_act_raw_stride    = htp_mm_act_raw_row_size(k);
+    lctx->vtcm_act_raw_stride    = htp_mm_act_raw_row_size(k, sizeof(float));
 
     lctx->vtcm_x_f16        = VTCM_LAYOUT_PTR(__fp16, base, L_lora.off_x_f16);
     lctx->vtcm_h_f32        = VTCM_LAYOUT_PTR(float, base, L_lora.off_h_f32);

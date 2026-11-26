@@ -1,3 +1,5 @@
+#pragma clang diagnostic ignored "-Wunused-function"
+
 #include <HAP_farf.h>
 #include <HAP_perf.h>
 
