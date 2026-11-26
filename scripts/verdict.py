@@ -95,6 +95,24 @@ def rc_of(line):
     return int(m.group(1)) if m else None
 
 
+def unsupported_only(d, op, row):
+    """Recognize the upstream no-supported-cases exit, never a missing or partial run."""
+    if rc_of(row) != 1 or not re.search(r"\b0/0 tests passed\b", row):
+        return False
+    try:
+        with open(os.path.join(d, "support.log"), errors="replace") as f:
+            support = ANSI.sub("", f.read())
+        with open(os.path.join(d, f"test_{op}.log"), errors="replace") as f:
+            log = ANSI.sub("", f.read())
+    except OSError:
+        return False
+    cases = re.findall(r"^\s+" + re.escape(op) + r"\(.*\): (NOT SUPPORTED|SUPPORTED)\s*$", support, re.M)
+    return (bool(cases) and all(c == "NOT SUPPORTED" for c in cases)
+            and "no test case ran: the selected test cases are not supported" in log
+            and re.search(r"^\s*0/0 tests passed\s*$", log, re.M) is not None
+            and "Failing tests:" not in log)
+
+
 def check_ops(d, known, out, known_budget=()):
     summary = os.path.join(d, "summary.txt")
     if not os.path.isfile(summary):
@@ -124,6 +142,9 @@ def check_ops(d, known, out, known_budget=()):
             continue
         if rc < 0 or rc > 128 or rc in (124, 126, 127):
             out.fail(f"ops: {op} rc={rc} (signal, timeout or not runnable)")
+            continue
+        if unsupported_only(d, op, row):
+            out.note(f"ops: {op} has no supported cases (support inventory and test agree)")
             continue
         listed, errs = failing_cases(os.path.join(d, f"test_{op}.log"))
         if not listed:
@@ -188,6 +209,15 @@ def check_budget(logs, what, out, exempt=()):
     (out.fail if r.returncode else out.note)(f"{what}: op-budget.py --fail rc={r.returncode} on {len(logs)} logs")
 
 
+def long_unsupported_only(text):
+    """Recognize the upstream no-supported-cases exit in a --long log (0/0 tests passed)."""
+    return ("no test case ran: the selected test cases are not supported" in text
+            and re.search(r"^\s*0/0 tests passed\s*$", text, re.M) is not None
+            and "backends passed" in text
+            and "Failing tests:" not in text
+            and "profile-op" not in text)
+
+
 def check_long(d, out):
     summary = os.path.join(d, "summary.txt")
     steps = [l for l in open(summary, errors="replace") if l.startswith("long ")] if os.path.isfile(summary) else []
@@ -195,10 +225,13 @@ def check_long(d, out):
         out.fail(f"long: no long results in {summary}")
     for line in steps:
         name, rc = line.split()[1], rc_of(line)
-        if rc != 0:
-            out.fail(f"long: {line.strip()}")
         log = os.path.join(d, f"long_{name}.log")
         text = ANSI.sub("", open(log, errors="replace").read()) if os.path.isfile(log) else ""
+        if rc == 1 and long_unsupported_only(text):
+            out.note(f"long: {name}: no op ran on the HTP (left to the CPU by the op budget)")
+            continue
+        if rc != 0:
+            out.fail(f"long: {line.strip()}")
         if "backends passed" not in text:
             out.fail(f"long: {name}: {log} has no test result")
         elif "profile-op" not in text:

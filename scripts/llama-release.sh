@@ -17,7 +17,8 @@
 #      tests/patches (llama.cpp, conflicts resolved by union: the patches add test cases),
 #      asr/patches (NeMo), sensevoice/patches (SenseVoice); a conflict in the latter two stops
 #   6. review-ops: the ops the HTP newly takes, and whether the functional-safety op budget or a
-#      yield point covers each one (<work dir>/review-ops.txt)
+#      yield point covers each one (<work dir>/review-ops.txt). Exits 3 when ops are marked REVIEW
+#      (matching scripts/verdict.py), or when review-ops finds them.
 # Nothing is committed except the vendor branch and the merge; nothing is pushed.
 #
 # review-ops lists the GGML ops that htp_op_remap() maps in <new> but not in <old>, and for each
@@ -62,7 +63,11 @@ cmd=${1:-}
 case "$cmd" in
 review-ops)
     [ $# -ge 3 ] || die "usage: $0 review-ops <old rev> <new rev> [<tree>]"
-    review_ops "$2" "$3" "${4:-$top}"
+    out=$(review_ops "$2" "$3" "${4:-$top}")
+    printf '%s\n' "$out"
+    if printf '%s\n' "$out" | grep -q REVIEW; then
+        exit 3
+    fi
     exit 0 ;;
 import) ;;
 *) die "usage: $0 import <tag> <worktree> <work dir> [--nemo <rev>] [--sensevoice <rev>] | review-ops ..." ;;
@@ -84,7 +89,7 @@ branch=import/llama-$tag
 
 # 1. the release
 [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || echo "llama-release: warning: $tag is not an official vX.Y.Z tag" >&2
-git -C "$top/llama.cpp" rev-parse -q --verify "refs/tags/$tag" > /dev/null || git -C "$top/llama.cpp" fetch -q --tags origin
+git -C "$top/llama.cpp" rev-parse -q --verify "$tag^{commit}" > /dev/null || git -C "$top/llama.cpp" fetch -q --tags origin
 new=$(git -C "$top/llama.cpp" rev-parse "$tag^{commit}")
 old=$(git -C "$top" ls-tree main -- llama.cpp | awk '{print $3}')
 echo "llama.cpp: ${old:0:9} (main) -> ${new:0:9} ($tag), $(git -C "$top/llama.cpp" rev-list --count "$old..$new") commits"
@@ -147,7 +152,7 @@ series() { # name submodule patch-dir union?
     fi
     if [ -d "$(git -C "$w/repo" rev-parse --path-format=absolute --git-path rebase-merge)" ]; then
         if [ "$union" = union ]; then
-            (cd "$wt" && scripts/rebase-patches.sh continue "$w" --union)
+            (cd "$wt" && scripts/rebase-patches.sh continue "$w" --union) | tee "$w/union.log"
         else
             (cd "$wt" && scripts/rebase-patches.sh continue "$w") || exit 2
         fi
@@ -163,5 +168,11 @@ series sensevoice SenseVoice sensevoice/patches no
 review_ops "$old" "$new" "$wt" | tee "$work/review-ops.txt"
 echo
 echo "import ready in $wt ($branch): build and test, then commit the pins, patches and VENDOR.md"
-grep -q REVIEW "$work/review-ops.txt" && echo "note: ops marked REVIEW in $work/review-ops.txt need a budget estimate or a yield point"
+if grep -q '^union:' "$work"/rebase-*/union.log 2>/dev/null; then
+    echo "note: auto-union resolved conflicts — review the rebased patches and line-check.txt"
+fi
+if grep -q REVIEW "$work/review-ops.txt"; then
+    echo "REVIEW required: ops marked REVIEW in $work/review-ops.txt need a budget estimate or a yield point" >&2
+    exit 3
+fi
 exit 0

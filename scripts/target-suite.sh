@@ -84,7 +84,21 @@ echo "suite $mode new=$(head -1 "$new/BUILD_INFO.txt") old=$([ "$old" = - ] && e
 for g in $groups; do
     case $g in
     ops)
-        probe=0 run ops ops sh "$here/device-tests.sh" "$new" "$out/ops" --ops ;;
+        probe=0 run ops ops sh "$here/device-tests.sh" "$new" "$out/ops" --ops
+        if [ -f "$here/verdict.py" ] && command -v python3 >/dev/null 2>&1; then
+            kargs=""
+            for f in "$here/known-failures.txt" "$here/../tests/known-failures.txt"; do
+                [ -f "$f" ] && { kargs="$kargs --known $f"; break; }
+            done
+            for f in "$here/known-over-budget.txt" "$here/../tests/known-over-budget.txt"; do
+                [ -f "$f" ] && { kargs="$kargs --known-budget $f"; break; }
+            done
+            python3 "$here/verdict.py" --ops "$out/ops" $kargs > "$out/ops-verdict.txt" 2>&1 || {
+                cat "$out/ops-verdict.txt" >&2
+                echo "STOP ops: verdict failed $(now)" >> "$steps"
+                exit 1
+            }
+        fi ;;
     long)
         doms=cdsp probe=1 run long long sh "$here/device-tests.sh" "$new" "$out/long" --long --leak ;;
     compare)
