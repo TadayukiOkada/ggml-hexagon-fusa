@@ -66,13 +66,23 @@ if [ $ops -eq 1 ]; then
         MUL_MAT_GLU MUL_MAT_SOFTCAP NORM_MUL_MAT RMS_NORM_ADD_SCALE RMS_NORM_ROPE"
     { grep -aoE '^  [A-Z_0-9]+\(' "$out/support.log" | tr -d ' ('; printf '%s\n' $fused; } | sort -u > "$out/ops.txt"
     echo "ops: $(wc -l < "$out/ops.txt")" | tee -a "$summary"
+    ops_bad=0
     for op in $(cat "$out/ops.txt"); do
         o=${op%_UNFUSED}; unfused=0; [ "$o" != "$op" ] && unfused=1
         GGML_HEXAGON_LORA_UNFUSED=$unfused GGML_HEXAGON_PROFILE=1 run 3600 "$out/test_$op.log" test-backend-ops-hex test -b HTP0 -j 1 -o "$o"
         rc=$?
         echo "test $op rc=$rc $(grep -aE '[0-9]+/[0-9]+ tests passed' "$out/test_$op.log" | tail -1 | tr -s ' ')" | tee -a "$summary"
-        [ $rc -ne 0 ] && sleep "$pause"
+        if [ $rc -ne 0 ]; then
+            if [ $rc -lt 0 ] || [ $rc -gt 128 ] || [ $rc -eq 124 ] || [ $rc -eq 126 ] || [ $rc -eq 127 ]; then
+                ops_bad=1
+            elif ! grep -q "Failing tests:" "$out/test_$op.log" &&
+                 ! grep -q "no test case ran: the selected test cases are not supported" "$out/test_$op.log"; then
+                ops_bad=1
+            fi
+            sleep "$pause"
+        fi
     done
+    [ "$ops_bad" -eq 0 ] || exit 1
 fi
 
 if [ $long -eq 1 ]; then

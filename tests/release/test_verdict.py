@@ -100,6 +100,20 @@ class VerdictTest(unittest.TestCase):
         d = self.ops_dir(["test ADD rc=0 10/10 tests passed", "test SUB rc=0 4/4 tests passed", "metadata rc=0 OK"])
         self.assertEqual(self.run_verdict("--ops", d), PASS, self.output)
 
+    def test_ops_no_supported_cases_requires_matching_inventory(self):
+        log = "0/0 tests passed\nno test case ran: the selected test cases are not supported\n"
+        d = self.ops_dir(["test ADD rc=1 0/0 tests passed"], ops=("ADD",), logs={"ADD": log})
+        support = os.path.join(d, "support.log")
+        write(support, "inventory\n  ADD(type=f32): NOT SUPPORTED\n")
+        self.assertEqual(self.run_verdict("--ops", d), PASS, self.output)
+        write(support, "inventory\n  ADD(type=f32): SUPPORTED\n")
+        self.assertEqual(self.run_verdict("--ops", d), FAIL, self.output)
+        os.remove(support)
+        self.assertEqual(self.run_verdict("--ops", d), FAIL, self.output)
+        write(support, "inventory\n  ADD(type=f32): NOT SUPPORTED\n")
+        write(os.path.join(d, "test_ADD.log"), "0/0 tests passed\n")
+        self.assertEqual(self.run_verdict("--ops", d), FAIL, self.output)
+
     def test_ops_known_failure(self):
         log = """
         [SUB] ERR = 0.0000005 > 0.0000001   SUB(type=f16,ne=[1,1,1,1]): FAIL
@@ -187,6 +201,23 @@ class VerdictTest(unittest.TestCase):
                           {"fa": self.PROFILE.format(op="FLASH_ATTN_EXT", usec=90000), "argsort": "2/2 backends passed\n"})
         self.assertEqual(self.run_verdict("--long", d), PASS, self.output)
         self.assertIn("left to the CPU", self.output)
+
+    def test_long_unsupported_only_pass(self):
+        log = "0/0 tests passed\nno test case ran: the selected test cases are not supported\n1/2 backends passed\nFAIL\n"
+        d = self.long_dir(["long fa rc=0", "long argsort rc=1"],
+                          {"fa": self.PROFILE.format(op="FLASH_ATTN_EXT", usec=90000), "argsort": log})
+        self.assertEqual(self.run_verdict("--long", d), PASS, self.output)
+        self.assertIn("left to the CPU", self.output)
+
+    def test_long_rc1_with_failing_tests_fails(self):
+        log = "0/0 tests passed\nFailing tests:\n  ARGSORT(type=f32)\n1/2 backends passed\nFAIL\n"
+        d = self.long_dir(["long argsort rc=1"], {"argsort": log})
+        self.assertEqual(self.run_verdict("--long", d), FAIL, self.output)
+
+    def test_long_rc1_without_unsupported_msg_fails(self):
+        log = "0/0 tests passed\n1/2 backends passed\nFAIL\n"
+        d = self.long_dir(["long argsort rc=1"], {"argsort": log})
+        self.assertEqual(self.run_verdict("--long", d), FAIL, self.output)
 
     def test_long_over_budget(self):
         d = self.long_dir(["long lu rc=0"], {"lu": self.PROFILE.format(op="LIGHTNING_INDEXER", usec=90000)})
