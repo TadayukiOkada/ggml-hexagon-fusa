@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b3d1658e0..302ec0624 100644
+index 4b7b12929..9fcfc389d 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9534,6 +9534,38 @@ struct test_flash_attn_ext_kv_rows : public test_case {
+@@ -10549,6 +10549,38 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
      }
  };
  
@@ -41,7 +41,7 @@ index b3d1658e0..302ec0624 100644
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -13778,6 +13810,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -15178,6 +15210,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
          test_cases.emplace_back(new test_gdn_decay(64, 127, 2, 2, g_lo));
      }
@@ -55,5 +55,5 @@ index b3d1658e0..302ec0624 100644
 +        }
 +    }
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
-     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
-     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
+     for (bool keep : { true, false }) {
+         test_cases.emplace_back(new test_gated_delta_net_replay(4, 32,  4, 1, 1, false, 4, keep));

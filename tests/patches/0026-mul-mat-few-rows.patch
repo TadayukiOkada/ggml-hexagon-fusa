@@ -1,7 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1fa3814e5..59a51f094 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11214,6 +11214,36 @@
+@@ -12276,6 +12276,36 @@ struct test_set_kv_grid : test_set_rows {
      double max_nmse_err() override { return 0.0; }
  };
  
@@ -38,7 +39,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
      std::default_random_engine rng(0);
-@@ -12720,6 +12750,30 @@
+@@ -13989,6 +14019,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_mul_mat_fusion(type_a, GGML_GLU_OP_SWIGLU, 1, 1000, 1024, true, 4, 2));
      }
  

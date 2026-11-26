@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index d6ee36d33..1b37b53b7 100644
+index 9bfa2f256..4c0fddab9 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11055,9 +11055,60 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
+@@ -12117,9 +12117,60 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
  }
  
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
@@ -62,11 +62,11 @@ index d6ee36d33..1b37b53b7 100644
 +
  
      // unary ops
-     // TODO: add GGML_UNARY_OP_SOFTPLUS test that is sensitive to using `log1p(exp(x))` vs `log(exp(x) + 1)`
-@@ -14124,6 +14175,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
- static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
-     std::vector<std::unique_ptr<test_case>> test_cases;
- 
+     test_cases.emplace_back(new test_unary_softplus_neg());
+@@ -15583,6 +15634,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 2, 10000));
+     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 7, 1000));
+     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 256, 10000));
 +    // Flat cache formats, selectable with -p kv_types: decode at 12k (D 128 with 2 query heads per KV head,
 +    // D 64 with 4), a pp512 step at 4k, and a 512-token cache write.
 +    for (auto kv : std::vector<std::pair<ggml_type, ggml_type>>{

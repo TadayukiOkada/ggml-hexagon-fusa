@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index e5ce486d4..e60f7c25c 100644
+index c91c39969..8dbbcfb43 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6280,6 +6280,37 @@ struct test_norm_mul_mat : public test_case {
+@@ -7010,6 +7010,37 @@ struct test_norm_mul_mat : public test_case {
      }
  };
  
@@ -40,7 +40,7 @@ index e5ce486d4..e60f7c25c 100644
  // GGML_OP_OUT_PROD
  struct test_out_prod : public test_case {
      const ggml_type type_a;
-@@ -13773,6 +13804,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -15226,6 +15257,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_mul_mat_softcap(type, 1536, 32768, 3));
      }
  

@@ -32,6 +32,7 @@ firmware an op that holds VTCM/HMX past the self-test period stops the DSP.
 | 2026-11-04 | `cd959bae9` (v0.9.0) | New HTP ops CONV_2D, CONV_2D_DW, UPSCALE, TOP_K_MASK, LIGHTNING_INDEXER, DSV4_HC_PRE/POST and a tiled transposed copy. CONV_2D_DW and the transposed copy release VTCM between rounds; the others are in the op budget, fitted to one shape each on v73 with margin (LIGHTNING_INDEXER took 38 ms at 64 heads x 16k keys, so large ones stay on the CPU). IM2COL keeps its rounds on upstream's block split and gains the KH = 1 gather path. NeMo-Speech.cpp moves to v0.3.0 (`20999cc`) |
 | 2026-11-13 | `b1b770d90` (v1.0.0) | Upstream counts threads and HVX contexts apart (`n_threads`/`n_hvx`, `htp_thread_t`, `ctx->hvx_queue`), keeps tensor state as flag bits in `tensor->extra` and tiles weights in place when a graph first uses them, fuses the post-norm residual (`RMS_NORM_MUL_ADD`), adds Q5_0/Q5_1 weights, CONV_3D and an absolute skel path. 28 conflicts; decisions in "v1.0.0 import" below |
 | 2026-11-14 | `c6c0ec6d5` | Four upstream changes after v1.0.0: buffer allocation and mapping rework (#32144), SSM_SCAN (#31921), IQ2_XXS and NVFP4 weights (#31954), the unmasked FA tail fix (#32243). Four conflicts: mapping follows upstream's `mmap_buffers` (the foreign-buffer check moved to `enqueue_op`); the IQ2_XXS decode table goes through `hmx_mm_2d_vtcm_setup`, so it is copied again after VTCM is released inside the op; `hmx_mm_nx_2d_f32` takes upstream's `rows_per_chunk` and keeps the single output of the fused GLU; `op_matmul_nx_impl` keeps both sides. SSM_SCAN stays on the CPU under the op budget (no release point, not timed on v73). One break merged without a conflict: upstream's `src2_bytes` truncation shrank the VTCM staging area of a streamed src2 (fixed in `ce00b99`). Fused GLU is not applied to tiled F16 weights (`94da20a`) |
+| 2026-11-26 | `171527522` (v1.1.0) | Upstream ggml-hexagon 2.0 foundation: INT-HMX W8A8 matmul and flash attention, automatic F32-to-F16 graph lowering (`htp-lower.cpp`), generic DMA pipelines (`dma-proxy.[ch]`), 32x4 weight tiling, new `work-queue.c` (`htp-dcache.[ch]` removed), `HTP_FUSE_MUL_MAT_NX_GLU`, `HTP_FUSE_GDN_STATE`, and `TIMESTEP_EMBEDDING`. 30 conflicts; decisions in "v1.1.0 import" below |
 
 Upstream fixes taken into `main` ahead of an import. When an import brings
 the commit, its test patch no longer applies (configure stops): delete it.
@@ -74,3 +75,16 @@ For the next import: upstream's renames were mechanical in every DSP file except
 `work_queue_run` calls and from the host files (`ggml-hexagon.cpp`, `htp-fusion.cpp`,
 `htp-kparams.cpp`). The skel is now opened by absolute path first (the directory of
 `libggml-hexagon.so` or `GGML_HEXAGON_LIBHTP_DIR`), then through the DSP search path.
+
+## v1.1.0 import: what was kept, replaced and removed
+
+| Local change | Upstream v1.1.0 (ggml-hexagon 2.0) | Decision |
+|---|---|---|
+| Rounds that release VTCM/HMX on request inside long ops (`HTP_YIELD_IN_OPS`), op budget (`htp-budget.cpp`), yield between ops | Generic DMA pipelines (`dma-proxy.[ch]`), INT-HMX W8A8 matmul/FA, new `work-queue.c` | Kept and re-integrated into 2.0 `matmul-ops.c` (pipelined/sync FP16 & INT-HMX paths, `dma_proxy_flush` inside `htp_vtcm_yield`), `flash-attn-ops.c`, `get-rows-ops.c`, `binary-ops.c`. Added `TIMESTEP_EMBEDDING`, `MUL_MAT_ID` budget, and GDN replay `n_pend` to `htp-budget.cpp` |
+| Runtime LoRA fusion (`lora-ops.c`, `HTP_OP_MUL_MAT_LORA`, `HTP_OP_LORA_ADD`) | none | Kept and adapted to 2.0 (`hmx-mm-kernels-tiled-fp.h`, `hvx_flat_store_*_f32`, `resolve_fp16_output_col_chunk_fn`; skipped in `htp-lower.cpp` F32-to-F16 lowering) |
+| Mixed/low-bit KV cache (`Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`/`F8_E4M3`/`IQ4_NL`, `kv-cache-quant.h`, `hmx-kv-prep.h`, `hmx-q8-prep.h`) and multi-head decode (`fa_mh_run`) | W8A8 FA and `fa_phase_o_store` | Kept; `fa_mh_run` updated to 2.0 `fa_q_load_args_t` and `fa_phase_o_store` |
+| Separable HVX bilinear `upscale-ops.c` | Basic upscale | Kept |
+| Local `MUL_MAT_NX`+GLU fusion, GDN state-rows fusion, `htp-dcache.[ch]`, local Q4_0 tile layout, local `work-queue.c` | Upstream `HTP_FUSE_MUL_MAT_NX_GLU`, `HTP_FUSE_GDN_STATE`, 32x4 tiling, new `work-queue.c`, removed `htp-dcache.[ch]` | Replaced with upstream 2.0 implementations |
+| Local small fusions (`NORM_MUL_MAT_NX`, `RMS_NORM_ROPE`, `RMS_NORM_MUL_ADD_MUL`, `MUL_MAT_POST`, compact-activation MTP kernels) | Automatic F32-to-F16 graph lowering (`htp-lower.cpp`), INT-HMX W8A8 | Removed for clean 2.0 adoption (revisit only if KPI regresses vs baseline) |
+| Stable `hvx_vec_softplus_f32_inline` and `< v79` bit-exact F16 RNE rounding (`hvx-scale.h`) | Upstream `softplus` and F16 rounding | Kept |
+| Host buffers off up to v73, build ID check, dspqueue recovery, DSP state query, I/O trace, SWIV/SDK 5.5.7 | Host buffers on by default | Kept |

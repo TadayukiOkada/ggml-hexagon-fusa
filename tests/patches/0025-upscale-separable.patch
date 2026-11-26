@@ -1,7 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 996478dcd..1fa3814e5 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11173,6 +11173,12 @@
+@@ -12235,6 +12235,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
      test_cases.emplace_back(new test_lightning_indexer(128, 64, 16384, 512));
      // tiled transposed copies of a long KV cache
      test_cases.emplace_back(new test_cont(GGML_TYPE_F16, { 128, 8, 16384, 1 }, false, { 1, 2, 0, 3 }));
@@ -14,7 +15,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  
      return test_cases;
  }
-@@ -13487,6 +13493,17 @@
+@@ -14818,6 +14824,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {2, 5,  7, 11}, {5, 7, 11, 13}, mode));
          test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {5, 7, 11, 13}, {2, 5,  7, 11}, mode));
      }
