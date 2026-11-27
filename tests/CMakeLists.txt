@@ -39,3 +39,8 @@ target_link_libraries(test-hexagon-metadata PRIVATE ggml)
 # A row of a quantized mat-mul gets the same bits for one to four rows (run on the target).
 add_executable(test-hexagon-mm-rows test-hexagon-mm-rows.cpp)
 target_link_libraries(test-hexagon-mm-rows PRIVATE ggml)
+
+# Graph lowering gives the same result with the fork's fast transactions as with upstream's loops
+# (run on the target).
+add_executable(test-hexagon-lower test-hexagon-lower.cpp)
+target_link_libraries(test-hexagon-lower PRIVATE ggml)
