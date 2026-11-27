@@ -63,6 +63,7 @@ static double htp_estimate_sort_ms(const struct ggml_tensor * src0, const struct
 static double htp_mm_flop_per_ms(int kernel_type) {
     switch (kernel_type) {
         case HTP_MM_KERNEL_HMX_BATCHED:
+        case HTP_MM_KERNEL_HMX_W8A8_BATCHED:  // not selected yet; taken at the F16 rate
             return 0.6e9;
         case HTP_MM_KERNEL_HVX_F16_F16_VTCM:
         case HTP_MM_KERNEL_HVX_F32_F32_VTCM:
