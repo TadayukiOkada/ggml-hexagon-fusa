@@ -87,10 +87,6 @@ typedef void (*lora_vec_dot_32x2_t)(const uint32_t n, void * restrict s0, void *
                                     uint32_t valid_rows, const void * restrict sz0, const void * restrict sz1,
                                     hvx_tiled_store_row_fn_t store_row);
 
-static inline uint32_t lora_hvx_vtcm_tile_stride(uint32_t type) {
-    return htp_tensor_get_tile_padded_size(type);
-}
-
 // LoRA ops write outputs (and in HMX mode read base_out/norm_w) via direct cached HVX loads/stores
 // while other ops in the same opbatch access DDR via bypass UDMA. Flush written outputs and
 // invalidate directly-read inputs to keep DDR coherent across ops within a batch.
@@ -520,7 +516,7 @@ static void lora_transfer_output_chunk_threaded(
             .dst_stride = (uint32_t) dst_stride, .src2_stride = src2_stride,
             .dst_cols = (uint32_t) dst_cols,
             .n_hvx_div = (n_hvx == (int) ctx->n_hvx) ? ctx->n_hvx_div : init_fastdiv_values(n_hvx),
-            .writeback = ctx->mm_out_writeback,
+            .writeback = true,
         };
         work_queue_run(ctx->hvx_queue, lora_out_col_worker, &col_state, n_hvx);
         return;
@@ -532,7 +528,7 @@ static void lora_transfer_output_chunk_threaded(
         .n_tasks = (uint32_t) actual_hvx, .n_tot_chunks = (uint32_t) n_rows,
         .n_chunks_per_task = n_chunks_per_task, .n_cols = (uint32_t) n_cols,
         .dst_stride = (uint32_t) dst_stride, .src2_stride = src2_stride,
-        .dst_cols = (uint32_t) dst_cols, .writeback = ctx->mm_out_writeback,
+        .dst_cols = (uint32_t) dst_cols, .writeback = true,
     };
     work_queue_run(ctx->hvx_queue, lora_out_row_worker, &state, actual_hvx);
 }
@@ -749,7 +745,7 @@ static void lora_transfer_output_chunk_glu_threaded(
         .dst_stride   = (uint32_t) dst_stride,
         .dst_cols     = (uint32_t) dst_cols,
         .n_hvx_div    = (n_use == (int) ctx->n_hvx) ? ctx->n_hvx_div : init_fastdiv_values(n_use),
-        .writeback    = ctx->mm_out_writeback,
+        .writeback    = true,
     };
 
     const float * lut = lora_glu_lut_get(ctx, glu);
@@ -1541,7 +1537,7 @@ static void hvx_mm_lora_2d_tiled(const htp_thread_t * th, unsigned int nth, unsi
 
         const uint32_t ne01            = src_w->ne[1];
         const uint32_t tile_size       = htp_tensor_get_tile_size(src_w->type);
-        const uint32_t aligned_tile    = lora_hvx_vtcm_tile_stride(src_w->type);
+        const uint32_t aligned_tile    = htp_tensor_get_tile_padded_size(src_w->type);
         const uint32_t n_k_tiles_w     = src_w->ne[0] / htp_tensor_get_tile_k(src_w->type);
         const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
         const uint32_t tile_row_vtcm   = hex_align_up(n_k_tiles_w * aligned_tile, 128);
@@ -2591,7 +2587,6 @@ static int hmx_mm_lora_op(struct htp_ops_context * octx, const struct htp_lora_k
     }
 
     hmx_mm_lora_vtcm_setup(vtcm_scales, vtcm_eye, vtcm_lut, L_hmx.lut_bytes);
-    ctx->mm_out_writeback = true;
 
     const struct fastdiv_values k_div       = kp->div_ne00_padded;
     const struct fastdiv_values act_hvx_div = kp->div_n_act_hvx;
@@ -3295,7 +3290,6 @@ static int hmx_lora_add_op(struct htp_ops_context * octx, const struct htp_lora_
     const struct fastdiv_values act_hvx_div = kp->div_n_act_hvx;
 
     hmx_mm_lora_vtcm_setup(vtcm_scales, vtcm_eye, NULL, 0);
-    ctx->mm_out_writeback = true;
     lora_dcache_invalidate_tensor(base_out);
 
     for (uint32_t mr = 0; mr < m; mr += mc) {

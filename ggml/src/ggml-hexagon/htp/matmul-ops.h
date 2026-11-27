@@ -28,12 +28,6 @@ extern "C" {
 #define HTP_MM_WEIGHT_TILE_SIZE_Q2_0          HTP_TENSOR_TILE_SIZE_Q2_0
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q2_0  640
 
-// --- VTCM stride of weight tiles in the HVX kernels ---
-// Q4_0 tiles stay packed in VTCM (their DDR stride), so the weight DMA is one contiguous transfer
-// instead of 576-byte rows; the HVX Q4_0 kernels load them unaligned. The other types keep the
-// 128-byte aligned stride. The HMX path stages every type at the aligned stride.
-#define HTP_MM_VTCM_TILE_STRIDE_Q4_0   HTP_TENSOR_TILE_SIZE_Q4_0
-
 // --- Activation Tiled Block Sizes (including padding) ---
 #define HTP_MM_ACT_BLOCK_K             128
 #define HTP_MM_ACT_TILE_SIZE_Q8_0      1152
@@ -113,13 +107,6 @@ static inline uint32_t htp_int_hmx_min_k(int wtype) {
 }
 
 // Op-specific struct for precomputed matmul params
-// GLU fused into the store of an HMX MUL_MAT_NX of a gate and an up weight: dst = act(gate) * up
-enum htp_mm_glu {
-    HTP_MM_GLU_NONE   = 0,
-    HTP_MM_GLU_GEGLU  = 1,
-    HTP_MM_GLU_SWIGLU = 2,
-};
-
 struct htp_mm_kernel_params {
     uint8_t  kernel_type;        // enum htp_mm_kernel_type
     uint8_t  pipeline;           // 1 = pipelined execution, 0 = standard

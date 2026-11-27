@@ -136,7 +136,6 @@ struct htp_context {
     uint32_t               glu_lut_batch;
     uint32_t               glu_lut_op;
     uint32_t               glu_lut_kind;      // 1 + table index, 0 = none
-    bool                   mm_out_writeback;  // HMX matmul output stores write their lines back
 
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
     void *                 ddr_spad_base;

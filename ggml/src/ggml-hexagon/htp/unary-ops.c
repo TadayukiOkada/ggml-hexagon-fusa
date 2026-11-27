@@ -79,7 +79,6 @@ struct htp_unary_context {
     dma_addr_t                data_src0;
     dma_addr_t                data_src1;            // mul/scale tensor for RMS_NORM_MUL
     dma_addr_t                data_src2;            // residual tensor for RMS_NORM_MUL_ADD
-    float                     scale3;               // value of src3 that RMS_NORM_MUL_ADD multiplies by (mul_src3)
     dma_addr_t                data_dst;
 
     size_t                    src0_data_row_size;   // actual data bytes per row

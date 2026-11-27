@@ -2038,7 +2038,7 @@ ggml_hexagon_session::dsp_state ggml_hexagon_session::report_dsp_state(uint64_t 
     if (!at_release || w[29] || w[31]) {
         GGML_LOG_WARN("ggml-hex: %s %s batch %" PRIu64 " after %" PRIu64 " ms; DSP: phase %u for %u ms, batch %u op %u/%u "
                       "opcode %u, batches %u yields %u release-requests %u, acquire %u ms tries %u err 0x%x, vtcm valid %u "
-                      "needs-release %u, wq active %u seqn %u r %u w %u pending %u busy 0x%x, hmx w %u r %u pop %u locked %u, "
+                      "needs-release %u, wq active %u seqn %u last %u workers %u pending %u busy 0x%x, hmx w %u r %u pop %u locked %u, "
                       "main-thread prio %d, peek errors %u (0x%x), read errors %u (0x%x), main-thread exits %u\n",
                       this->c_name(), at_release ? "at the end, last" : "no response to", (uint64_t) this->batch_rsp_seq + !at_release,
                       waited_ms, w[2], phase_ms, w[4], w[6], w[5], w[7], w[8], w[9], w[10], acquire_ms, w[12], w[13], w[14],

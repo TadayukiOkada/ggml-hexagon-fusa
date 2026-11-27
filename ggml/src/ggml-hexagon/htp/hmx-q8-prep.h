@@ -219,28 +219,4 @@ static inline void hmx_q8_v_to_tiles(__fp16 * dst, const uint8_t * src, size_t s
     }
 }
 
-// F16 K rows (128-byte aligned staging) of flash attention into its K tiles, four rows per hmx_k_scatter4.
-// The rows of [start, end) are valid; the tail keeps hmx_interleave_rows_to_tiles (row end zero-filled when
-// end is odd and the last row of the block).
-static inline void hmx_f16_k_to_tiles(__fp16 * dst, const __fp16 * src, uint32_t n_rows, uint32_t padded,
-                                      size_t src_stride, uint32_t start, uint32_t end) {
-    const size_t tstride = (size_t) (padded / 32) * 1024;
-    uint32_t     r       = start;
-    if (r % 4 != 0 && r + 2 <= end) {
-        hmx_interleave_rows_to_tiles(dst, src, n_rows, padded, src_stride, r, r + 2);
-        r += 2;
-    }
-    for (; r + 4 <= end; r += 4) {
-        const __fp16 * s  = src + (size_t) r * src_stride;
-        __fp16 *       tb = dst + (size_t) (r / 32) * tstride;
-        for (uint32_t c = 0; c < padded; c += 64) {
-            hmx_k_scatter4((size_t) (tb + (size_t) (c / 32) * 1024), r % 32, hvx_vmem(s + c), hvx_vmem(s + src_stride + c),
-                           hvx_vmem(s + 2 * src_stride + c), hvx_vmem(s + 3 * src_stride + c));
-        }
-    }
-    if (r < end) {
-        hmx_interleave_rows_to_tiles(dst, src, n_rows, padded, src_stride, r, end);
-    }
-}
-
 #endif

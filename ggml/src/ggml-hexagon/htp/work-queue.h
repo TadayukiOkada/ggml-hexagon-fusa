@@ -21,7 +21,7 @@ void work_queue_wakeup(work_queue_t q);
 void work_queue_suspend(work_queue_t q);
 bool work_queue_is_active(work_queue_t q);
 
-// active, seqn, idx_read, idx_write, threads not done with the oldest job, busy workers (bit mask)
+// active, seqn, last seqn, workers, threads not done with the current job, busy workers (bit mask)
 #define WORK_QUEUE_DIAG_WORDS 6
 void work_queue_diag(work_queue_t q, uint32_t out[WORK_QUEUE_DIAG_WORDS]);
 
