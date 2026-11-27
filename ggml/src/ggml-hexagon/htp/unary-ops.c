@@ -4031,7 +4031,15 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     // Large tensors (e.g. logit soft-capping over a whole ubatch, 128M elements) run in rounds of
     // about 32 MiB, so VTCM/HMX can be given away between rounds when a release is requested.
     // Each round stages its own rows; nothing in VTCM outlives a round.
-    const size_t   rows_32m   = (32u << 20) / MAX(src0_data_row_size, (size_t) 1);
+    size_t round_bytes = 32u << 20;
+#if __HVX_ARCH__ < 79
+    // F16 SCALE is a scalar loop below v79 (exact rounding, hvx-scale.h), several times slower per byte
+    // than the HVX ops the 32 MiB rounds were sized for.
+    if (octx->op == HTP_OP_SCALE && is_f16) {
+        round_bytes = 4u << 20;
+    }
+#endif
+    const size_t   rows_32m   = round_bytes / MAX(src0_data_row_size, (size_t) 1);
     const uint32_t round_rows = MAX(n_hvx, (uint32_t) MIN(rows_32m, (size_t) nrows) / n_hvx * n_hvx);
     for (uint32_t done = 0; done < nrows;) {
         const uint32_t n = MIN(round_rows, nrows - done);
