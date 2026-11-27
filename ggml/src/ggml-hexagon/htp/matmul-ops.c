@@ -2841,7 +2841,7 @@ static void transfer_activation_chunk_threaded(const struct activation_transfer_
         return;
     }
 
-    assert(k_block % HTP_MM_HMX_TILE_N_COLS == 0 && k_stride % HTP_MM_HMX_TILE_N_COLS == 0);
+    assert(k_block % HTP_MM_HMX_TILE_N_COLS == 0);  // fork: k_stride is the real K of a padded flat F16/F32 weight
 
     size_t n_tot_chunks      = n_rows;
     size_t n_chunks_per_task = (n_hvx == 1) ? n_tot_chunks : 32;  // must be multiple of 32 to ensure correct destination address
