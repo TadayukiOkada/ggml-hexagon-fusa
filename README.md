@@ -222,6 +222,33 @@ one backend registry across cache pairs and call the pinned, unmodified Linux to
 shared libraries. Run them sequentially with an outer timeout; the exported C++
 entry points are version-specific.
 
+## Prefill matmul precision
+
+Prefill matmuls (more than 4 rows) with Q4_0 and the other integer weight types run as W8A8 on
+HMX, as upstream does: activations are quantized to 8 bits per row and 2048-column block.
+Decode uses HVX and is the same in every mode. `GGML_HEXAGON_MM_SELECT` chooses:
+
+| Value | Prefill matmuls |
+|---|---|
+| `3` (default) | W8A8 INT HMX, FP16 HMX where W8A8 does not apply (as upstream) |
+| `4` | As `3`, but projections whose input comes from a GLU (`ffn_down`, gated attention output, Qwen3.5 `ssm_out`, Gemma per-layer `proj`) run on FP16 HMX: more accurate, slower prefill |
+| `2` | FP16 HMX |
+| `1`, `0` | HVX, CPU |
+
+On v73 with more than one HTP session (for example `GGML_HEXAGON_DEVICES=HTP0,HTP1`) the default
+is `2` unless `GGML_HEXAGON_MM_SELECT` is set.
+
+The activations of GLU outputs have large per-channel outliers, so W8A8 loses accuracy there. Choose
+`4` when output quality matters more than prefill speed. Measured on the v73 EVK (Q4_0; mean KL
+divergence of the logits against the CPU backend on Wikitext-2, context 512, 32 chunks;
+`llama-bench` pp512 in tokens/s):
+
+| Model | KLD `3` / `4` | pp512 `3` / `4` |
+|---|---|---|
+| Qwen3-0.6B | 0.0319 / 0.0245 | 3682 / 3458 |
+| Qwen3.5-0.8B | 0.0154 / 0.0054 | 3398 / 3114 |
+| Gemma-4-E2B | 0.0267 / 0.0184 | 4197 / 3634 |
+
 ## Speech recognition
 
 `GGML_HEXAGON_ASR=ON` (the `arm64-oe-linux-v73-fusa-asr` preset) also builds

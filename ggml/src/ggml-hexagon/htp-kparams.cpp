@@ -775,7 +775,8 @@ static bool htp_matmul_is_hmx_eligible(
 }
 
 // Post-GLU/gated projections (e.g. ffn_down, gated attn_output) have sharp channel outliers
-// that degrade W8A8 activation quantization; route them to FP16 HMX under MM_SELECT=3.
+// that degrade W8A8 activation quantization; MM_SELECT=4 routes them to FP16 HMX (the W8A8 + FP16
+// hybrid that upstream ca123ba76 dropped; the default MM_SELECT=3 is upstream's pure W8A8).
 static bool htp_mm_is_post_glu(const struct ggml_tensor * act) {
     while (act && (act->op == GGML_OP_VIEW || act->op == GGML_OP_RESHAPE || act->op == GGML_OP_CONT || act->op == GGML_OP_CPY)) {
         act = act->view_src ? act->view_src : act->src[0];
@@ -844,9 +845,8 @@ static bool htp_kparams_solve_hmx_mm(
     const uint8_t  fp16_kernel_type = (is_batched && !is_matmul_id) ? HTP_MM_KERNEL_HMX_BATCHED : HTP_MM_KERNEL_HMX_2D;
     uint8_t        kernel_type      = fp16_kernel_type;
     const uint32_t min_k            = htp_int_hmx_min_k((int) wtype);
-    const bool     allow_w8a8       = (opt_mm_select >= 4) ||
-                                      (opt_mm_select == 3 && !htp_mm_is_post_glu(act) &&
-                                       (!dst || ggml_prec_get_acc(dst) != GGML_PREC_F32));
+    const bool     allow_w8a8       = (opt_mm_select >= 3) && !(opt_mm_select == 4 && htp_mm_is_post_glu(act)) &&
+                                      (!dst || ggml_prec_get_acc(dst) != GGML_PREC_F32);
     if (is_tiled && htp_is_int_hmx_weight_type((int) wtype) && allow_w8a8 &&
         ne00_padded >= (int) min_k && (ne00_padded % min_k) == 0) {
         kernel_type = (is_batched && !is_matmul_id) ? HTP_MM_KERNEL_HMX_W8A8_BATCHED : HTP_MM_KERNEL_HMX_W8A8_2D;
