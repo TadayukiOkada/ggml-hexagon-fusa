@@ -18,17 +18,15 @@ enum htp_fusion_flags {
     HTP_FUSE_MUL_MUL_SCALAR  = (1 << 9),  // 512
     HTP_FUSE_BINARY_NX       = (1 << 10), // 1024
     HTP_FUSE_RMS_NORM_SCALE  = (1 << 11), // 2048
-    HTP_FUSE_SSM_CONV_SILU   = (1 << 12), // 4096
+    HTP_FUSE_SSM_CONV_SILU    = (1 << 12), // 4096
     HTP_FUSE_RMS_NORM_MUL_ADD = (1 << 13), // 8192
+    HTP_FUSE_UNARY_SCALE      = (1 << 14), // 16384
+    HTP_FUSE_GDN_STATE        = (1 << 15), // 32768
+    HTP_FUSE_CONCAT_SSM_CONV  = (1 << 16), // 65536
+    HTP_FUSE_MUL_MAT_NX_GLU   = (1 << 17), // 131072
 
     // Not in upstream; numbered from bit 20 so that upstream can keep adding below
-    HTP_FUSE_MUL_MAT_NX_GLU       = (1 << 20), // 1048576
-    HTP_FUSE_NORM_MUL_MAT_NX      = (1 << 21), // 2097152
-    HTP_FUSE_RMS_NORM_ROPE        = (1 << 22), // 4194304
-    HTP_FUSE_RMS_NORM_MUL_ADD_MUL = (1 << 23), // 8388608
-    HTP_FUSE_MUL_MAT_POST         = (1 << 24), // 16777216
-    HTP_FUSE_GDN_STATE_ROWS       = (1 << 25), // 33554432
-    HTP_FUSE_LORA                 = (1 << 26), // 67108864
+    HTP_FUSE_LORA             = (1 << 26), // 67108864
 };
 
 static inline bool htp_fusion_enabled(int flag) {
@@ -42,9 +40,7 @@ bool htp_fusion_can_stack(const struct ggml_tensor * a, const struct ggml_tensor
 int  htp_fusion_max(const struct ggml_cgraph * graph, int idx);
 void htp_fusion_tag_graph(struct ggml_cgraph * graph);
 bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_opnode & prev, const struct htp_opnode & cur);
-bool htp_fusion_try_absorb_norm(const struct htp_opnode & norm, struct htp_opnode & nx);
-void htp_fusion_elide_gdn_state_rows(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph,
-                                     std::vector<struct htp_opnode> & nodes);
+void htp_fusion_optimize_nodes(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph, std::vector<struct htp_opnode> & nodes);
 void htp_fusion_collect_lora_weights(const struct ggml_cgraph * graph,
                                      std::unordered_set<const struct ggml_tensor *> & lora_weights);
 void htp_fusion_lora(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph,

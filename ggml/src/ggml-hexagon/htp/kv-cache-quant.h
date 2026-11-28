@@ -516,6 +516,45 @@ static inline void kv_quantize_row_f8(uint8_t * dst, const float * src, uint32_t
     }
 }
 
+// Exact IEEE-754 FP16 -> FP32 conversion in integer HVX (no qf32 rounding difference on ties).
+static inline HVX_Vector kv_f16_word_to_f32(HVX_Vector h) {
+    const HVX_Vector zero    = Q6_V_vzero();
+    const HVX_Vector sign    = Q6_Vw_vasl_VwR(Q6_V_vand_VV(h, Q6_V_vsplat_R(0x8000)), 16);
+    const HVX_Vector mag     = Q6_V_vand_VV(h, Q6_V_vsplat_R(0x7fff));
+    const HVX_Vector nrm     = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(mag, 13), Q6_V_vsplat_R(112 << 23));
+    const HVX_Vector inf_nan = Q6_V_vor_VV(Q6_V_vsplat_R(0x7f800000),
+                                           Q6_Vw_vasl_VwR(Q6_V_vand_VV(mag, Q6_V_vsplat_R(0x3ff)), 13));
+    const HVX_Vector lz      = Q6_Vuw_vcl0_Vuw(mag);
+    const HVX_Vector sub_exp = Q6_Vw_vasl_VwR(Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(134), lz), 23);
+    const HVX_Vector sub_man = Q6_V_vand_VV(Q6_Vw_vasl_VwVw(mag, Q6_Vw_vsub_VwVw(lz, Q6_V_vsplat_R(8))),
+                                            Q6_V_vsplat_R(0x7fffff));
+    const HVX_Vector sub     = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(mag, zero), zero, Q6_V_vor_VV(sub_exp, sub_man));
+    HVX_Vector r = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VuwVuw(Q6_V_vsplat_R(0x0400), mag), sub, nrm);
+    r = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VuwVuw(Q6_V_vsplat_R(0x7c00), mag), r, inf_nan);
+    return Q6_V_vor_VV(r, sign);
+}
+
+static inline void kv_f16_to_f32_exact(float * restrict dst, const __fp16 * restrict src, uint32_t n) {
+    uint32_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        const HVX_VectorPair p = Q6_Wuw_vunpack_Vuh(*(const HVX_UVector *) (src + i));
+        *(HVX_UVector *) (dst + i)      = kv_f16_word_to_f32(Q6_V_lo_W(p));
+        *(HVX_UVector *) (dst + i + 32) = kv_f16_word_to_f32(Q6_V_hi_W(p));
+    }
+    const uint32_t rem = n - i;
+    if (rem) {
+        const HVX_VectorPair p = Q6_Wuw_vunpack_Vuh(*(const HVX_UVector *) (src + i));
+        if (rem >= 32) {
+            *(HVX_UVector *) (dst + i) = kv_f16_word_to_f32(Q6_V_lo_W(p));
+            if (rem > 32) {
+                hvx_vec_store_u(dst + i + 32, (rem - 32) * sizeof(float), kv_f16_word_to_f32(Q6_V_hi_W(p)));
+            }
+        } else {
+            hvx_vec_store_u(dst + i, rem * sizeof(float), kv_f16_word_to_f32(Q6_V_lo_W(p)));
+        }
+    }
+}
+
 // Cache writes follow the reference block rule (upstream quantize_row_*_ref): bit-identical for finite
 // inputs. The existing SET_ROWS DMA pipeline parallelizes rows and keeps DDR access out of these loops.
 static inline void kv_quantize_row(void * dst, const float * src, uint32_t n, int type) {

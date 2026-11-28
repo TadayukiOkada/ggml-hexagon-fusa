@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index e60f7c25c..0a4d6c8b9 100644
+index 8dbbcfb43..adc91adde 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6311,6 +6311,58 @@ struct test_rms_norm_add_scale : public test_case {
+@@ -7041,6 +7041,58 @@ struct test_rms_norm_add_scale : public test_case {
      }
  };
  
@@ -61,7 +61,7 @@ index e60f7c25c..0a4d6c8b9 100644
  // GGML_OP_OUT_PROD
  struct test_out_prod : public test_case {
      const ggml_type type_a;
-@@ -13809,6 +13861,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -15262,6 +15314,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
      test_cases.emplace_back(new test_rms_norm_add_scale(2048, 33, false));
  

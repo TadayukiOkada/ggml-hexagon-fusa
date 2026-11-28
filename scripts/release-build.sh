@@ -78,7 +78,7 @@ if want fusa; then
     # the FuSa build itself runs scripts/check-skel.sh (CRC section, firmware shell imports)
     if [ -z "$failed" ]; then
         sums "$out/pkg"; sums "$out/flat"
-        { grep -m1 -o 'build ID[^,]*' "$out/build-fusa.log" 2>/dev/null
+        { grep -m1 -o 'build ID[^,]*' "$out/fusa-configure.log" 2>/dev/null
           sha256sum "$out/flat/libggml-htp-v73.so" "$out/flat/libggml-hexagon.so"; } > "$out/fusa-artifacts.txt"
     fi
 fi

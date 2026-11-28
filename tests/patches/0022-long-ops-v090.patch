@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8d232c07c..d6ee36d33 100644
+index 90763f69f..9bfa2f256 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11036,6 +11036,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
+@@ -12098,6 +12098,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_long_ops() {
      // gated delta net prefill: 16 K heads, 32 V heads, head 128
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2));
  

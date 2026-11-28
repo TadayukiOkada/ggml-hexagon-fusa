@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 6ddc3bf..15a5da3 100644
+index 4c0fddab9..996478dcd 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6429,6 +6429,129 @@ struct test_rms_norm_rope : public test_case {
+@@ -7159,6 +7159,129 @@ struct test_rms_norm_rope : public test_case {
      }
  };
  
@@ -132,7 +132,7 @@ index 6ddc3bf..15a5da3 100644
  // GGML_OP_OUT_PROD
  struct test_out_prod : public test_case {
      const ggml_type type_a;
-@@ -14136,6 +14259,98 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -15589,6 +15712,98 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  

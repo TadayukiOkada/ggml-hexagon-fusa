@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 0a4d6c8b9..c5aff8ee7 100644
+index adc91adde..9995672c3 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -8319,6 +8319,7 @@ enum mul_mat_add_mode {
+@@ -9176,6 +9176,7 @@ enum mul_mat_add_mode {
      MUL_MAT_ADD_RES_INPLACE, // res += mm
      MUL_MAT_ADD_B_INPLACE,   // b += mm: the sum overwrites the mat-mul input (m == k)
      MUL_MAT_ADD_MM_MM,       // mm2 + mm: the residual is itself a mat-mul output, so both operands are MUL_MAT
@@ -10,7 +10,7 @@ index 0a4d6c8b9..c5aff8ee7 100644
  };
  
  static std::string var_to_str(mul_mat_add_mode mode) {
-@@ -8329,6 +8330,7 @@ static std::string var_to_str(mul_mat_add_mode mode) {
+@@ -9186,6 +9187,7 @@ static std::string var_to_str(mul_mat_add_mode mode) {
          case MUL_MAT_ADD_RES_INPLACE: return "res+=mm";
          case MUL_MAT_ADD_B_INPLACE:   return "b+=mm";
          case MUL_MAT_ADD_MM_MM:       return "mm2+mm";
@@ -18,7 +18,7 @@ index 0a4d6c8b9..c5aff8ee7 100644
      }
      return "unknown";
  }
-@@ -8364,13 +8366,14 @@ struct test_mul_mat_add : public test_case {
+@@ -9221,13 +9223,14 @@ struct test_mul_mat_add : public test_case {
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a   = ggml_new_tensor_2d(ctx, type_a,        k, m);
          ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
@@ -35,7 +35,7 @@ index 0a4d6c8b9..c5aff8ee7 100644
              case MUL_MAT_ADD_RES_MM:      out = ggml_add(ctx, res, mm);         break;
              case MUL_MAT_ADD_RES_INPLACE: out = ggml_add_inplace(ctx, res, mm); break;
              case MUL_MAT_ADD_B_INPLACE:   out = ggml_add_inplace(ctx, b, mm);   break;
-@@ -12287,7 +12290,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13550,7 +13553,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              }
          }
          for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K, GGML_TYPE_F16}) {

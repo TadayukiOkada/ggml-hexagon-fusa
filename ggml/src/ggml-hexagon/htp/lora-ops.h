@@ -15,6 +15,13 @@ extern "C" {
 #define HTP_LORA_MAX_ADAPTERS 4
 #define HTP_LORA_MAX_WEIGHTS  3
 
+// GLU fused into the store of a MUL_MAT_LORA of a gate and an up weight: dst = act(gate) * up
+enum htp_mm_glu {
+    HTP_MM_GLU_NONE   = 0,
+    HTP_MM_GLU_GEGLU  = 1,
+    HTP_MM_GLU_SWIGLU = 2,
+};
+
 enum htp_lora_mode {
     HTP_LORA_MODE_HVX = 0,
     HTP_LORA_MODE_HMX = 1,
@@ -144,25 +151,6 @@ static inline void htp_lora_hvx_layout_build(
     L->phase1_batch_rows = p1_batch_rows;
     L->extra_bytes = off - base_aligned;
     L->total_bytes = off;
-}
-
-static inline size_t htp_lora_hvx_extra_bytes(
-    uint32_t k,
-    uint32_t m,
-    uint32_t n_hvx,
-    uint32_t n_loras,
-    uint32_t max_r,
-    size_t max_a_elem_bytes,
-    size_t max_b_row_bytes,
-    uint32_t max_loras_per_w,
-    uint32_t b_chunk_tiles,
-    uint32_t glu,
-    uint32_t max_n
-) {
-    struct htp_lora_hvx_vtcm_layout L;
-    htp_lora_hvx_layout_build(&L, 0, k, m, n_hvx, n_loras, max_r, max_a_elem_bytes, max_b_row_bytes, max_loras_per_w,
-                              b_chunk_tiles, glu, max_n);
-    return L.extra_bytes;
 }
 
 // --- HMX MUL_MAT_LORA Group A Sub-Layout (inside HMX layout's off_bias) ---

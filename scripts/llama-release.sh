@@ -27,7 +27,7 @@
 set -euo pipefail
 
 die() { echo "llama-release: $*" >&2; exit 1; }
-top=$(git rev-parse --show-toplevel)
+top=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
 
 remap_ops() { # rev in llama.cpp -> GGML op names the HTP maps
     git -C "$top/llama.cpp" show "$1:ggml/src/ggml-hexagon/htp-kparams.cpp" 2>/dev/null |
